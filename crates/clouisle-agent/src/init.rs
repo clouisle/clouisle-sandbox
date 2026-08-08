@@ -58,25 +58,26 @@ pub fn configure_network() -> Result<(), String> {
         .ok_or_else(|| "clouisle.gateway not set in cmdline".to_string())?;
 
     // 优先 ifconfig（net-tools），缺失则用 ip 命令
-    let configured = std::process::Command::new("ifconfig")
+    let ifcfg_ok = std::process::Command::new("ifconfig")
         .args(["eth0", guest_ip, "netmask", "255.255.255.252", "up"])
         .status()
         .map(|s| s.success())
         .unwrap_or(false);
 
-    if !configured {
-        let up = std::process::Command::new("ip")
+    if ifcfg_ok {
+        // ifconfig up 隐含 link up
+    } else {
+        // ip 命令：先 link up，再配地址
+        let up_ok = std::process::Command::new("ip")
             .args(["link", "set", "eth0", "up"])
             .status()
             .map(|s| s.success())
             .unwrap_or(false);
-        let addr_ok = std::process::Command::new("ip")
+        let _ = std::process::Command::new("ip")
             .args(["addr", "add", &format!("{guest_ip}/30"), "dev", "eth0"])
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
-        if !(up || addr_ok) {
-            return Err("ifconfig and ip addr both failed for eth0".into());
+            .status();
+        if !up_ok {
+            return Err(format!("failed to bring eth0 up (guest_ip={guest_ip})"));
         }
     }
 
@@ -85,8 +86,8 @@ pub fn configure_network() -> Result<(), String> {
         .status();
 
     // 记录接口状态（排查用）
-    if let Ok(out) = std::process::Command::new("ip").args(["link", "show"]).output() {
-        tracing::info!(links = %String::from_utf8_lossy(&out.stdout), "guest link state");
+    if let Ok(out) = std::process::Command::new("ip").args(["addr", "show"]).output() {
+        tracing::info!(addrs = %String::from_utf8_lossy(&out.stdout), "guest addr state");
     }
 
     tracing::info!(guest_ip = %guest_ip, gateway = %gateway, "guest network configured");
