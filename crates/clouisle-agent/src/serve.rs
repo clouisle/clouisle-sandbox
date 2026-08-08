@@ -146,6 +146,11 @@ pub const AGENT_PORT: u16 = 5201;
 /// - 其他平台（macOS 测试）：占位返回。
 #[cfg(target_os = "linux")]
 pub async fn run_serve() -> AgentResult<()> {
+    // 配置 guest 网络（从内核 cmdline 读 guest_ip/gateway）
+    if let Err(e) = crate::init::configure_network() {
+        tracing::warn!(error = %e, "guest network config failed (continuing)");
+    }
+
     let addr = format!("0.0.0.0:{AGENT_PORT}");
     let listener = tokio::net::TcpListener::bind(&addr)
         .await

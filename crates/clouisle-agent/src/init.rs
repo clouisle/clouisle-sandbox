@@ -38,6 +38,57 @@ pub fn init_boot(cmdline: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// 读取当前内核 cmdline（/proc/cmdline）。
+pub fn read_cmdline() -> String {
+    std::fs::read_to_string("/proc/cmdline").unwrap_or_default()
+}
+
+/// 配置 guest 网络（eth0 静态 IP + 默认网关）。
+///
+/// 从内核 cmdline 读取 `clouisle.guest_ip` / `clouisle.gateway`，
+/// 用 ifconfig/route 配置 eth0。不依赖发行版网络管理（Ubuntu 的
+/// systemd-networkd 不认内核 `ip=` 参数）。
+pub fn configure_network() -> Result<(), String> {
+    let params = parse_cmdline(&read_cmdline());
+    let guest_ip = params
+        .get("guest_ip")
+        .ok_or_else(|| "clouisle.guest_ip not set in cmdline".to_string())?;
+    let gateway = params
+        .get("gateway")
+        .ok_or_else(|| "clouisle.gateway not set in cmdline".to_string())?;
+
+    let ip_status = std::process::Command::new("ifconfig")
+        .args(["eth0", guest_ip, "netmask", "255.255.255.252", "up"])
+        .status()
+        .map_err(|e| format!("ifconfig failed: {e}"))?;
+    if !ip_status.success() {
+        // ifconfig 可能不存在（精简 rootfs），尝试 ip 命令
+        let ip_status = std::process::Command::new("ip")
+            .args([
+                "addr",
+                "add",
+                &format!("{guest_ip}/30"),
+                "dev",
+                "eth0",
+            ])
+            .status()
+            .map_err(|e| format!("ip addr failed: {e}"))?;
+        if !ip_status.success() {
+            return Err("ifconfig and ip addr both failed for eth0".into());
+        }
+        let _ = std::process::Command::new("ip")
+            .args(["link", "set", "eth0", "up"])
+            .status();
+    }
+
+    let _ = std::process::Command::new("route")
+        .args(["add", "default", "gw", gateway])
+        .status();
+
+    tracing::info!(guest_ip = %guest_ip, gateway = %gateway, "guest network configured");
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

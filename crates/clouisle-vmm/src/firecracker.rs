@@ -182,7 +182,10 @@ impl FirecrackerVmm {
             .unwrap_or_else(|| "console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda rw".to_string());
         // 追加 guest IP 配置（10.{a}.{b}.2/30，网关 10.{a}.{b}.1）
         let (a, b) = Self::sandbox_subnet(sandbox_id);
-        format!("{base} ip=10.{a}.{b}.2::10.{a}.{b}.1:255.255.255.252::eth0:off")
+        format!(
+            "{base} ip=10.{a}.{b}.2::10.{a}.{b}.1:255.255.255.252::eth0:off \
+             clouisle.guest_ip=10.{a}.{b}.2 clouisle.gateway=10.{a}.{b}.1"
+        )
     }
 
     /// 从 sandbox_id 派生独立网段（与 clouisle-net/src/netns.rs 算法一致）。
