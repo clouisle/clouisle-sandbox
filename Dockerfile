@@ -31,7 +31,7 @@ ARG TARGETARCH
 
 # 安装 Firecracker（按架构）+ 运行时依赖
 RUN apt-get update -qq && apt-get install -y -qq \
-    curl ca-certificates iproute2 nftables iptables \
+    curl ca-certificates iproute2 nftables iptables procps \
     && rm -rf /var/lib/apt/lists/* \
     && if [ "$TARGETARCH" = "arm64" ]; then \
         FC_ARCH=aarch64; \
