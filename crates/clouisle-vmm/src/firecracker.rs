@@ -386,6 +386,7 @@ impl Vmm for FirecrackerVmm {
             cache_type: &'a str,
         }
         let rootfs = self.rootfs_path(spec).to_string_lossy().into_owned();
+        info!(rootfs = %rootfs, "configuring rootfs drive");
         self.fc_put(
             &handle,
             "/drives/rootfs",
