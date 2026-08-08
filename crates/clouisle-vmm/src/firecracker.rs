@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -232,11 +233,16 @@ impl FirecrackerVmm {
             .header("Content-Type", "application/json")
             .body(Full::new(Bytes::from(json)))
             .map_err(|e| ClouisleError::new(ErrorKind::Vmm, format!("build request: {e}")))?;
-        let resp = client
-            .request(req)
+        let resp = tokio::time::timeout(Duration::from_secs(30), client.request(req))
             .await
+            .map_err(|_| {
+                ClouisleError::new(ErrorKind::Vmm, format!("firecracker POST {path} timed out"))
+            })?
             .map_err(|e| {
-                ClouisleError::new(ErrorKind::Vmm, format!("firecracker POST {path}: {e}"))
+                ClouisleError::new(
+                    ErrorKind::Vmm,
+                    format!("firecracker POST {path}: {e}"),
+                )
             })?;
         let status = resp.status();
         if !status.is_success() {
@@ -383,7 +389,6 @@ impl Vmm for FirecrackerVmm {
             path_on_host: &'a str,
             is_root_device: bool,
             is_read_only: bool,
-            cache_type: &'a str,
         }
         let rootfs = self.rootfs_path(spec).to_string_lossy().into_owned();
         info!(rootfs = %rootfs, "configuring rootfs drive");
@@ -395,7 +400,6 @@ impl Vmm for FirecrackerVmm {
                 path_on_host: &rootfs,
                 is_root_device: true,
                 is_read_only: false,
-                cache_type: "Unsafe",
             },
         )
         .await?;
