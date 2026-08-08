@@ -2,9 +2,7 @@
 
 use async_trait::async_trait;
 
-use clouisle_core::Result;
-#[cfg(any(test, feature = "test-utils"))]
-use clouisle_core::ClouisleError;
+use clouisle_core::{ClouisleError, Result};
 use clouisle_vmm::VmHandle;
 
 /// 连接器 trait：给定 VMM handle 和 sandbox_id，连接 vsock 并完成 Hello 握手。
@@ -409,7 +407,7 @@ impl AgentConnector for VsockAgentConnector {
 
         // 发送 Hello，等待 guest 回应 Hello。
         write_frame(
-            &mut conn.stream.lock().await,
+            &mut *conn.stream.lock().await,
             &Frame::Hello {
                 agent_version: env!("CARGO_PKG_VERSION").to_string(),
             },
@@ -419,7 +417,7 @@ impl AgentConnector for VsockAgentConnector {
             ClouisleError::io(format!("write Hello to cid {cid}:{AGENT_PORT}: {e}"))
         })?;
 
-        let resp = read_frame(&mut conn.stream.lock().await).await.map_err(|e| {
+        let resp = read_frame(&mut *conn.stream.lock().await).await.map_err(|e| {
             ClouisleError::io(format!("read Hello response from cid {cid}:{AGENT_PORT}: {e}"))
         })?;
         if !matches!(resp, Frame::Hello { .. }) {
@@ -458,7 +456,7 @@ impl AgentConnection for VsockFrameConnection {
 
         let id = uuid::Uuid::now_v7().to_string();
         write_frame(
-            &mut self.stream.lock().await,
+            &mut *self.stream.lock().await,
             &Frame::ExecReq {
                 id: id.clone(),
                 argv,
@@ -474,7 +472,7 @@ impl AgentConnection for VsockFrameConnection {
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
         let exit_code = loop {
-            let frame = read_frame(&mut self.stream.lock().await)
+            let frame = read_frame(&mut *self.stream.lock().await)
                 .await
                 .map_err(|e| ClouisleError::io(format!("read exec response: {e}")))?;
             match frame {
@@ -512,7 +510,7 @@ impl AgentConnection for VsockFrameConnection {
         use clouisle_proto::Frame;
 
         write_frame(
-            &mut self.stream.lock().await,
+            &mut *self.stream.lock().await,
             &Frame::WriteFile {
                 path: path.to_string(),
                 mode,
@@ -531,7 +529,7 @@ impl AgentConnection for VsockFrameConnection {
         use clouisle_proto::Frame;
 
         write_frame(
-            &mut self.stream.lock().await,
+            &mut *self.stream.lock().await,
             &Frame::ReadFile {
                 path: path.to_string(),
                 offset: 0,
@@ -541,7 +539,7 @@ impl AgentConnection for VsockFrameConnection {
         .await
         .map_err(|e| ClouisleError::io(format!("send ReadFile {path}: {e}")))?;
 
-        let resp = read_frame(&mut self.stream.lock().await)
+        let resp = read_frame(&mut *self.stream.lock().await)
             .await
             .map_err(|e| ClouisleError::io(format!("read ReadFile response: {e}")))?;
         match resp {
@@ -561,7 +559,7 @@ impl AgentConnection for VsockFrameConnection {
         use clouisle_proto::Frame;
 
         write_frame(
-            &mut self.stream.lock().await,
+            &mut *self.stream.lock().await,
             &Frame::ListDir {
                 path: path.to_string(),
             },
@@ -569,7 +567,7 @@ impl AgentConnection for VsockFrameConnection {
         .await
         .map_err(|e| ClouisleError::io(format!("send ListDir {path}: {e}")))?;
 
-        let resp = read_frame(&mut self.stream.lock().await)
+        let resp = read_frame(&mut *self.stream.lock().await)
             .await
             .map_err(|e| ClouisleError::io(format!("read ListDir response: {e}")))?;
         match resp {
@@ -597,10 +595,10 @@ impl AgentConnection for VsockFrameConnection {
         use clouisle_proto::codec::{read_frame, write_frame};
         use clouisle_proto::Frame;
 
-        write_frame(&mut self.stream.lock().await, &Frame::Ping)
+        write_frame(&mut *self.stream.lock().await, &Frame::Ping)
             .await
             .map_err(|e| ClouisleError::io(format!("send Ping: {e}")))?;
-        let resp = read_frame(&mut self.stream.lock().await)
+        let resp = read_frame(&mut *self.stream.lock().await)
             .await
             .map_err(|e| ClouisleError::io(format!("read Pong: {e}")))?;
         match resp {
