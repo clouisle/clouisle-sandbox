@@ -2,7 +2,9 @@
 
 use async_trait::async_trait;
 
-use clouisle_core::{ClouisleError, Result};
+use clouisle_core::Result;
+#[cfg(any(test, feature = "test-utils"))]
+use clouisle_core::ClouisleError;
 use clouisle_vmm::VmHandle;
 
 /// 连接器 trait：给定 VMM handle 和 sandbox_id，连接 vsock 并完成 Hello 握手。
@@ -43,9 +45,12 @@ pub trait AgentConnection: Send + Sync {
     async fn ping(&self) -> Result<()>;
 }
 
-/// Mock 连接器：不真的连 vsock，直接模拟 agent 行为（macOS 可跑）。
+/// Mock 连接器：测试用，仅在 test 或 test-utils feature 下编译。
+/// 不真的连 vsock，直接模拟 agent 行为。
+#[cfg(any(test, feature = "test-utils"))]
 pub struct MockAgentConnector;
 
+#[cfg(any(test, feature = "test-utils"))]
 #[async_trait]
 impl AgentConnector for MockAgentConnector {
     async fn connect_and_hello(
@@ -59,11 +64,13 @@ impl AgentConnector for MockAgentConnector {
     }
 }
 
+#[cfg(any(test, feature = "test-utils"))]
 /// Mock 连接：用宿主机本地进程执行命令（模拟 guest exec）。
 pub struct MockAgentConnection {
     sandbox_id: String,
 }
 
+#[cfg(any(test, feature = "test-utils"))]
 #[async_trait]
 impl AgentConnection for MockAgentConnection {
     fn sandbox_id(&self) -> &str {
@@ -209,11 +216,13 @@ impl AgentConnection for MockAgentConnection {
     }
 }
 
+#[cfg(any(test, feature = "test-utils"))]
 /// 独立的文件系统后端（Mock 用宿主机本地文件系统模拟 guest 文件系统）。
 /// 每个沙盒映射到 `<tmpdir>/clouisle-mock-fs/<sandbox_id>/`。
 #[derive(Debug, Clone, Default)]
 pub struct MockFsBackend;
 
+#[cfg(any(test, feature = "test-utils"))]
 impl MockFsBackend {
     pub fn new() -> Self {
         Self
@@ -242,11 +251,13 @@ impl MockFsBackend {
     }
 }
 
+#[cfg(any(test, feature = "test-utils"))]
 /// 线程安全的文件系统连接（每个 sandbox 一个实例）。
 pub struct MockFsConnection {
     sandbox_id: String,
 }
 
+#[cfg(any(test, feature = "test-utils"))]
 #[async_trait]
 impl AgentConnection for MockFsConnection {
     fn sandbox_id(&self) -> &str {
@@ -331,6 +342,277 @@ impl AgentConnection for MockFsConnection {
 
     async fn ping(&self) -> Result<()> {
         Ok(())
+    }
+}
+
+/// guest agent 监听的 vsock 端口（与 clouisle-agent 约定）。
+#[cfg(target_os = "linux")]
+pub const AGENT_PORT: u32 = 5201;
+
+/// 真实 vsock 连接器（Linux）：通过 AF_VSOCK 连 guest CID:5201，完成 Hello 握手。
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone)]
+pub struct VsockAgentConnector {
+    /// 连接与握手超时
+    pub connect_timeout: std::time::Duration,
+}
+
+#[cfg(target_os = "linux")]
+impl Default for VsockAgentConnector {
+    fn default() -> Self {
+        Self {
+            connect_timeout: std::time::Duration::from_secs(10),
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[async_trait]
+impl AgentConnector for VsockAgentConnector {
+    async fn connect_and_hello(
+        &self,
+        handle: &VmHandle,
+        sandbox_id: &str,
+    ) -> Result<Box<dyn AgentConnection>> {
+        use clouisle_proto::codec::{read_frame, write_frame};
+        use clouisle_proto::Frame;
+
+        let cid = handle.vsock_cid.ok_or_else(|| {
+            ClouisleError::new(
+                clouisle_core::ErrorKind::Vmm,
+                format!("VmHandle {} has no vsock_cid", handle.id),
+            )
+        })?;
+        let addr = tokio_vsock::VsockAddr::new(cid as u32, AGENT_PORT);
+        let stream = tokio::time::timeout(
+            self.connect_timeout,
+            tokio_vsock::VsockStream::connect(addr),
+        )
+        .await
+        .map_err(|_| {
+            ClouisleError::new(
+                clouisle_core::ErrorKind::Vmm,
+                format!("vsock connect timeout (cid {cid}:{AGENT_PORT})"),
+            )
+        })?
+        .map_err(|e| {
+            ClouisleError::new(
+                clouisle_core::ErrorKind::Vmm,
+                format!("vsock connect cid {cid}:{AGENT_PORT} failed: {e}"),
+            )
+        })?;
+
+        let mut conn = VsockFrameConnection {
+            sandbox_id: sandbox_id.to_string(),
+            stream: tokio::sync::Mutex::new(tokio::io::BufStream::new(stream)),
+        };
+
+        // 发送 Hello，等待 guest 回应 Hello。
+        write_frame(
+            &mut conn.stream.lock().await,
+            &Frame::Hello {
+                agent_version: env!("CARGO_PKG_VERSION").to_string(),
+            },
+        )
+        .await
+        .map_err(|e| {
+            ClouisleError::io(format!("write Hello to cid {cid}:{AGENT_PORT}: {e}"))
+        })?;
+
+        let resp = read_frame(&mut conn.stream.lock().await).await.map_err(|e| {
+            ClouisleError::io(format!("read Hello response from cid {cid}:{AGENT_PORT}: {e}"))
+        })?;
+        if !matches!(resp, Frame::Hello { .. }) {
+            return Err(ClouisleError::invalid_state(format!(
+                "expected Hello from guest, got unexpected frame"
+            )));
+        }
+
+        Ok(Box::new(conn))
+    }
+}
+
+/// 真实 vsock 连接：通过 Frame 协议与 guest agent 通信。
+#[cfg(target_os = "linux")]
+pub struct VsockFrameConnection {
+    sandbox_id: String,
+    stream: tokio::sync::Mutex<tokio::io::BufStream<tokio_vsock::VsockStream>>,
+}
+
+#[cfg(target_os = "linux")]
+#[async_trait]
+impl AgentConnection for VsockFrameConnection {
+    fn sandbox_id(&self) -> &str {
+        &self.sandbox_id
+    }
+
+    async fn exec(
+        &self,
+        argv: Vec<String>,
+        env: std::collections::HashMap<String, String>,
+        cwd: Option<String>,
+        timeout_ms: u64,
+    ) -> Result<clouisle_core::execution::ExecutionResult> {
+        use clouisle_proto::codec::{read_frame, write_frame};
+        use clouisle_proto::Frame;
+
+        let id = uuid::Uuid::now_v7().to_string();
+        write_frame(
+            &mut self.stream.lock().await,
+            &Frame::ExecReq {
+                id: id.clone(),
+                argv,
+                env,
+                cwd,
+                timeout_ms,
+            },
+        )
+        .await
+        .map_err(|e| ClouisleError::io(format!("send ExecReq: {e}")))?;
+
+        let start = std::time::Instant::now();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let exit_code = loop {
+            let frame = read_frame(&mut self.stream.lock().await)
+                .await
+                .map_err(|e| ClouisleError::io(format!("read exec response: {e}")))?;
+            match frame {
+                Frame::Stdout {
+                    id: fid, chunk, ..
+                } if fid == id => stdout.extend_from_slice(&chunk),
+                Frame::Stderr {
+                    id: fid, chunk, ..
+                } if fid == id => stderr.extend_from_slice(&chunk),
+                Frame::Exited { id: fid, code } if fid == id => break code,
+                Frame::Error { message, .. } => {
+                    return Err(ClouisleError::new(
+                        clouisle_core::ErrorKind::Vmm,
+                        format!("guest exec error: {message}"),
+                    ))
+                }
+                other => {
+                    return Err(ClouisleError::invalid_state(format!(
+                        "unexpected frame during exec: {other:?}"
+                    )))
+                }
+            }
+        };
+
+        Ok(clouisle_core::execution::ExecutionResult {
+            exit_code,
+            stdout: bytes::Bytes::from(stdout),
+            stderr: bytes::Bytes::from(stderr),
+            duration_ms: start.elapsed().as_millis() as u64,
+        })
+    }
+
+    async fn write_file(&self, path: &str, content: bytes::Bytes, mode: u32) -> Result<()> {
+        use clouisle_proto::codec::write_frame;
+        use clouisle_proto::Frame;
+
+        write_frame(
+            &mut self.stream.lock().await,
+            &Frame::WriteFile {
+                path: path.to_string(),
+                mode,
+                content,
+            },
+        )
+        .await
+        .map_err(|e| ClouisleError::io(format!("send WriteFile {path}: {e}")))?;
+
+        // WriteFile 为 fire-and-forget：guest 不返回响应帧。
+        Ok(())
+    }
+
+    async fn read_file(&self, path: &str) -> Result<bytes::Bytes> {
+        use clouisle_proto::codec::{read_frame, write_frame};
+        use clouisle_proto::Frame;
+
+        write_frame(
+            &mut self.stream.lock().await,
+            &Frame::ReadFile {
+                path: path.to_string(),
+                offset: 0,
+                length: u64::MAX,
+            },
+        )
+        .await
+        .map_err(|e| ClouisleError::io(format!("send ReadFile {path}: {e}")))?;
+
+        let resp = read_frame(&mut self.stream.lock().await)
+            .await
+            .map_err(|e| ClouisleError::io(format!("read ReadFile response: {e}")))?;
+        match resp {
+            Frame::ReadFileResult { content, .. } => Ok(content),
+            Frame::Error { message, .. } => Err(ClouisleError::new(
+                clouisle_core::ErrorKind::Vmm,
+                format!("guest read_file {path}: {message}"),
+            )),
+            other => Err(ClouisleError::invalid_state(format!(
+                "unexpected frame for ReadFile: {other:?}"
+            ))),
+        }
+    }
+
+    async fn list_dir(&self, path: &str) -> Result<Vec<clouisle_core::DirEntry>> {
+        use clouisle_proto::codec::{read_frame, write_frame};
+        use clouisle_proto::Frame;
+
+        write_frame(
+            &mut self.stream.lock().await,
+            &Frame::ListDir {
+                path: path.to_string(),
+            },
+        )
+        .await
+        .map_err(|e| ClouisleError::io(format!("send ListDir {path}: {e}")))?;
+
+        let resp = read_frame(&mut self.stream.lock().await)
+            .await
+            .map_err(|e| ClouisleError::io(format!("read ListDir response: {e}")))?;
+        match resp {
+            Frame::ListDirResult { entries } => Ok(entries
+                .into_iter()
+                .map(|e| clouisle_core::DirEntry {
+                    name: e.name,
+                    size: e.size,
+                    mode: e.mode,
+                    mtime: e.mtime,
+                    is_dir: e.is_dir,
+                })
+                .collect()),
+            Frame::Error { message, .. } => Err(ClouisleError::new(
+                clouisle_core::ErrorKind::Vmm,
+                format!("guest list_dir {path}: {message}"),
+            )),
+            other => Err(ClouisleError::invalid_state(format!(
+                "unexpected frame for ListDir: {other:?}"
+            ))),
+        }
+    }
+
+    async fn ping(&self) -> Result<()> {
+        use clouisle_proto::codec::{read_frame, write_frame};
+        use clouisle_proto::Frame;
+
+        write_frame(&mut self.stream.lock().await, &Frame::Ping)
+            .await
+            .map_err(|e| ClouisleError::io(format!("send Ping: {e}")))?;
+        let resp = read_frame(&mut self.stream.lock().await)
+            .await
+            .map_err(|e| ClouisleError::io(format!("read Pong: {e}")))?;
+        match resp {
+            Frame::Pong => Ok(()),
+            Frame::Error { message, .. } => Err(ClouisleError::new(
+                clouisle_core::ErrorKind::Vmm,
+                format!("guest ping: {message}"),
+            )),
+            other => Err(ClouisleError::invalid_state(format!(
+                "unexpected frame for Ping: {other:?}"
+            ))),
+        }
     }
 }
 
@@ -461,6 +743,7 @@ mod tests {
             pid: None,
             api_socket: None,
             vsock_socket: None,
+            vsock_cid: None,
         };
         let c = conn.connect_and_hello(&handle, "test-sbx").await.unwrap();
         assert!(c.ping().await.is_ok());

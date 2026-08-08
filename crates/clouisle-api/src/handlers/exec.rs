@@ -25,6 +25,7 @@ pub(crate) fn meta_to_handle(
         pid: meta.pid,
         api_socket: meta.api_socket.clone(),
         vsock_socket: meta.vsock_socket.clone(),
+        vsock_cid: meta.vsock_cid,
     }
 }
 

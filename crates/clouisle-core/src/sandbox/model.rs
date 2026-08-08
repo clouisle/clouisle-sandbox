@@ -18,6 +18,9 @@ pub struct VmmMeta {
     pub api_socket: Option<String>,
     /// vsock UDS 路径
     pub vsock_socket: Option<String>,
+    /// Firecracker 分配的 guest CID
+    #[serde(default)]
+    pub vsock_cid: Option<u64>,
     /// VMM 分配的 ID
     pub vmm_id: Option<String>,
     /// 额外 JSON 元数据

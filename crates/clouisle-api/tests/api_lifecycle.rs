@@ -51,6 +51,7 @@ impl Vmm for TestVmm {
             pid: None,
             api_socket: None,
             vsock_socket: None,
+            vsock_cid: None,
         })
     }
     async fn start(&self, _h: &VmHandle) -> Result<()> {
@@ -74,6 +75,7 @@ impl Vmm for TestVmm {
             pid: None,
             api_socket: None,
             vsock_socket: None,
+            vsock_cid: None,
         })
     }
     async fn stop(&self, _h: &VmHandle, _m: StopMode) -> Result<()> {

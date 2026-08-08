@@ -33,7 +33,7 @@ jobs:
       - name: Format check
         run: cargo fmt --check --all
       - name: Clippy (Linux)
-        run: cargo clippy --workspace -- -D warnings
+        run: cargo clippy --workspace --features test-utils -- -D warnings
 
   # ============ 编译检查（Linux amd64） ============
   build-linux:

@@ -69,6 +69,7 @@ impl PoolSlot {
                 pid: None,
                 api_socket: None,
                 vsock_socket: None,
+                vsock_cid: None,
             },
             state: SlotState::Preparing,
             created_at: now,
@@ -415,6 +416,7 @@ mod tests {
                 pid: None,
                 api_socket: None,
                 vsock_socket: None,
+                vsock_cid: None,
             })
         }
         async fn start(&self, _: &VmHandle) -> clouisle_core::Result<()> {
@@ -445,6 +447,7 @@ mod tests {
                 pid: None,
                 api_socket: None,
                 vsock_socket: None,
+                vsock_cid: None,
             })
         }
         async fn stop(&self, _: &VmHandle, _m: StopMode) -> clouisle_core::Result<()> {

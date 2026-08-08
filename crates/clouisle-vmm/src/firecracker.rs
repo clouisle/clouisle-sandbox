@@ -2,17 +2,41 @@
 //!
 //! 通过外部 `firecracker` 进程 + Unix socket HTTP API 集成。
 //! 仅 Linux 编译（`#[cfg(target_os = "linux")]`）。
+//!
+//! 使用 hyper 的 client + hyperlocal 的 UnixConnector 进行 HTTP-over-UDS 通信
+//! （reqwest 0.12 不支持 Unix domain socket）。
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
+use bytes::Bytes;
+use http_body_util::Full;
+use hyper::{body::Incoming, Request};
+use hyper_util::client::legacy::Client;
+use hyperlocal::{UnixClientExt, UnixConnector, Uri as UnixUri};
+use serde::Serialize;
+use serde_json::Value;
 use tokio::sync::Mutex;
+use tracing::{info, warn};
 
 use clouisle_core::{ClouisleError, ErrorKind, Result, SandboxSpec};
 
 use crate::{SnapshotKind, SnapshotPaths, StopMode, VmHandle, VmStats, Vmm, VmmCapabilities};
+
+/// 默认 guest CID 起始值（CID 0/1/2 为保留值）。
+const MIN_CID: u64 = 3;
+
+/// 用于出站白名单短名（与 clouisle-net/src/netns.rs 一致）。
+fn short_name(sandbox_id: &str, prefix: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(sandbox_id.as_bytes());
+    let hash = hex::encode(hasher.finalize());
+    format!("{prefix}{}", &hash[..8])
+}
 
 /// FirecrackerVmm 配置。
 #[derive(Debug, Clone)]
@@ -29,6 +53,8 @@ pub struct FirecrackerConfig {
     pub use_jailer: bool,
     /// 是否启用 seccomp
     pub enable_seccomp: bool,
+    /// 已构建的 rootfs 镜像缓存目录
+    pub images_dir: PathBuf,
 }
 
 impl Default for FirecrackerConfig {
@@ -40,6 +66,7 @@ impl Default for FirecrackerConfig {
             api_sock_dir: PathBuf::from("/tmp/clouisle-fc"),
             use_jailer: true,
             enable_seccomp: true,
+            images_dir: PathBuf::from("/tmp/clouisle-cache"),
         }
     }
 }
@@ -50,6 +77,9 @@ struct FcProcess {
     handle: VmHandle,
     child: Option<tokio::process::Child>,
 }
+
+/// Hyper client 类型别名：Unix domain socket 连接器 + JSON body。
+type FcClient = Client<UnixConnector, Full<Bytes>>;
 
 /// FirecrackerVmm 后端。
 #[derive(Debug, Clone)]
@@ -94,6 +124,167 @@ impl FirecrackerVmm {
         }
         Ok(())
     }
+
+    // ── HTTP-over-UDS 辅助方法 ──────────────────────────────────────────
+
+    /// 构建一个指向 `handle.api_socket` 的 `UnixUri`（hyperlocal URI）。
+    fn api_uri(&self, handle: &VmHandle, path: &str) -> Result<UnixUri> {
+        let sock = handle
+            .api_socket
+            .as_ref()
+            .ok_or_else(|| ClouisleError::invalid_state("VmHandle missing api_socket"))?;
+        Ok(UnixUri::new(sock, path))
+    }
+
+    /// 返回一个 hyper + UnixConnector 的 HTTP 客户端。
+    fn fc_client(&self) -> FcClient {
+        Client::unix()
+    }
+
+    /// 等待 API socket 文件就绪（指数退避，最多约 10s）。
+    async fn wait_for_socket(&self, sock_path: &Path) -> Result<()> {
+        let mut delay = Duration::from_millis(50);
+        for _ in 0..14 {
+            if sock_path.exists() {
+                return Ok(());
+            }
+            tokio::time::sleep(delay).await;
+            delay = (delay * 2).min(Duration::from_secs(2));
+        }
+        Err(ClouisleError::new(
+            ErrorKind::Vmm,
+            format!(
+                "firecracker API socket not ready at {}",
+                sock_path.display()
+            ),
+        ))
+    }
+
+    /// 构建 rootfs 路径：`{images_dir}/{image_reference_sanitized}.ext4`
+    fn rootfs_path(&self, spec: &SandboxSpec) -> PathBuf {
+        let key = spec
+            .image
+            .digest
+            .as_deref()
+            .unwrap_or(&spec.image.reference);
+        // 替换 / 和 : 为 _ 以免路径冲突
+        let safe = key.replace('/', "_").replace(':', "_");
+        self.config.images_dir.join(format!("{safe}.ext4"))
+    }
+
+    /// 内核命令行参数，从 spec 的 env 中提取 `boot_args` 或使用默认值。
+    fn boot_args(&self, spec: &SandboxSpec) -> String {
+        spec.env
+            .get("boot_args")
+            .cloned()
+            .unwrap_or_else(|| "console=ttyS0 reboot=k panic=1 pci=off".to_string())
+    }
+
+    /// 生成一个可用的 guest CID（≥ 3，当前时间低位 + 随机）。
+    fn next_cid(&self) -> u64 {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        MIN_CID + (ts & 0xFFFF) // 0–65535 偏移，碰撞概率极低
+    }
+
+    // ── 底层 HTTP 方法 ──────────────────────────────────────────────────
+
+    /// PUT JSON 请求到 Firecracker API。
+    async fn fc_put<T: Serialize>(&self, handle: &VmHandle, path: &str, body: &T) -> Result<()> {
+        let client = self.fc_client();
+        let uri = self.api_uri(handle, path)?;
+        let json = serde_json::to_vec(body)
+            .map_err(|e| ClouisleError::new(ErrorKind::Vmm, format!("serialize: {e}")))?;
+        let req = Request::put(hyper::Uri::from(uri))
+            .header("Content-Type", "application/json")
+            .body(Full::new(Bytes::from(json)))
+            .map_err(|e| ClouisleError::new(ErrorKind::Vmm, format!("build request: {e}")))?;
+        let resp = client
+            .request(req)
+            .await
+            .map_err(|e| ClouisleError::new(ErrorKind::Vmm, format!("firecracker PUT {path}: {e}")))?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = read_body(resp).await;
+            return Err(ClouisleError::new(
+                ErrorKind::Vmm,
+                format!("firecracker PUT {path} => {status}: {body}"),
+            ));
+        }
+        Ok(())
+    }
+
+    /// POST JSON 请求到 Firecracker API。
+    async fn fc_post<T: Serialize>(
+        &self,
+        handle: &VmHandle,
+        path: &str,
+        body: &T,
+    ) -> Result<()> {
+        let client = self.fc_client();
+        let uri = self.api_uri(handle, path)?;
+        let json = serde_json::to_vec(body)
+            .map_err(|e| ClouisleError::new(ErrorKind::Vmm, format!("serialize: {e}")))?;
+        let req = Request::post(hyper::Uri::from(uri))
+            .header("Content-Type", "application/json")
+            .body(Full::new(Bytes::from(json)))
+            .map_err(|e| ClouisleError::new(ErrorKind::Vmm, format!("build request: {e}")))?;
+        let resp = client
+            .request(req)
+            .await
+            .map_err(|e| {
+                ClouisleError::new(ErrorKind::Vmm, format!("firecracker POST {path}: {e}"))
+            })?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = read_body(resp).await;
+            return Err(ClouisleError::new(
+                ErrorKind::Vmm,
+                format!("firecracker POST {path} => {status}: {body}"),
+            ));
+        }
+        Ok(())
+    }
+
+    /// GET 请求并返回 JSON 值。
+    async fn fc_get(&self, handle: &VmHandle, path: &str) -> Result<Value> {
+        let client = self.fc_client();
+        let uri = self.api_uri(handle, path)?;
+        let req = Request::get(hyper::Uri::from(uri))
+            .body(Full::new(Bytes::new()))
+            .map_err(|e| ClouisleError::new(ErrorKind::Vmm, format!("build request: {e}")))?;
+        let resp = client
+            .request(req)
+            .await
+            .map_err(|e| ClouisleError::new(ErrorKind::Vmm, format!("firecracker GET {path}: {e}")))?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = read_body(resp).await;
+            return Err(ClouisleError::new(
+                ErrorKind::Vmm,
+                format!("firecracker GET {path} => {status}: {body}"),
+            ));
+        }
+        let body = read_body(resp).await;
+        serde_json::from_str(&body)
+            .map_err(|e| ClouisleError::new(ErrorKind::Vmm, format!("parse JSON: {e}")))
+    }
+}
+
+/// 读取 hyper 响应体到字符串。
+async fn read_body(resp: hyper::Response<Incoming>) -> String {
+    use hyper::body::Buf;
+    let body = hyper::body::aggregate(resp.into_body()).await;
+    match body {
+        Ok(mut buf) => {
+            let bytes = buf.copy_to_bytes(buf.remaining());
+            String::from_utf8_lossy(&bytes).to_string()
+        }
+        Err(e) => format!("<read error: {e}>"),
+    }
 }
 
 #[async_trait]
@@ -121,52 +312,197 @@ impl Vmm for FirecrackerVmm {
             .map_err(|e| ClouisleError::new(ErrorKind::Vmm, format!("spawn firecracker: {e}")))?;
 
         let pid = child.id().map(|p| p as u64);
+        let cid = self.next_cid();
+        let vsock_path = format!("/tmp/clouisle-{id}.vsock");
+        // 与 clouisle-net/src/netns.rs 一致的短名
+        let host_dev = short_name(&id, "vh");
+
         let handle = VmHandle {
             id: id.clone(),
             backend: "firecracker".into(),
             pid,
             api_socket: Some(sock_path.to_string_lossy().into_owned()),
-            vsock_socket: Some(format!("/tmp/clouisle-{id}.vsock")),
+            vsock_socket: Some(vsock_path.clone()),
+            vsock_cid: Some(cid),
         };
 
         let mut vms = self.vms.lock().await;
         vms.insert(
-            id,
+            id.clone(),
             FcProcess {
                 handle: handle.clone(),
                 child: Some(child),
             },
         );
+        drop(vms);
 
-        // 等待 API socket 就绪（指数退避）
-        let spec2 = spec;
-        let _ = spec2;
+        // 等待 API socket 就绪
+        self.wait_for_socket(&sock_path).await?;
+
+        // 1. 配置机器规格
+        #[derive(Serialize)]
+        struct MachineConfig<'a> {
+            vcpu_count: u16,
+            mem_size_mib: u32,
+            smt: bool,
+            track_dirty_pages: bool,
+        }
+        self.fc_put(
+            &handle,
+            "/machine-config",
+            &MachineConfig {
+                vcpu_count: spec.resources.vcpu,
+                mem_size_mib: spec.resources.memory_mb,
+                smt: false,
+                track_dirty_pages: false,
+            },
+        )
+        .await?;
+
+        // 2. 配置启动源
+        #[derive(Serialize)]
+        struct BootSource<'a> {
+            kernel_image_path: &'a str,
+            boot_args: &'a str,
+        }
+        let kernel_path = self.config.kernel_path.to_string_lossy().into_owned();
+        let boot_args = self.boot_args(spec);
+        self.fc_put(
+            &handle,
+            "/boot-source",
+            &BootSource {
+                kernel_image_path: &kernel_path,
+                boot_args: &boot_args,
+            },
+        )
+        .await?;
+
+        // 3. 配置根文件系统
+        #[derive(Serialize)]
+        struct DriveConfig<'a> {
+            drive_id: &'a str,
+            path_on_host: &'a str,
+            is_root_device: bool,
+            is_read_only: bool,
+        }
+        let rootfs = self.rootfs_path(spec).to_string_lossy().into_owned();
+        self.fc_put(
+            &handle,
+            "/drives",
+            &DriveConfig {
+                drive_id: "rootfs",
+                path_on_host: &rootfs,
+                is_root_device: true,
+                is_read_only: false,
+            },
+        )
+        .await?;
+
+        // 4. 配置 vsock
+        #[derive(Serialize)]
+        struct VsockConfig<'a> {
+            guest_cid: u64,
+            uds_path: &'a str,
+        }
+        self.fc_put(
+            &handle,
+            "/vsock",
+            &VsockConfig {
+                guest_cid: cid,
+                uds_path: &vsock_path,
+            },
+        )
+        .await?;
+
+        // 5. 配置网络接口（如果启用）
+        if spec.network.enabled {
+            #[derive(Serialize)]
+            struct NetIface<'a> {
+                iface_id: &'a str,
+                host_dev_name: &'a str,
+            }
+            // 使用与 netns rs 一致的短名作为宿主机 veth 设备名
+            self.fc_put(
+                &handle,
+                "/network-interfaces",
+                &NetIface {
+                    iface_id: "eth0",
+                    host_dev_name: &host_dev,
+                },
+            )
+            .await?;
+        }
+
+        info!(
+            id = %id,
+            pid = ?pid,
+            cid = cid,
+            "firecracker VM configured"
+        );
+
         Ok(handle)
     }
 
     async fn start(&self, h: &VmHandle) -> Result<()> {
-        // 通过 HTTP-over-UDS 发送 InstanceStart
-        let _ = h;
+        #[derive(Serialize)]
+        struct Action<'a> {
+            action_type: &'a str,
+        }
+        self.fc_post(h, "/actions", &Action { action_type: "InstanceStart" })
+            .await?;
+        info!(id = %h.id, "firecracker VM started");
         Ok(())
     }
 
     async fn pause(&self, h: &VmHandle) -> Result<()> {
-        let _ = h;
+        #[derive(Serialize)]
+        struct Action<'a> {
+            action_type: &'a str,
+        }
+        self.fc_post(h, "/actions", &Action { action_type: "Pause" })
+            .await?;
+        info!(id = %h.id, "firecracker VM paused");
         Ok(())
     }
 
     async fn resume(&self, h: &VmHandle) -> Result<()> {
-        let _ = h;
+        #[derive(Serialize)]
+        struct Action<'a> {
+            action_type: &'a str,
+        }
+        self.fc_post(h, "/actions", &Action { action_type: "Resume" })
+            .await?;
+        info!(id = %h.id, "firecracker VM resumed");
         Ok(())
     }
 
     async fn snapshot(
         &self,
         h: &VmHandle,
-        _kind: SnapshotKind,
-        _out: &SnapshotPaths,
+        kind: SnapshotKind,
+        out: &SnapshotPaths,
     ) -> Result<()> {
-        let _ = h;
+        let snapshot_type = match kind {
+            SnapshotKind::Full => "Full",
+            SnapshotKind::Diff => "Diff",
+        };
+        #[derive(Serialize)]
+        struct SnapshotReq<'a> {
+            snapshot_type: &'a str,
+            mem_file_path: &'a str,
+            snapshot_path: &'a str,
+        }
+        self.fc_post(
+            h,
+            "/snapshot/create",
+            &SnapshotReq {
+                snapshot_type,
+                mem_file_path: &out.mem_path,
+                snapshot_path: &out.state_path,
+            },
+        )
+        .await?;
+        info!(id = %h.id, "firecracker snapshot created");
         Ok(())
     }
 
@@ -176,25 +512,62 @@ impl Vmm for FirecrackerVmm {
         ))
     }
 
-    async fn stop(&self, h: &VmHandle, _mode: StopMode) -> Result<()> {
+    async fn stop(&self, h: &VmHandle, mode: StopMode) -> Result<()> {
+        match mode {
+            StopMode::Graceful => {
+                // 先尝试 ACPI 关机
+                #[derive(Serialize)]
+                struct Action<'a> {
+                    action_type: &'a str,
+                }
+                let result = self
+                    .fc_post(h, "/actions", &Action { action_type: "SendCtrlAltDel" })
+                    .await;
+                if let Err(e) = result {
+                    warn!(
+                        id = %h.id,
+                        error = %e,
+                        "SendCtrlAltDel failed, falling back to force stop"
+                    );
+                } else {
+                    info!(id = %h.id, "SendCtrlAltDel sent");
+                    // 给 Guest 一个短暂的时间关闭
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
+            }
+            StopMode::Force => {
+                // 不尝试优雅关闭，直接杀进程组
+            }
+        }
+
+        // 总是 kill 进程组（确保 firecracker 及其子进程被清理）
         let mut vms = self.vms.lock().await;
         if let Some(mut proc) = vms.remove(&h.id) {
-            // 先 kill 整个进程组（确保 firecracker 及其子进程全杀）
             if let Some(pid) = proc.handle.pid {
                 let pgid = nix::unistd::Pid::from_raw(pid as i32);
                 let _ = nix::sys::signal::killpg(pgid, nix::sys::signal::Signal::SIGKILL);
             }
-            // 再 wait 子进程，回收资源
             if let Some(mut child) = proc.child.take() {
                 let _ = child.wait().await;
             }
         }
+        info!(id = %h.id, "firecracker VM stopped");
         Ok(())
     }
 
     async fn stats(&self, h: &VmHandle) -> Result<VmStats> {
-        let _ = h;
-        Ok(VmStats::default())
+        let config = self.fc_get(h, "/vm/config").await?;
+        let mem_used_mb = config
+            .get("mem_size_mib")
+            .and_then(|v| v.as_u64());
+
+        Ok(VmStats {
+            boot_time_us: None,
+            vcpu_usage: None,
+            mem_used_mb,
+            rx_bytes: None,
+            tx_bytes: None,
+        })
     }
 
     fn capabilities(&self) -> VmmCapabilities {
@@ -225,5 +598,48 @@ mod tests {
         let vmm = FirecrackerVmm::new(FirecrackerConfig::default());
         assert!(vmm.capabilities().snapshot);
         assert!(vmm.capabilities().vsock);
+    }
+
+    #[test]
+    fn short_name_length() {
+        let name = short_name("test-sandbox-id", "vh");
+        assert!(name.len() <= 15, "short_name too long: {name}");
+        assert!(name.starts_with("vh"));
+    }
+
+    #[test]
+    fn rootfs_path_default() {
+        let cfg = FirecrackerConfig::default();
+        let vmm = FirecrackerVmm::new(cfg);
+        let mut spec = SandboxSpec::default();
+        spec.image.reference = "docker.io/library/alpine:latest".into();
+        let path = vmm.rootfs_path(&spec);
+        assert!(path.to_string_lossy().contains("alpine:latest"));
+        assert!(path.extension().map(|e| e == "ext4").unwrap_or(false));
+    }
+
+    #[test]
+    fn next_cid_in_range() {
+        let vmm = FirecrackerVmm::new(FirecrackerConfig::default());
+        let cid = vmm.next_cid();
+        assert!(cid >= 3, "CID {cid} too low");
+    }
+
+    #[test]
+    fn boot_args_default() {
+        let vmm = FirecrackerVmm::new(FirecrackerConfig::default());
+        let spec = SandboxSpec::default();
+        let args = vmm.boot_args(&spec);
+        assert!(args.contains("console=ttyS0"));
+    }
+
+    #[test]
+    fn boot_args_from_env() {
+        let vmm = FirecrackerVmm::new(FirecrackerConfig::default());
+        let mut spec = SandboxSpec::default();
+        spec.env
+            .insert("boot_args".into(), "custom=1".into());
+        let args = vmm.boot_args(&spec);
+        assert_eq!(args, "custom=1");
     }
 }

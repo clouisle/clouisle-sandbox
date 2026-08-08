@@ -3,6 +3,17 @@ name = "clouisle-api"
 version.workspace = true
 edition.workspace = true
 
+[features]
+test-utils = []
+
+[[test]]
+name = "api_files"
+required-features = ["test-utils"]
+
+[[test]]
+name = "api_lifecycle"
+required-features = ["test-utils"]
+
 [dependencies]
 clouisle-core = { path = "../clouisle-core" }
 clouisle-vmm = { path = "../clouisle-vmm" }
@@ -29,4 +40,7 @@ bytes.workspace = true
 chrono.workspace = true
 clap.workspace = true
 tracing-subscriber.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+tokio-vsock.workspace = true
 

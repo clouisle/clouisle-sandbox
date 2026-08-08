@@ -14,10 +14,14 @@ async-trait.workspace = true
 tracing.workspace = true
 uuid.workspace = true
 hyper.workspace = true
-hyperlocal.workspace = true
+hyperlocal = { workspace = true, features = ["client"] }
+hyper-util = "0.1"
+http-body-util = "0.1"
 futures.workspace = true
 bytes.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 nix = { version = "0.29", features = ["fs", "process", "signal"] }
+sha2 = { workspace = true }
+hex = { workspace = true }
 

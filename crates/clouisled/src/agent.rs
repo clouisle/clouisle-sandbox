@@ -137,6 +137,7 @@ impl NodeAgent {
             pid: handle.pid,
             api_socket: handle.api_socket.clone(),
             vsock_socket: handle.vsock_socket.clone(),
+            vsock_cid: handle.vsock_cid,
             vmm_id: Some(handle.id.clone()),
             extra: Default::default(),
         };
@@ -188,6 +189,7 @@ impl NodeAgent {
             pid: sandbox.vmm_meta.pid,
             api_socket: sandbox.vmm_meta.api_socket.clone(),
             vsock_socket: sandbox.vmm_meta.vsock_socket.clone(),
+            vsock_cid: sandbox.vmm_meta.vsock_cid,
         };
         self.vmm.stop(&handle, StopMode::Force).await?;
 
@@ -295,6 +297,7 @@ mod tests {
                 pid: None,
                 api_socket: None,
                 vsock_socket: None,
+                vsock_cid: None,
             })
         }
         async fn start(&self, _: &VmHandle) -> clouisle_core::Result<()> {
@@ -325,6 +328,7 @@ mod tests {
                 pid: None,
                 api_socket: None,
                 vsock_socket: None,
+                vsock_cid: None,
             })
         }
         async fn stop(&self, _: &VmHandle, _m: StopMode) -> clouisle_core::Result<()> {

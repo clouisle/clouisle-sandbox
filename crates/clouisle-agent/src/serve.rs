@@ -24,9 +24,8 @@ pub fn process_frames(decoder: &mut FrameDecoder, data: &[u8]) -> AgentResult<Ve
 pub fn handle_frame(frame: Frame) -> AgentResult<Vec<Frame>> {
     match frame {
         Frame::Ping => Ok(vec![Frame::Pong]),
-        Frame::Hello { .. } => Ok(vec![Frame::Error {
-            message: "server already initialized".into(),
-            code: 1,
+        Frame::Hello { .. } => Ok(vec![Frame::Hello {
+            agent_version: env!("CARGO_PKG_VERSION").to_string(),
         }]),
         Frame::ExecReq {
             id,
@@ -115,6 +114,13 @@ where
             // Echo 简单帧
             match frame {
                 Frame::Ping => clouisle_proto::codec::write_frame(writer, &Frame::Pong).await?,
+                Frame::Hello { .. } => clouisle_proto::codec::write_frame(
+                    writer,
+                    &Frame::Hello {
+                        agent_version: env!("CARGO_PKG_VERSION").to_string(),
+                    },
+                )
+                .await?,
                 _ => {
                     clouisle_proto::codec::write_frame(
                         writer,
@@ -130,8 +136,38 @@ where
     }
 }
 
-/// serve 模式入口（Phase 0 简化：进程内跑，供单元测试）。
-pub fn run_serve() -> AgentResult<()> {
+/// guest agent 监听的 vsock 端口。
+pub const AGENT_PORT: u32 = 5201;
+
+/// serve 模式入口：
+/// - Linux：绑定 vsock 端口 5201，接受 host 连接，逐连接跑 [`serve_loop`]。
+/// - 其他平台（macOS 测试）：无 AF_VSOCK，仅占位返回。
+#[cfg(target_os = "linux")]
+pub async fn run_serve() -> AgentResult<()> {
+    use tokio_vsock::{VsockAddr, VsockListener, VMADDR_CID_ANY};
+
+    let addr = VsockAddr::new(VMADDR_CID_ANY, AGENT_PORT);
+    let listener = VsockListener::bind(addr).map_err(AgentError::Io)?;
+    tracing::info!("vsock agent listening on port {AGENT_PORT}");
+
+    loop {
+        let (stream, peer) = listener
+            .accept()
+            .await
+            .map_err(AgentError::Io)?;
+        tracing::info!("vsock connection from {peer:?}");
+        let (mut reader, mut writer) = tokio::io::split(stream);
+        tokio::spawn(async move {
+            if let Err(e) = serve_loop(&mut reader, &mut writer).await {
+                tracing::warn!(error = %e, "serve_loop ended");
+            }
+        });
+    }
+}
+
+/// serve 模式入口（macOS/测试：无 AF_VSOCK，占位）。
+#[cfg(not(target_os = "linux"))]
+pub async fn run_serve() -> AgentResult<()> {
     // macOS/测试环境：serve 由外部 vsock 触发；此函数仅为 lib 导出占位。
     Ok(())
 }

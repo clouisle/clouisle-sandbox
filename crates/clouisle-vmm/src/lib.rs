@@ -29,6 +29,8 @@ pub struct VmHandle {
     pub api_socket: Option<String>,
     /// vsock socket 路径
     pub vsock_socket: Option<String>,
+    /// Firecracker 分配的 guest CID
+    pub vsock_cid: Option<u64>,
 }
 
 /// 停止模式。

@@ -81,6 +81,7 @@ pub async fn create_sandbox(
         pid: handle.pid,
         api_socket: handle.api_socket.clone(),
         vsock_socket: handle.vsock_socket.clone(),
+        vsock_cid: handle.vsock_cid,
         vmm_id: Some(handle.id.clone()),
         extra: Default::default(),
     };
@@ -205,6 +206,7 @@ pub async fn delete_sandbox(
             pid: Some(pid),
             api_socket: sb.vmm_meta.api_socket.clone(),
             vsock_socket: sb.vmm_meta.vsock_socket.clone(),
+            vsock_cid: sb.vmm_meta.vsock_cid,
         };
         let _ = state.vmm.stop(&handle, clouisle_vmm::StopMode::Force).await;
     }

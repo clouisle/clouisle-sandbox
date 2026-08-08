@@ -12,6 +12,7 @@
 //! 3. 删除 netns
 
 use std::collections::HashMap;
+use std::os::unix::io::AsRawFd;
 use std::sync::Arc;
 
 use tokio::sync::{Mutex, RwLock};
@@ -33,11 +34,18 @@ struct SandboxNet {
     host_ip: String,
 }
 
+/// 运行中的 DNS 代理句柄。
+#[derive(Debug)]
+struct DnsHandle {
+    proxy: DnsProxy,
+    cancel: tokio::sync::oneshot::Sender<()>,
+}
+
 /// 防火墙编排器。
 #[derive(Debug, Clone)]
 pub struct FirewallManager {
     nets: Arc<RwLock<HashMap<String, SandboxNet>>>,
-    dns_proxies: Arc<Mutex<HashMap<String, DnsProxy>>>,
+    dns_proxies: Arc<Mutex<HashMap<String, DnsHandle>>>,
 }
 
 impl FirewallManager {
@@ -66,18 +74,66 @@ impl FirewallManager {
 
         // 3. 创建 DNS 代理
         let proxy = DnsProxy::new(allow_egress.to_vec());
-        let proxy_clone = proxy.clone();
-        let ns_name = format!("clo-{sandbox_id}");
+        let ns_name = netns::short_name(sandbox_id, "");
+        let ns_full = format!("clo-{ns_name}");
 
         // 4. 启动 DNS 代理在 netns 内（监听 10.0.0.1:53）
-        tokio::spawn(async move {
-            // 通过 `ip netns exec <ns> dnsproxy` 启动
-            // 简化：DnsProxy 本身监听 UDP 53
-            let _ = proxy_clone;
-            let _ = ns_name;
-            // 真实实现要用 hickory-resolver 的 UDP server 在 netns 内监听
-            // 此处留待完整实现
-        });
+        // 使用独立 OS 线程 + 独立 tokio runtime，避免 setns 污染主线程池
+        let proxy_srv = proxy.clone();
+        let ns_path = format!("/var/run/netns/{ns_full}");
+        let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
+        let cancel_rx = std::sync::Mutex::new(Some(cancel_rx));
+        std::thread::Builder::new()
+            .name(format!("dns-{ns_name}"))
+            .spawn(move || {
+                // 进入 netns
+                let ns_path = ns_path.as_str();
+                // 打开 /var/run/netns/<name> 并 setns(CLONE_NEWNET)
+                let file = match std::fs::File::open(ns_path) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        tracing::warn!(ns = ns_path, error = %e, "dns: open netns failed");
+                        return;
+                    }
+                };
+                let fd = file.as_raw_fd();
+                if let Err(e) = nix::sched::setns(fd, nix::sched::CloneNewNet) {
+                    tracing::warn!(ns = ns_path, error = %e, "dns: setns failed");
+                    return;
+                }
+
+                // 在 netns 内创建独立 tokio runtime
+                let rt = match tokio::runtime::Runtime::new() {
+                    Ok(r) => r,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "dns: create runtime failed");
+                        return;
+                    }
+                };
+                let cancel = cancel_rx.lock().unwrap().take().unwrap();
+                rt.block_on(async {
+                    tokio::select! {
+                        _ = cancel => {
+                            tracing::debug!(ns = ns_path, "dns proxy cancelled");
+                        }
+                        result = proxy_srv.serve("10.0.0.1") => {
+                            if let Err(e) = result {
+                                tracing::warn!(ns = ns_path, error = %e, "dns proxy stopped");
+                            }
+                        }
+                    }
+                });
+            })
+            .map_err(|e| ClouisleError::io(format!("spawn dns thread: {e}")))?;
+
+        // 记录 DNS 代理句柄
+        self.dns_proxies.lock().await.insert(
+            sandbox_id.to_string(),
+            DnsHandle {
+                proxy,
+                cancel: cancel_tx,
+            },
+        );
 
         // 记录状态
         self.nets.write().await.insert(
@@ -94,15 +150,19 @@ impl FirewallManager {
 
     /// 删除沙盒的网络隔离环境。
     pub async fn teardown_sandbox_network(&self, sandbox_id: &str) -> Result<(), ClouisleError> {
-        // 1. 删除 nftables
+        // 1. 停止 DNS 代理
+        if let Some(handle) = self.dns_proxies.lock().await.remove(sandbox_id) {
+            let _ = handle.cancel.send(());
+        }
+
+        // 2. 删除 nftables
         let _ = nftables::teardown_ruleset(sandbox_id);
 
-        // 2. 删除 netns（自动清理所有设备）
+        // 3. 删除 netns（自动清理所有设备）
         let _ = netns::delete_netns(sandbox_id);
 
-        // 3. 清理状态
+        // 4. 清理状态
         self.nets.write().await.remove(sandbox_id);
-        self.dns_proxies.lock().await.remove(sandbox_id);
 
         Ok(())
     }
@@ -119,7 +179,7 @@ impl FirewallManager {
 
     /// 获取沙盒的 DNS 代理（供外部调用）。
     pub async fn dns_proxy(&self, sandbox_id: &str) -> Option<DnsProxy> {
-        self.dns_proxies.lock().await.get(sandbox_id).cloned()
+        self.dns_proxies.lock().await.get(sandbox_id).map(|h| h.proxy.clone())
     }
 }
 
