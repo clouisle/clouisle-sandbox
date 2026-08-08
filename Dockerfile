@@ -19,7 +19,7 @@ COPY sdk/rust/ ./sdk/rust/
 RUN if [ "$TARGETARCH" = "arm64" ]; then rustup target add aarch64-unknown-linux-gnu; fi
 
 # 全量编译（BUILDPLATFORM 上编译，产物对应 TARGETARCH）
-RUN cargo build --release -p clouisle-api -p clouislectl
+RUN cargo build --release -p clouisle-api -p clouislectl -p clouisle-agent
 
 # ============================================================
 # Stage 2: 运行镜像（多平台）
@@ -46,6 +46,7 @@ RUN apt-get update -qq && apt-get install -y -qq \
 # 复制编译产物
 COPY --from=builder /build/target/release/clouisle-api /usr/local/bin/
 COPY --from=builder /build/target/release/clouislectl /usr/local/bin/
+COPY --from=builder /build/target/release/clouisle-agent /usr/local/bin/
 
 # 创建 firecracker / jailer 符号链接（解压后文件名带版本号）
 RUN ln -sf firecracker-v1.10.1-x86_64 /usr/local/bin/firecracker \
