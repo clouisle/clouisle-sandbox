@@ -84,7 +84,7 @@ pub async fn create_sandbox(
 
     // 5. VMM create + start
     let start = std::time::Instant::now();
-    let handle = match state.vmm.create(&req.spec).await {
+    let handle = match state.vmm.create(&id, &req.spec).await {
         Ok(h) => h,
         Err(e) => {
             state

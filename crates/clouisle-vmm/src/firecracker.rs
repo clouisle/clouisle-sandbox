@@ -309,10 +309,10 @@ async fn read_body(resp: hyper::Response<Incoming>) -> String {
 
 #[async_trait]
 impl Vmm for FirecrackerVmm {
-    async fn create(&self, spec: &SandboxSpec) -> Result<VmHandle> {
+    async fn create(&self, sandbox_id: &str, spec: &SandboxSpec) -> Result<VmHandle> {
         self.check_environment()?;
 
-        let id = uuid::Uuid::now_v7().to_string();
+        let id = sandbox_id.to_string();
         let sock_path = self.config.api_sock_dir.join(format!("{id}.sock"));
         std::fs::create_dir_all(&self.config.api_sock_dir)
             .map_err(|e| ClouisleError::io(e.to_string()))?;

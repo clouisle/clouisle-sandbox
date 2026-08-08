@@ -44,7 +44,7 @@ impl Default for TestVmm {
 
 #[async_trait]
 impl Vmm for TestVmm {
-    async fn create(&self, _spec: &SandboxSpec) -> Result<VmHandle> {
+    async fn create(&self, _: &str, _spec: &SandboxSpec) -> Result<VmHandle> {
         Ok(VmHandle {
             id: uuid::Uuid::now_v7().to_string(),
             backend: "test".into(),

@@ -81,7 +81,8 @@ pub struct VmmCapabilities {
 #[async_trait]
 pub trait Vmm: Send + Sync {
     /// 创建 VMM 资源（进程启动、socket 就绪），不启动 guest。
-    async fn create(&self, spec: &SandboxSpec) -> Result<VmHandle>;
+    /// `sandbox_id` 由控制平面统一生成（用于 netns 名、设备名一致性）。
+    async fn create(&self, sandbox_id: &str, spec: &SandboxSpec) -> Result<VmHandle>;
 
     /// 启动 guest（InstanceStart）。
     async fn start(&self, h: &VmHandle) -> Result<()>;

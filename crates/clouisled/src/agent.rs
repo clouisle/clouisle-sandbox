@@ -121,7 +121,7 @@ impl NodeAgent {
         store.create_sandbox(&sandbox).await?;
 
         // VMM
-        let handle = match self.vmm.create(&sandbox.spec).await {
+        let handle = match self.vmm.create(&id, &sandbox.spec).await {
             Ok(h) => h,
             Err(e) => {
                 sandbox.transition(SandboxEvent::Failed).ok();
@@ -290,7 +290,7 @@ mod tests {
 
     #[async_trait]
     impl Vmm for TestVmm {
-        async fn create(&self, _: &clouisle_core::SandboxSpec) -> clouisle_core::Result<VmHandle> {
+        async fn create(&self, _: &str, _: &clouisle_core::SandboxSpec) -> clouisle_core::Result<VmHandle> {
             Ok(VmHandle {
                 id: uuid::Uuid::now_v7().to_string(),
                 backend: "test".into(),

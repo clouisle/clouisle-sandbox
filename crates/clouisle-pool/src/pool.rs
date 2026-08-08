@@ -223,7 +223,7 @@ impl Pool {
             s
         };
 
-        let handle = match self.vmm.create(spec).await {
+        let handle = match self.vmm.create(&slot.id, spec).await {
             Ok(h) => h,
             Err(e) => {
                 tracing::warn!(error = %e, spec = %key, "pool: cold create failed");
@@ -369,7 +369,7 @@ async fn replenish(inner: &Arc<Mutex<PoolInner>>, vmm: &Arc<dyn Vmm>) {
         s
     };
 
-    let handle = match vmm.create(&spec).await {
+    let handle = match vmm.create(&slot.id, &spec).await {
         Ok(h) => h,
         Err(e) => {
             tracing::warn!(error = %e, spec = %key, "pool: replenish create failed");
@@ -409,7 +409,7 @@ mod tests {
 
     #[async_trait]
     impl Vmm for TestVmm {
-        async fn create(&self, _: &clouisle_core::SandboxSpec) -> clouisle_core::Result<VmHandle> {
+        async fn create(&self, _: &str, _: &clouisle_core::SandboxSpec) -> clouisle_core::Result<VmHandle> {
             Ok(VmHandle {
                 id: uuid::Uuid::now_v7().to_string(),
                 backend: "test".into(),

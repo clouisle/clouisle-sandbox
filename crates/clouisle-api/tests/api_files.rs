@@ -23,7 +23,7 @@ struct TestVmm(Arc<std::sync::atomic::AtomicUsize>);
 
 #[async_trait]
 impl Vmm for TestVmm {
-    async fn create(&self, _: &clouisle_core::SandboxSpec) -> Result<VmHandle> {
+    async fn create(&self, _: &str, _: &clouisle_core::SandboxSpec) -> Result<VmHandle> {
         Ok(VmHandle {
             id: uuid::Uuid::now_v7().to_string(),
             backend: "test".into(),
