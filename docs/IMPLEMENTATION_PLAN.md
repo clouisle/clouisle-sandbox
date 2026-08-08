@@ -9,3 +9,13 @@
 7. [ ] 端到端验证
 
 See `docs/plan/production-ready.md` for details.
+
+## 服务器全量验收测试
+
+1. [x] 盘点当前 HTTP、CLI、SDK、gRPC、VMM、网络和存储功能
+2. [x] 编写逐参数、逐功能服务器测试计划
+3. [ ] 在 `root@10.144.144.2` 执行环境、API、VMM、网络、存储和清理验收
+4. [ ] 执行 Rust/Python/TypeScript/JavaScript SDK 远程交叉验证
+5. [ ] 输出测试报告、缺陷清单和最终 PASS/FAIL 结论
+
+See `docs/plan/server-comprehensive-test-plan.md` for the complete test matrix and evidence requirements.
