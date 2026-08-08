@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use http_body_util::Full;
+use http_body_util::{BodyExt, Full};
 use hyper::{body::Incoming, Request};
 use hyper_util::client::legacy::Client;
 use hyperlocal::{UnixClientExt, UnixConnector, Uri as UnixUri};
@@ -276,9 +276,12 @@ impl FirecrackerVmm {
 
 /// 读取 hyper 响应体到字符串。
 async fn read_body(resp: hyper::Response<Incoming>) -> String {
-    let body = hyper::body::to_bytes(resp.into_body()).await;
-    match body {
-        Ok(bytes) => String::from_utf8_lossy(&bytes).to_string(),
+    use http_body_util::BodyExt;
+    match resp.into_body().collect().await {
+        Ok(collected) => {
+            let bytes = collected.to_bytes();
+            String::from_utf8_lossy(&bytes).to_string()
+        }
         Err(e) => format!("<read error: {e}>"),
     }
 }
