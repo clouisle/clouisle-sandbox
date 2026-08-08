@@ -13,6 +13,7 @@ WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY crates/ ./crates/
 COPY benches/ ./benches/
+COPY sdk/rust/ ./sdk/rust/
 
 # 交叉编译目标（跨平台构建时添加目标架构）
 RUN if [ "$TARGETARCH" = "arm64" ]; then rustup target add aarch64-unknown-linux-gnu; fi
