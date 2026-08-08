@@ -371,7 +371,7 @@ impl Default for VsockAgentConnector {
 impl AgentConnector for VsockAgentConnector {
     async fn connect_and_hello(
         &self,
-        handle: &VmHandle,
+        _handle: &VmHandle,
         sandbox_id: &str,
     ) -> Result<Box<dyn AgentConnection>> {
         use clouisle_proto::Frame;
@@ -384,16 +384,15 @@ impl AgentConnector for VsockAgentConnector {
             .parse::<std::net::SocketAddr>()
             .map_err(|e| ClouisleError::io(format!("invalid guest addr {guest_ip}:5201: {e}")))?;
         let deadline = tokio::time::Instant::now() + self.connect_timeout;
-        let mut last_err = String::new();
         loop {
-            match tokio::time::timeout(
+            let last_err = match tokio::time::timeout(
                 std::time::Duration::from_millis(500),
                 tokio::net::TcpStream::connect(guest_addr),
             )
             .await
             {
                 Ok(Ok(stream)) => {
-                    let mut conn = VsockFrameConnection {
+                    let conn = VsockFrameConnection {
                         sandbox_id: sandbox_id.to_string(),
                         stream: tokio::sync::Mutex::new(tokio::io::BufStream::new(stream)),
                     };
@@ -419,13 +418,9 @@ impl AgentConnector for VsockAgentConnector {
                     }
                     return Ok(Box::new(conn));
                 }
-                Ok(Err(e)) => {
-                    last_err = format!("{e}");
-                }
-                Err(_) => {
-                    last_err = "connect timed out".into();
-                }
-            }
+                Ok(Err(e)) => e.to_string(),
+                Err(_) => "connect timed out".into(),
+            };
             if tokio::time::Instant::now() >= deadline {
                 return Err(ClouisleError::new(
                     clouisle_core::ErrorKind::Vmm,
