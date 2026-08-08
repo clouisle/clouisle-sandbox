@@ -79,6 +79,7 @@ table ip filter {{
         ip daddr 10.0.0.0/8 accept
         ip daddr 127.0.0.0/8 accept
         iif "tap0" accept
+        iif "{veth_ns}" accept
         ct state established,related accept
         counter drop
     }}
