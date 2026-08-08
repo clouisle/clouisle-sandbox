@@ -378,8 +378,7 @@ impl Vmm for FirecrackerVmm {
 
         // 3. 配置根文件系统
         #[derive(Serialize)]
-        struct DriveConfig<'a> {
-            drive_id: &'a str,
+        struct DriveAdd<'a> {
             path_on_host: &'a str,
             is_root_device: bool,
             is_read_only: bool,
@@ -387,9 +386,8 @@ impl Vmm for FirecrackerVmm {
         let rootfs = self.rootfs_path(spec).to_string_lossy().into_owned();
         self.fc_put(
             &handle,
-            "/drives",
-            &DriveConfig {
-                drive_id: "rootfs",
+            "/drives/rootfs",
+            &DriveAdd {
                 path_on_host: &rootfs,
                 is_root_device: true,
                 is_read_only: false,
@@ -423,7 +421,7 @@ impl Vmm for FirecrackerVmm {
             // 使用与 netns rs 一致的短名作为宿主机 veth 设备名
             self.fc_put(
                 &handle,
-                "/network-interfaces",
+                "/network-interfaces/eth0",
                 &NetIface {
                     iface_id: "eth0",
                     host_dev_name: &host_dev,
