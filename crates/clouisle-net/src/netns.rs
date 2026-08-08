@@ -112,11 +112,25 @@ pub fn create_netns(sandbox_id: &str) -> Result<NetInfo> {
 }
 
 /// 将 Firecracker 创建的 tap0 加入网桥（VMM.create 之后调用）。
+/// Firecracker 建 tap0 有延迟，轮询等待其出现。
 pub fn attach_tap(sandbox_id: &str) -> Result<()> {
     let ns = ns_name(sandbox_id);
-    run_in_ns(&ns, &["link", "set", "tap0", "master", "br0"])?;
-    run_in_ns(&ns, &["link", "set", "tap0", "up"])?;
-    Ok(())
+    // 最多等 15s，每 500ms 检查一次
+    for _ in 0..30 {
+        match run_in_ns(&ns, &["link", "show", "tap0"]) {
+            Ok(_) => {
+                run_in_ns(&ns, &["link", "set", "tap0", "master", "br0"])?;
+                run_in_ns(&ns, &["link", "set", "tap0", "up"])?;
+                return Ok(());
+            }
+            Err(_) => {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            }
+        }
+    }
+    Err(ClouisleError::io(format!(
+        "tap0 did not appear in netns {ns} after Firecracker start"
+    )))
 }
 
 /// 删除沙盒 netns（自动清理 veth/tap/路由不自动删，需手动删路由）。
