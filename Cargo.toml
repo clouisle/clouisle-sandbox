@@ -16,6 +16,7 @@ members = [
     "crates/clouisle-obs",
     "crates/clouisled",
     "benches",
+    "sdk/rust",
 ]
 
 [workspace.package]
@@ -54,3 +55,4 @@ rand = "0.8"
 bytes = { version = "1.8", features = ["serde"] }
 derive_more = "1.0"
 pin-project = "1.1"
+reqwest = { version = "0.12", features = ["json", "stream"] }

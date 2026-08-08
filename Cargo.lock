@@ -689,6 +689,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "clouisle-sdk"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.19",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "clouisle-store"
 version = "0.1.0"
 dependencies = [
