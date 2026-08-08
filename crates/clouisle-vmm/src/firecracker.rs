@@ -453,7 +453,7 @@ impl Vmm for FirecrackerVmm {
         struct Action<'a> {
             action_type: &'a str,
         }
-        self.fc_post(h, "/actions", &Action { action_type: "InstanceStart" })
+        self.fc_put(h, "/actions", &Action { action_type: "InstanceStart" })
             .await?;
         info!(id = %h.id, "firecracker VM started");
         Ok(())
