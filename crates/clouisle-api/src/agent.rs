@@ -375,28 +375,30 @@ impl AgentConnector for VsockAgentConnector {
         use clouisle_proto::codec::{read_frame, write_frame};
         use clouisle_proto::Frame;
 
-        let cid = handle.vsock_cid.ok_or_else(|| {
+        // Firecracker vsock 使用 UDS 而非 AF_VSOCK：host 连接
+        // handle.vsock_socket 路径下的 Unix socket，Firecracker 作为代理
+        // 桥接到 guest 的 vsock 设备。
+        let vsock_path = handle.vsock_socket.as_ref().ok_or_else(|| {
             ClouisleError::new(
                 clouisle_core::ErrorKind::Vmm,
-                format!("VmHandle {} has no vsock_cid", handle.id),
+                format!("VmHandle {} has no vsock_socket", handle.id),
             )
         })?;
-        let addr = tokio_vsock::VsockAddr::new(cid as u32, AGENT_PORT);
         let stream = tokio::time::timeout(
             self.connect_timeout,
-            tokio_vsock::VsockStream::connect(addr),
+            tokio::net::UnixStream::connect(vsock_path),
         )
         .await
         .map_err(|_| {
             ClouisleError::new(
                 clouisle_core::ErrorKind::Vmm,
-                format!("vsock connect timeout (cid {cid}:{AGENT_PORT})"),
+                format!("vsock UDS connect timeout ({vsock_path})"),
             )
         })?
         .map_err(|e| {
             ClouisleError::new(
                 clouisle_core::ErrorKind::Vmm,
-                format!("vsock connect cid {cid}:{AGENT_PORT} failed: {e}"),
+                format!("vsock UDS connect {vsock_path}: {e}"),
             )
         })?;
 
@@ -431,10 +433,11 @@ impl AgentConnector for VsockAgentConnector {
 }
 
 /// 真实 vsock 连接：通过 Frame 协议与 guest agent 通信。
+/// 连接方式为 Firecracker 的 vsock UDS 代理。
 #[cfg(target_os = "linux")]
 pub struct VsockFrameConnection {
     sandbox_id: String,
-    stream: tokio::sync::Mutex<tokio::io::BufStream<tokio_vsock::VsockStream>>,
+    stream: tokio::sync::Mutex<tokio::io::BufStream<tokio::net::UnixStream>>,
 }
 
 #[cfg(target_os = "linux")]
