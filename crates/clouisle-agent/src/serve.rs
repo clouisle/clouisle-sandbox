@@ -147,7 +147,7 @@ pub async fn run_serve() -> AgentResult<()> {
     use tokio_vsock::{VsockAddr, VsockListener, VMADDR_CID_ANY};
 
     let addr = VsockAddr::new(VMADDR_CID_ANY, AGENT_PORT);
-    let listener = VsockListener::bind(addr).map_err(AgentError::Io)?;
+    let mut listener = VsockListener::bind(addr).map_err(AgentError::Io)?;
     tracing::info!("vsock agent listening on port {AGENT_PORT}");
 
     loop {
