@@ -1,7 +1,7 @@
 # ============================================================
 # Stage 1: 编译 Rust 二进制（多平台）
 # ============================================================
-FROM --platform=$BUILDPLATFORM rust:1.85-slim-bookworm AS builder
+FROM --platform=$BUILDPLATFORM rust:1-slim-bookworm AS builder
 
 ARG TARGETPLATFORM
 ARG BUILDPLATFORM
