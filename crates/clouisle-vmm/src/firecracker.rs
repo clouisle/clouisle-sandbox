@@ -173,11 +173,27 @@ impl FirecrackerVmm {
     }
 
     /// 内核命令行参数，从 spec 的 env 中提取 `boot_args` 或使用默认值。
-    fn boot_args(&self, spec: &SandboxSpec) -> String {
-        spec.env
+    /// 默认值包含 rootfs 挂载 + guest 静态 IP（与 clouisle-net netns 网段一致）。
+    fn boot_args(&self, sandbox_id: &str, spec: &SandboxSpec) -> String {
+        let base = spec
+            .env
             .get("boot_args")
             .cloned()
-            .unwrap_or_else(|| "console=ttyS0 reboot=k panic=1 pci=off".to_string())
+            .unwrap_or_else(|| "console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda rw".to_string());
+        // 追加 guest IP 配置（10.{a}.{b}.2/30，网关 10.{a}.{b}.1）
+        let (a, b) = Self::sandbox_subnet(sandbox_id);
+        format!("{base} ip=10.{a}.{b}.2::10.{a}.{b}.1:255.255.255.252::eth0:off")
+    }
+
+    /// 从 sandbox_id 派生独立网段（与 clouisle-net/src/netns.rs 算法一致）。
+    fn sandbox_subnet(sandbox_id: &str) -> (u16, u16) {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(sandbox_id.as_bytes());
+        let digest = hasher.finalize();
+        let a = 10 + (digest[0] as u16 % 200);
+        let b = 10 + (digest[1] as u16 % 200);
+        (a, b)
     }
 
     /// 生成一个可用的 guest CID（≥ 3，当前时间低位 + 随机）。
@@ -301,8 +317,11 @@ impl Vmm for FirecrackerVmm {
         std::fs::create_dir_all(&self.config.api_sock_dir)
             .map_err(|e| ClouisleError::io(e.to_string()))?;
 
-        // 启动 firecracker 进程（新进程组，便于 kill 整个组）
-        let mut cmd = tokio::process::Command::new(&self.config.firecracker_bin);
+        // 启动 firecracker 进程（在沙盒 netns 内运行，新进程组便于 kill）
+        let ns_name = format!("clo-{}", short_name(&id, ""));
+        let mut cmd = tokio::process::Command::new("ip");
+        cmd.arg("netns").arg("exec").arg(&ns_name);
+        cmd.arg(&self.config.firecracker_bin);
         cmd.arg("--api-sock").arg(&sock_path);
         if !self.config.enable_seccomp {
             cmd.arg("--no-seccomp");
@@ -313,13 +332,13 @@ impl Vmm for FirecrackerVmm {
 
         let child = cmd
             .spawn()
-            .map_err(|e| ClouisleError::new(ErrorKind::Vmm, format!("spawn firecracker: {e}")))?;
+            .map_err(|e| ClouisleError::new(ErrorKind::Vmm, format!("spawn firecracker in ns {ns_name}: {e}")))?;
 
         let pid = child.id().map(|p| p as u64);
         let cid = self.next_cid();
         let vsock_path = format!("/tmp/clouisle-{id}.vsock");
-        // 与 clouisle-net/src/netns.rs 一致的 TAP 设备短名
-        let host_dev = short_name(&id, "fc");
+        // TAP 设备在 netns 内，Firecracker 直连 tap0
+        let host_dev = "tap0";
 
         let handle = VmHandle {
             id: id.clone(),
@@ -370,7 +389,7 @@ impl Vmm for FirecrackerVmm {
             boot_args: &'a str,
         }
         let kernel_path = self.config.kernel_path.to_string_lossy().into_owned();
-        let boot_args = self.boot_args(spec);
+        let boot_args = self.boot_args(&id, spec);
         self.fc_put(
             &handle,
             "/boot-source",

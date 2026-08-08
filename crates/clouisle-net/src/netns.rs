@@ -1,13 +1,21 @@
-//! 沙盒网络管理（Linux only）。
+//! 沙盒网络命名空间管理（Linux only）。
 //!
-//! 每沙盒一个 host 侧 TAP 设备 `fc-<short-id>`，Firecracker 直连。
-//! nftables 规则在宿主侧直接控制 tap 设备流量。
+//! 每沙盒一个独立 netns `clo-<hash>`：
+//! - veth pair：宿主侧 `vh-<hash>` ↔ netns 侧 `vn-<hash>`
+//! - TAP 设备 `tap0` 在 netns 内，Firecracker 进程也在 netns 内运行，
+//!   guest eth0 直连 tap0
+//! - nftables 规则在 netns 内执行（per-netns，对宿主零影响）
+//!
+//! IP 规划（每沙盒独立网段，多沙盒不冲突）：
+//!   netns vn-<hash>: 10.{a}.{b}.1/30
+//!   guest (tap0):    10.{a}.{b}.2/30
+//!   宿主路由:        10.{a}.{b}.0/30 dev vh-<hash>
 
 use std::process::Command;
 
 use clouisle_core::ClouisleError;
 
-/// 从 sandbox_id 生成短接口名（ ≤ 15 字符，Linux 接口名上限）。
+/// 从 sandbox_id 生成短接口名（≤ 15 字符，Linux 接口名上限）。
 pub(crate) fn short_name(sandbox_id: &str, prefix: &str) -> String {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
@@ -16,36 +24,142 @@ pub(crate) fn short_name(sandbox_id: &str, prefix: &str) -> String {
     format!("{prefix}{}", &hash[..8])
 }
 
+/// netns 名（`clo-<hash>`）。
+pub(crate) fn ns_name(sandbox_id: &str) -> String {
+    format!("clo-{}", short_name(sandbox_id, ""))
+}
+
+/// 从 sandbox_id 派生独立网段 10.{a}.{b}.0/30。
+fn sandbox_subnet(sandbox_id: &str) -> (u16, u16) {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(sandbox_id.as_bytes());
+    let digest = hasher.finalize();
+    // a/b ∈ [10, 209]，避开常见内网段
+    let a = 10 + (digest[0] as u16 % 200);
+    let b = 10 + (digest[1] as u16 % 200);
+    (a, b)
+}
+
+/// 沙盒网段信息。
+#[derive(Debug, Clone)]
+pub struct NetInfo {
+    pub ns_name: String,
+    pub veth_host: String,
+    pub veth_ns: String,
+    pub subnet: String,   // 10.{a}.{b}.0/30
+    pub gateway: String,  // 10.{a}.{b}.1
+    pub guest_ip: String, // 10.{a}.{b}.2
+}
+
 /// 操作结果。
 pub type Result<T> = std::result::Result<T, ClouisleError>;
 
-/// 创建沙盒的 TAP 设备，供 Firecracker 直连。
+/// 创建沙盒 netns 拓扑。
 ///
-/// 架构：
-/// ```text
-/// guest eth0 ── fc-<hash> (TAP) ── nftables ── SNAT ── 宿主机
-/// ```
-/// 返回 TAP 设备名（如 `fc-a1b2c3d4`）。
-pub fn create_tap(sandbox_id: &str) -> Result<String> {
-    let tap_name = short_name(sandbox_id, "fc");
+/// 1. `ip netns add clo-<hash>`
+/// 2. 创建 veth pair `vh-<hash>` + `vn-<hash>`
+/// 3. `vn-<hash>` 移入 netns，配网关 IP
+/// 4. netns 内创建 TAP `tap0`，配 guest IP
+/// 5. netns 内开启 IP 转发
+/// 6. 宿主侧 `vh-<hash>` up + 添加指向沙盒网段的路由
+pub fn create_netns(sandbox_id: &str) -> Result<NetInfo> {
+    let (a, b) = sandbox_subnet(sandbox_id);
+    let info = NetInfo {
+        ns_name: ns_name(sandbox_id),
+        veth_host: short_name(sandbox_id, "vh"),
+        veth_ns: short_name(sandbox_id, "vn"),
+        subnet: format!("10.{a}.{b}.0/30"),
+        gateway: format!("10.{a}.{b}.1"),
+        guest_ip: format!("10.{a}.{b}.2"),
+    };
 
-    // 1. 创建 TAP 设备
-    run("ip", &["tuntap", "add", &tap_name, "mode", "tap"])?;
+    // 1. 创建 netns
+    run("ip", &["netns", "add", &info.ns_name])?;
 
-    // 2. 启用
-    run("ip", &["link", "set", &tap_name, "up"])?;
+    // 2. 创建 veth pair
+    run(
+        "ip",
+        &[
+            "link", "add", &info.veth_host, "type", "veth", "peer", "name", &info.veth_ns,
+        ],
+    )?;
 
-    // 3. 启用 IP 转发
-    run("sysctl", &["-w", "net.ipv4.ip_forward=1"])?;
+    // 3. veth_ns 移入 netns + 配置网关 IP
+    run("ip", &["link", "set", &info.veth_ns, "netns", &info.ns_name])?;
+    run_in_ns(&info.ns_name, &["addr", "add", &format!("{}/30", info.gateway), "dev", &info.veth_ns])?;
+    run_in_ns(&info.ns_name, &["link", "set", &info.veth_ns, "up"])?;
 
-    Ok(tap_name)
+    // 4. netns 内创建 TAP + 配置 guest IP
+    run_in_ns(&info.ns_name, &["tuntap", "add", "tap0", "mode", "tap"])?;
+    run_in_ns(&info.ns_name, &["addr", "add", &format!("{}/30", info.guest_ip), "dev", "tap0"])?;
+    run_in_ns(&info.ns_name, &["link", "set", "tap0", "up"])?;
+
+    // 5. netns 内开启 IP 转发
+    run_in_ns(&info.ns_name, &["-w", "net.ipv4.ip_forward=1"])?;
+
+    // 6. 宿主侧 veth up + 路由
+    run("ip", &["link", "set", &info.veth_host, "up"])?;
+    run(
+        "ip",
+        &["route", "replace", &info.subnet, "dev", &info.veth_host],
+    )?;
+
+    Ok(info)
 }
 
-/// 删除沙盒的 TAP 设备。
-pub fn delete_tap(sandbox_id: &str) -> Result<()> {
-    let tap_name = short_name(sandbox_id, "fc");
-    let _ = run("ip", &["link", "delete", &tap_name]);
+/// 删除沙盒 netns（自动清理 veth/tap/路由不自动删，需手动删路由）。
+pub fn delete_netns(sandbox_id: &str) -> Result<()> {
+    let info = NetInfo {
+        ns_name: ns_name(sandbox_id),
+        veth_host: short_name(sandbox_id, "vh"),
+        veth_ns: short_name(sandbox_id, "vn"),
+        subnet: String::new(),
+        gateway: String::new(),
+        guest_ip: String::new(),
+    };
+    // 删宿主路由
+    let _ = run("ip", &["route", "del", &sandbox_subnet_str(sandbox_id), "dev", &info.veth_host]);
+    // 删 netns（自动移除内部设备）
+    let _ = run("ip", &["netns", "del", &info.ns_name]);
     Ok(())
+}
+
+/// 在沙盒 netns 内执行命令（无 `ip netns exec` 前缀，调用方传完整命令）。
+pub(crate) fn run_in_ns(ns: &str, args: &[&str]) -> Result<String> {
+    let mut full = vec!["netns", "exec", ns];
+    full.push("ip");
+    full.extend_from_slice(args);
+    run("ip", &full)
+}
+
+/// 在沙盒 netns 内执行 nft 命令。
+pub(crate) fn run_nft_in_ns(ns: &str, args: &[&str]) -> Result<String> {
+    let mut full = vec!["netns", "exec", ns, "nft"];
+    full.extend_from_slice(args);
+    run("ip", &full)
+}
+
+/// 沙盒 guest IP（10.{a}.{b}.2）。
+pub fn guest_ip(sandbox_id: &str) -> String {
+    let (a, b) = sandbox_subnet(sandbox_id);
+    format!("10.{a}.{b}.2")
+}
+
+/// 沙盒网关 IP（10.{a}.{b}.1）。
+pub fn gateway_ip(sandbox_id: &str) -> String {
+    let (a, b) = sandbox_subnet(sandbox_id);
+    format!("10.{a}.{b}.1")
+}
+
+/// 沙盒网段（10.{a}.{b}.0/30）。
+pub fn subnet(sandbox_id: &str) -> String {
+    let (a, b) = sandbox_subnet(sandbox_id);
+    format!("10.{a}.{b}.0/30")
+}
+
+fn sandbox_subnet_str(sandbox_id: &str) -> String {
+    subnet(sandbox_id)
 }
 
 /// 执行系统命令并检查结果。
@@ -71,7 +185,13 @@ mod tests {
     #[test]
     fn short_name_length() {
         let name = short_name("019fe000-0000-0000-0000-000000000000", "fc");
-        assert!(name.len() <= 15, "name '{name}' too long");
-        assert!(name.starts_with("fc"));
+        assert!(name.len() <= 15);
+    }
+
+    #[test]
+    fn subnet_derived() {
+        let (a, b) = sandbox_subnet("019fe000-0000-0000-0000-000000000000");
+        assert!((10..210).contains(&a));
+        assert!((10..210).contains(&b));
     }
 }

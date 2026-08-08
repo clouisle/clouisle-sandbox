@@ -375,10 +375,12 @@ impl AgentConnector for VsockAgentConnector {
         use clouisle_proto::codec::{read_frame, write_frame};
         use clouisle_proto::Frame;
 
-        // 通过 guest 的 TAP 网络 IP (10.0.0.2) 进行 TCP 通信。
-        // 不使用 vsock，因为 Firecracker 的 vsock 需要 guest 内核驱动支持。
-        // TCP 隧道通过 TAP/veth 对，无需额外内核模块。
-        let guest_addr = std::net::SocketAddr::from(([10, 0, 0, 2], 5201));
+        // 通过 guest 的 TAP 网络 IP (每沙盒独立网段 10.{a}.{b}.2) 进行 TCP 通信。
+        // 不使用 vsock（需要 guest 内核驱动），TCP 隧道经 veth pair 跨 netns。
+        let guest_ip = clouisle_net::netns::guest_ip(sandbox_id);
+        let guest_addr = format!("{guest_ip}:5201")
+            .parse::<std::net::SocketAddr>()
+            .map_err(|e| ClouisleError::io(format!("invalid guest addr {guest_ip}:5201: {e}")))?;
         let deadline = tokio::time::Instant::now() + self.connect_timeout;
         let mut last_err = String::new();
         loop {
@@ -427,7 +429,7 @@ impl AgentConnector for VsockAgentConnector {
             if tokio::time::Instant::now() >= deadline {
                 return Err(ClouisleError::new(
                     clouisle_core::ErrorKind::Vmm,
-                    format!("guest TCP connect to 10.0.0.2:5201 failed: {last_err}"),
+                    format!("guest TCP connect to {guest_ip}:5201 failed: {last_err}"),
                 ));
             }
             tokio::time::sleep(std::time::Duration::from_millis(300)).await;

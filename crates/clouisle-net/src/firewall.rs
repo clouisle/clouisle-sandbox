@@ -1,14 +1,14 @@
-//! 防火墙编排器：联动 TAP 设备 + nftables + DNS 代理。
+//! 防火墙编排器：联动 netns + nftables + DNS 代理。
 //!
 //! 沙盒创建时：
-//! 1. 创建 host 侧 TAP 设备（`fc-<hash>`，Firecracker 直连）
-//! 2. 加载 nftables 规则集（默认 drop 入站 + 出站白名单 + SNAT）
-//! 3. 启动 DNS 代理（监听宿主 10.0.0.1:53）
+//! 1. 创建沙盒 netns（`clo-<hash>`）+ veth pair + TAP（[`netns::create_netns`]）
+//! 2. 在 netns 内加载 nftables 规则（per-netns，对宿主零影响）
+//! 3. 在 netns 内启动 DNS 代理（监听 10.0.0.1:53）
 //!
 //! 沙盒删除时：
 //! 1. 停止 DNS 代理
-//! 2. 删除 nftables 表
-//! 3. 删除 TAP 设备
+//! 2. 删除 netns 内 nftables 表
+//! 3. 删除 netns（自动清理 TAP/veth/路由）
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -24,8 +24,9 @@ use crate::nftables;
 /// 沙盒网络配置状态。
 #[derive(Debug)]
 struct SandboxNet {
-    tap: String,
-    host_ip: String,
+    ns_name: String,
+    veth_ns: String,
+    guest_ip: String,
 }
 
 /// 运行中的 DNS 代理句柄。
@@ -50,44 +51,73 @@ impl FirewallManager {
         }
     }
 
-    /// 创建 TAP 设备（VMM 启动前调用）。
-    pub async fn create_network(&self, sandbox_id: &str) -> Result<String, ClouisleError> {
-        netns::create_tap(sandbox_id)
+    /// 创建沙盒 netns 拓扑（VMM 启动前调用）。
+    /// 返回 `(ns_name, veth_ns, guest_ip)`。
+    pub async fn create_network(&self, sandbox_id: &str) -> Result<(String, String, String), ClouisleError> {
+        let info = netns::create_netns(sandbox_id)?;
+        Ok((info.ns_name.clone(), info.veth_ns.clone(), info.guest_ip.clone()))
     }
 
-    /// 为沙盒创建完整网络隔离环境。
-    ///
-    /// `veth_host_ip`：宿主机侧 TAP 的 IP（如 `192.168.100.1/30`），
-    /// 用于 SNAT 区分流量。
+    /// 为沙盒配置网络隔离（netns 内 nftables + DNS 代理）。
     pub async fn setup_sandbox_network(
         &self,
         sandbox_id: &str,
         veth_host_ip: &str,
         allow_egress: &[String],
     ) -> Result<(), ClouisleError> {
-        // 1. 获取已创建的 TAP 设备名
-        let tap = netns::short_name(sandbox_id, "fc");
+        let ns = netns::ns_name(sandbox_id);
+        let veth_ns = netns::short_name(sandbox_id, "vn");
 
-        // 2. 加载 nftables 规则（TAP 设备已存在）
-        nftables::setup_ruleset(sandbox_id, &tap, veth_host_ip)?;
+        // 1. netns 内加载 nftables 规则
+        nftables::setup_ruleset(sandbox_id, &ns, &veth_ns, veth_host_ip)?;
 
-        // 3. 创建并启动 DNS 代理（监听宿主 10.0.0.1:53）
+        // 2. 启动 DNS 代理（在 netns 内监听 10.0.0.1:53）
+        // 使用独立 OS 线程 + setns 进入沙盒 netns，避免污染 tokio 线程池
         let proxy = DnsProxy::new(allow_egress.to_vec());
         let proxy_srv = proxy.clone();
+        let ns_path = format!("/var/run/netns/{ns}");
         let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
-        let mut cancel_rx = cancel_rx;
-        tokio::spawn(async move {
-            tokio::select! {
-                _ = &mut cancel_rx => {
-                    tracing::debug!("dns proxy cancelled");
-                }
-                result = proxy_srv.serve("10.0.0.1") => {
-                    if let Err(e) = result {
-                        tracing::warn!(error = %e, "dns proxy stopped");
+        let cancel_rx = std::sync::Mutex::new(Some(cancel_rx));
+        std::thread::Builder::new()
+            .name(format!("dns-{}", netns::short_name(sandbox_id, "")))
+            .spawn(move || {
+                use std::os::unix::io::AsRawFd;
+                // 进入沙盒 netns
+                let file = match std::fs::File::open(&ns_path) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        tracing::warn!(ns = %ns_path, error = %e, "dns: open netns failed");
+                        return;
                     }
+                };
+                let fd = file.as_raw_fd();
+                if let Err(e) = nix::sched::setns(fd, nix::sched::CloneNewNet) {
+                    tracing::warn!(ns = %ns_path, error = %e, "dns: setns failed");
+                    return;
                 }
-            }
-        });
+                // 在 netns 内创建独立 tokio runtime
+                let rt = match tokio::runtime::Runtime::new() {
+                    Ok(r) => r,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "dns: create runtime failed");
+                        return;
+                    }
+                };
+                let cancel = cancel_rx.lock().unwrap().take().unwrap();
+                rt.block_on(async {
+                    tokio::select! {
+                        _ = cancel => {
+                            tracing::debug!(ns = %ns_path, "dns proxy cancelled");
+                        }
+                        result = proxy_srv.serve("10.0.0.1") => {
+                            if let Err(e) = result {
+                                tracing::warn!(ns = %ns_path, error = %e, "dns proxy stopped");
+                            }
+                        }
+                    }
+                });
+            })
+            .map_err(|e| ClouisleError::io(format!("spawn dns thread: {e}")))?;
 
         // 记录 DNS 代理句柄
         self.dns_proxies.lock().await.insert(
@@ -102,8 +132,9 @@ impl FirewallManager {
         self.nets.write().await.insert(
             sandbox_id.to_string(),
             SandboxNet {
-                tap,
-                host_ip: veth_host_ip.to_string(),
+                ns_name: ns,
+                veth_ns,
+                guest_ip: netns::guest_ip(sandbox_id),
             },
         );
 
@@ -117,11 +148,12 @@ impl FirewallManager {
             let _ = handle.cancel.send(());
         }
 
-        // 2. 删除 nftables
-        let _ = nftables::teardown_ruleset(sandbox_id);
+        // 2. 删除 netns 内 nftables
+        let ns = netns::ns_name(sandbox_id);
+        let _ = nftables::teardown_ruleset(sandbox_id, &ns);
 
-        // 3. 删除 TAP 设备
-        let _ = netns::delete_tap(sandbox_id);
+        // 3. 删除 netns（自动清理 TAP/veth/路由）
+        let _ = netns::delete_netns(sandbox_id);
 
         // 4. 清理状态
         self.nets.write().await.remove(sandbox_id);
@@ -129,14 +161,15 @@ impl FirewallManager {
         Ok(())
     }
 
-    /// 放行一个 IP（由 DNS 解析回调触发）。
+    /// 放行一个 IP（由 DNS 解析回调触发，netns 内）。
     pub async fn allow_ip(
         &self,
         sandbox_id: &str,
         ip: &str,
         ttl_secs: u64,
     ) -> Result<(), ClouisleError> {
-        nftables::allow_ip(sandbox_id, ip, ttl_secs)
+        let ns = netns::ns_name(sandbox_id);
+        nftables::allow_ip(sandbox_id, &ns, ip, ttl_secs)
     }
 
     /// 获取沙盒的 DNS 代理（供外部调用）。
