@@ -57,28 +57,27 @@ pub fn configure_network() -> Result<(), String> {
         .get("gateway")
         .ok_or_else(|| "clouisle.gateway not set in cmdline".to_string())?;
 
-    let ip_status = std::process::Command::new("ifconfig")
+    // 优先 ifconfig（net-tools），缺失则用 ip 命令
+    let configured = std::process::Command::new("ifconfig")
         .args(["eth0", guest_ip, "netmask", "255.255.255.252", "up"])
         .status()
-        .map_err(|e| format!("ifconfig failed: {e}"))?;
-    if !ip_status.success() {
-        // ifconfig 可能不存在（精简 rootfs），尝试 ip 命令
-        let ip_status = std::process::Command::new("ip")
-            .args([
-                "addr",
-                "add",
-                &format!("{guest_ip}/30"),
-                "dev",
-                "eth0",
-            ])
+        .map(|s| s.success())
+        .unwrap_or(false);
+
+    if !configured {
+        let up = std::process::Command::new("ip")
+            .args(["link", "set", "eth0", "up"])
             .status()
-            .map_err(|e| format!("ip addr failed: {e}"))?;
-        if !ip_status.success() {
+            .map(|s| s.success())
+            .unwrap_or(false);
+        let addr_ok = std::process::Command::new("ip")
+            .args(["addr", "add", &format!("{guest_ip}/30"), "dev", "eth0"])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !(up || addr_ok) {
             return Err("ifconfig and ip addr both failed for eth0".into());
         }
-        let _ = std::process::Command::new("ip")
-            .args(["link", "set", "eth0", "up"])
-            .status();
     }
 
     let _ = std::process::Command::new("route")
