@@ -8,7 +8,9 @@ use std::collections::HashMap;
 use bytes::Bytes;
 use clouisle_proto::{Frame, FrameDecoder};
 
-use crate::errors::{AgentError, AgentResult};
+use crate::errors::AgentResult;
+#[cfg(target_os = "linux")]
+use crate::errors::AgentError;
 
 /// 在内存解码缓冲上处理一字节块中的完整帧，返回响应帧。
 pub fn process_frames(decoder: &mut FrameDecoder, data: &[u8]) -> AgentResult<Vec<Frame>> {

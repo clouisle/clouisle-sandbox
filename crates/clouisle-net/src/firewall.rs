@@ -62,14 +62,14 @@ impl FirewallManager {
     pub async fn setup_sandbox_network(
         &self,
         sandbox_id: &str,
-        _veth_host_ip: &str,
+        veth_host_ip: &str,
         allow_egress: &[String],
     ) -> Result<(), ClouisleError> {
         // 1. 获取已创建的 TAP 设备名
         let tap = netns::short_name(sandbox_id, "fc");
 
         // 2. 加载 nftables 规则（TAP 设备已存在）
-        nftables::setup_ruleset(sandbox_id, &tap, _veth_host_ip)?;
+        nftables::setup_ruleset(sandbox_id, &tap, veth_host_ip)?;
 
         // 3. 创建并启动 DNS 代理（监听宿主 10.0.0.1:53）
         let proxy = DnsProxy::new(allow_egress.to_vec());

@@ -58,7 +58,7 @@ fn run(cmd: &str, args: &[&str]) -> Result<String> {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(ClouisleError::new(
             clouisle_core::ErrorKind::Network,
-            format!("{cmd} {' '.join(args)} failed: {stderr}"),
+            format!("{cmd} {} failed: {stderr}", args.join(" ")),
         ));
     }
     Ok(String::from_utf8_lossy(&output.stdout).to_string())

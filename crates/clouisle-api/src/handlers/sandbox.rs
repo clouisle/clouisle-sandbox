@@ -62,7 +62,7 @@ pub async fn create_sandbox(
     tracing::info!(sandbox_id = %id, "sandbox admitted");
 
     // 4. 创建 TAP 设备（网络隔离前置，VMM 需要已知 TAP 名）
-    let tap_name = {
+    let _tap_name = {
         #[cfg(target_os = "linux")]
         {
             let tap = match state.firewall.create_network(&id).await {
