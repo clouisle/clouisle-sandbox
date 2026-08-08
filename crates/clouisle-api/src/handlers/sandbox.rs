@@ -92,6 +92,8 @@ pub async fn create_sandbox(
                 .update_sandbox_status(&id, &SandboxStatus::Error)
                 .await
                 .ok();
+            #[cfg(target_os = "linux")]
+            let _ = state.firewall.teardown_sandbox_network(&id).await;
             return Err(e.into());
         }
     };
@@ -119,20 +121,31 @@ pub async fn create_sandbox(
             .update_sandbox_status(&id, &SandboxStatus::Error)
             .await
             .ok();
+        let _ = state.vmm.stop(&handle, clouisle_vmm::StopMode::Force).await;
+        #[cfg(target_os = "linux")]
+        let _ = state.firewall.teardown_sandbox_network(&id).await;
         return Err(e.into());
     }
 
     // 6. 配置网络隔离 + nftables + DNS 代理（Linux only）
     #[cfg(target_os = "linux")]
     {
-        let veth_host_ip = format!("192.168.{}.1/30", (id.as_bytes()[0] as u16) % 255);
+        let veth_host_ip = format!("{}/30", clouisle_net::netns::gateway_ip(&id));
         let allow = req.spec.network.allow_egress.clone();
         if let Err(e) = state
             .firewall
             .setup_sandbox_network(&id, &veth_host_ip, &allow)
             .await
         {
-            tracing::warn!(sandbox_id = %id, error = %e, "firewall setup failed (non-fatal)");
+            tracing::error!(sandbox_id = %id, error = %e, "firewall setup failed");
+            state
+                .store
+                .update_sandbox_status(&id, &SandboxStatus::Error)
+                .await
+                .ok();
+            let _ = state.vmm.stop(&handle, clouisle_vmm::StopMode::Force).await;
+            let _ = state.firewall.teardown_sandbox_network(&id).await;
+            return Err(e.into());
         }
     }
 
@@ -163,6 +176,8 @@ pub async fn create_sandbox(
                 .await
                 .ok();
             let _ = state.vmm.stop(&handle, clouisle_vmm::StopMode::Force).await;
+            #[cfg(target_os = "linux")]
+            let _ = state.firewall.teardown_sandbox_network(&id).await;
             Err(e.into())
         }
         Err(_elapsed) => {
@@ -172,6 +187,8 @@ pub async fn create_sandbox(
                 .await
                 .ok();
             let _ = state.vmm.stop(&handle, clouisle_vmm::StopMode::Force).await;
+            #[cfg(target_os = "linux")]
+            let _ = state.firewall.teardown_sandbox_network(&id).await;
             Err(ApiError(ClouisleError::timeout(format!(
                 "sandbox {id} agent hello timeout after {}s",
                 req.spec.start_timeout_secs

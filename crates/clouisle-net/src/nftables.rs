@@ -53,7 +53,7 @@ fn apply_ruleset_in_ns(ns: &str, ruleset: &str) -> Result<()> {
 /// 语义（全部在沙盒 netns 内，不影响宿主）：
 /// - forward policy drop：guest 出站放行、host→guest 仅 agent(5201)/DNS(53)/已建立
 /// - SNAT masquerade：guest 出站经 veth_ns 出网
-pub fn setup_ruleset(sandbox_id: &str, ns: &str, veth_ns: &str, _host_ip: &str) -> Result<()> {
+pub fn setup_ruleset(_sandbox_id: &str, ns: &str, veth_ns: &str, _host_ip: &str) -> Result<()> {
     let ruleset = format!(
         r#"
 table ip filter {{

@@ -2,14 +2,15 @@
 //!
 //! 每沙盒一个独立 netns `clo-<hash>`：
 //! - veth pair：宿主侧 `vh-<hash>` ↔ netns 侧 `vn-<hash>`
+//! - 宿主侧 `vh-<hash>` 与 netns 网桥使用同一网关地址 `.1/30`
 //! - TAP 设备 `tap0` 在 netns 内，Firecracker 进程也在 netns 内运行，
 //!   guest eth0 直连 tap0
 //! - nftables 规则在 netns 内执行（per-netns，对宿主零影响）
 //!
 //! IP 规划（每沙盒独立网段，多沙盒不冲突）：
-//!   netns vn-<hash>: 10.{a}.{b}.1/30
-//!   guest (tap0):    10.{a}.{b}.2/30
-//!   宿主路由:        10.{a}.{b}.0/30 dev vh-<hash>
+//!   宿主 veth / netns br0: 10.{a}.{b}.1/30
+//!   guest (tap0):          10.{a}.{b}.2/30
+//!   宿主路由:              10.{a}.{b}.0/30 dev vh-<hash>
 
 use std::process::Command;
 
@@ -51,7 +52,6 @@ pub struct NetInfo {
     pub gateway: String,  // 10.{a}.{b}.1
     pub guest_ip: String, // 10.{a}.{b}.2
 }
-
 /// 操作结果。
 pub type Result<T> = std::result::Result<T, ClouisleError>;
 
@@ -84,21 +84,37 @@ pub fn create_netns(sandbox_id: &str) -> Result<NetInfo> {
     run(
         "ip",
         &[
-            "link", "add", &info.veth_host, "type", "veth", "peer", "name", &info.veth_ns,
+            "link",
+            "add",
+            &info.veth_host,
+            "type",
+            "veth",
+            "peer",
+            "name",
+            &info.veth_ns,
         ],
     )?;
 
     // 3. veth_ns 移入 netns，创建网桥并桥接
-    run("ip", &["link", "set", &info.veth_ns, "netns", &info.ns_name])?;
+    run(
+        "ip",
+        &["link", "set", &info.veth_ns, "netns", &info.ns_name],
+    )?;
     run_in_ns(&info.ns_name, &["link", "add", "br0", "type", "bridge"])?;
-    run_in_ns(&info.ns_name, &["link", "set", &info.veth_ns, "master", "br0"])?;
+    run_in_ns(
+        &info.ns_name,
+        &["link", "set", &info.veth_ns, "master", "br0"],
+    )?;
     run_in_ns(&info.ns_name, &["link", "set", &info.veth_ns, "up"])?;
 
     // 4. 不预建 tap0：由 Firecracker 在 VMM.create 时创建（host_dev_name="tap0"），
     //    VMM.start 后由 attach_tap 轮询其出现并加入 br0。
 
     // 5. br0 配网关 IP
-    run_in_ns(&info.ns_name, &["addr", "add", &format!("{}/30", info.gateway), "dev", "br0"])?;
+    run_in_ns(
+        &info.ns_name,
+        &["addr", "add", &format!("{}/30", info.gateway), "dev", "br0"],
+    )?;
     run_in_ns(&info.ns_name, &["link", "set", "br0", "up"])?;
 
     // 6. netns 内开启 IP 转发
@@ -109,7 +125,13 @@ pub fn create_netns(sandbox_id: &str) -> Result<NetInfo> {
     //    guest 不会回 ARP，host→guest 连接始终卡在 INCOMPLETE。
     run(
         "ip",
-        &["addr", "add", &format!("{}/30", info.gateway), "dev", &info.veth_host],
+        &[
+            "addr",
+            "add",
+            &format!("{}/30", info.gateway),
+            "dev",
+            &info.veth_host,
+        ],
     )?;
     run("ip", &["link", "set", &info.veth_host, "up"])?;
     run(
@@ -153,7 +175,16 @@ pub fn delete_netns(sandbox_id: &str) -> Result<()> {
         guest_ip: String::new(),
     };
     // 删宿主路由
-    let _ = run("ip", &["route", "del", &sandbox_subnet_str(sandbox_id), "dev", &info.veth_host]);
+    let _ = run(
+        "ip",
+        &[
+            "route",
+            "del",
+            &sandbox_subnet_str(sandbox_id),
+            "dev",
+            &info.veth_host,
+        ],
+    );
     // 删 netns（自动移除内部设备）
     let _ = run("ip", &["netns", "del", &info.ns_name]);
     Ok(())
