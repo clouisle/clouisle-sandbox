@@ -276,13 +276,9 @@ impl FirecrackerVmm {
 
 /// 读取 hyper 响应体到字符串。
 async fn read_body(resp: hyper::Response<Incoming>) -> String {
-    use hyper::body::Buf;
-    let body = hyper::body::aggregate(resp.into_body()).await;
+    let body = hyper::body::to_bytes(resp.into_body()).await;
     match body {
-        Ok(mut buf) => {
-            let bytes = buf.copy_to_bytes(buf.remaining());
-            String::from_utf8_lossy(&bytes).to_string()
-        }
+        Ok(bytes) => String::from_utf8_lossy(&bytes).to_string(),
         Err(e) => format!("<read error: {e}>"),
     }
 }
@@ -341,7 +337,7 @@ impl Vmm for FirecrackerVmm {
 
         // 1. 配置机器规格
         #[derive(Serialize)]
-        struct MachineConfig<'a> {
+        struct MachineConfig {
             vcpu_count: u16,
             mem_size_mib: u32,
             smt: bool,
