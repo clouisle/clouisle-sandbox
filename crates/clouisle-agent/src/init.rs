@@ -84,6 +84,11 @@ pub fn configure_network() -> Result<(), String> {
         .args(["add", "default", "gw", gateway])
         .status();
 
+    // 记录接口状态（排查用）
+    if let Ok(out) = std::process::Command::new("ip").args(["link", "show"]).output() {
+        tracing::info!(links = %String::from_utf8_lossy(&out.stdout), "guest link state");
+    }
+
     tracing::info!(guest_ip = %guest_ip, gateway = %gateway, "guest network configured");
     Ok(())
 }
