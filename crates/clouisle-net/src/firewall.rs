@@ -97,8 +97,9 @@ impl FirewallManager {
                     }
                 };
                 let fd = file.as_raw_fd();
-                if let Err(e) = nix::sched::setns(fd, nix::sched::CloneNewNet) {
-                    tracing::warn!(ns = ns_path, error = %e, "dns: setns failed");
+                let ret = unsafe { libc::setns(fd, libc::CLONE_NEWNET) };
+                if ret != 0 {
+                    tracing::warn!(ns = ns_path, error = %std::io::Error::last_os_error(), "dns: setns failed");
                     return;
                 }
 

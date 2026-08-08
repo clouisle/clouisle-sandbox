@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 clouisle-core = { path = "../clouisle-core" }
+libc.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 tokio.workspace = true

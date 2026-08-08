@@ -626,6 +626,7 @@ dependencies = [
  "hex",
  "hickory-proto",
  "hickory-resolver",
+ "libc",
  "nix 0.29.0",
  "rtnetlink",
  "serde",

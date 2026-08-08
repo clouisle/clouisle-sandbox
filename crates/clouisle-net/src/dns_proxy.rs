@@ -39,6 +39,12 @@ pub struct DnsProxy {
     upstream: TokioAsyncResolver,
 }
 
+impl std::fmt::Debug for DnsProxy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DnsProxy").finish_non_exhaustive()
+    }
+}
+
 impl DnsProxy {
     /// 创建 DNS 代理。
     pub fn new(domains: Vec<String>) -> Self {
@@ -62,7 +68,7 @@ impl DnsProxy {
     /// 收到查询后，解析域名、检查白名单、转发或拒绝。
     pub async fn serve(&self, addr: &str) -> Result<(), DnsError> {
         let bind = format!("{addr}:53");
-        let sock = UdpSocket::bind(&bind).await.map_err(DnsError::Io)?;
+        let sock = Arc::new(UdpSocket::bind(&bind).await.map_err(DnsError::Io)?);
         tracing::info!(bind = %bind, "dns proxy listening");
         let mut buf = [0u8; 4096];
 
@@ -70,7 +76,7 @@ impl DnsProxy {
             let (len, src) = sock.recv_from(&mut buf).await.map_err(DnsError::Io)?;
             let query = buf[..len].to_vec();
             let proxy = self.clone();
-            let sock = sock.try_clone().map_err(DnsError::Io)?;
+            let sock = sock.clone();
 
             tokio::spawn(async move {
                 if let Err(e) = proxy.handle_query(&sock, src, &query).await {
@@ -83,7 +89,7 @@ impl DnsProxy {
     /// 处理单条 DNS 查询。
     async fn handle_query(
         &self,
-        sock: &UdpSocket,
+        sock: &Arc<UdpSocket>,
         src: SocketAddr,
         query: &[u8],
     ) -> Result<(), DnsError> {
@@ -130,14 +136,12 @@ impl DnsProxy {
             RecordType::A => {
                 if let Ok(addrs) = self.upstream.lookup_ip(domain).await {
                     for addr in addrs.iter() {
-                        if let Some(ip) = addr.to_ip() {
-                            if ip.is_ipv4() {
-                                response.add_answer(hickory_proto::rr::Record::from_rdata(
-                                    Name::from_ascii(domain).unwrap(),
-                                    60,
-                                    hickory_proto::rr::RData::A(ip.into()),
-                                ));
-                            }
+                        if addr.is_ipv4() {
+                            response.add_answer(hickory_proto::rr::Record::from_rdata(
+                                Name::from_ascii(domain).unwrap(),
+                                60,
+                                hickory_proto::rr::RData::A(addr.into()),
+                            ));
                         }
                     }
                 } else {
@@ -147,14 +151,12 @@ impl DnsProxy {
             RecordType::AAAA => {
                 if let Ok(addrs) = self.upstream.lookup_ip(domain).await {
                     for addr in addrs.iter() {
-                        if let Some(ip) = addr.to_ip() {
-                            if ip.is_ipv6() {
-                                response.add_answer(hickory_proto::rr::Record::from_rdata(
-                                    Name::from_ascii(domain).unwrap(),
-                                    60,
-                                    hickory_proto::rr::RData::AAAA(ip.into()),
-                                ));
-                            }
+                        if addr.is_ipv6() {
+                            response.add_answer(hickory_proto::rr::Record::from_rdata(
+                                Name::from_ascii(domain).unwrap(),
+                                60,
+                                hickory_proto::rr::RData::AAAA(addr.into()),
+                            ));
                         }
                     }
                 } else {

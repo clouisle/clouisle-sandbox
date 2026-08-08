@@ -13,6 +13,6 @@ pub mod netns;
 pub mod nftables;
 
 #[cfg(target_os = "linux")]
-pub use dns_proxy::{DnsProxy, DnsRule};
+pub use dns_proxy::DnsProxy;
 #[cfg(target_os = "linux")]
 pub use firewall::FirewallManager;
