@@ -318,8 +318,8 @@ impl Vmm for FirecrackerVmm {
         let pid = child.id().map(|p| p as u64);
         let cid = self.next_cid();
         let vsock_path = format!("/tmp/clouisle-{id}.vsock");
-        // 与 clouisle-net/src/netns.rs 一致的短名
-        let host_dev = short_name(&id, "vh");
+        // 与 clouisle-net/src/netns.rs 一致的 TAP 设备短名
+        let host_dev = short_name(&id, "fc");
 
         let handle = VmHandle {
             id: id.clone(),

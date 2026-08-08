@@ -61,7 +61,28 @@ pub async fn create_sandbox(
     state.store.create_sandbox(&sandbox).await?;
     tracing::info!(sandbox_id = %id, "sandbox admitted");
 
-    // 4. VMM create + start
+    // 4. 创建 TAP 设备（网络隔离前置，VMM 需要已知 TAP 名）
+    let tap_name = {
+        #[cfg(target_os = "linux")]
+        {
+            let tap = match state.firewall.create_network(&id).await {
+                Ok(t) => t,
+                Err(e) => {
+                    state
+                        .store
+                        .update_sandbox_status(&id, &SandboxStatus::Error)
+                        .await
+                        .ok();
+                    return Err(e.into());
+                }
+            };
+            Some(tap)
+        }
+        #[cfg(not(target_os = "linux"))]
+        None::<String>
+    };
+
+    // 5. VMM create + start
     let start = std::time::Instant::now();
     let handle = match state.vmm.create(&req.spec).await {
         Ok(h) => h,
@@ -101,7 +122,7 @@ pub async fn create_sandbox(
         return Err(e.into());
     }
 
-    // 5. 配置网络隔离（Linux only）
+    // 6. 配置网络隔离 + nftables + DNS 代理（Linux only）
     #[cfg(target_os = "linux")]
     {
         let veth_host_ip = format!("192.168.{}.1/30", (id.as_bytes()[0] as u16) % 255);
@@ -115,7 +136,7 @@ pub async fn create_sandbox(
         }
     }
 
-    // 6. 等 agent hello（Start → Running）
+    // 7. 等 agent hello（Start → Running）
     let start_timeout = tokio::time::Duration::from_secs(req.spec.start_timeout_secs);
     let hello =
         tokio::time::timeout(start_timeout, state.agent.connect_and_hello(&handle, &id)).await;
