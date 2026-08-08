@@ -81,7 +81,6 @@ impl FirewallManager {
         std::thread::Builder::new()
             .name(format!("dns-{}", netns::short_name(sandbox_id, "")))
             .spawn(move || {
-                use std::os::unix::io::AsRawFd;
                 // 进入沙盒 netns
                 let file = match std::fs::File::open(&ns_path) {
                     Ok(f) => f,
@@ -90,8 +89,7 @@ impl FirewallManager {
                         return;
                     }
                 };
-                let fd = file.as_raw_fd();
-                if let Err(e) = nix::sched::setns(fd, nix::sched::CloneNewNet) {
+                if let Err(e) = nix::sched::setns(&file, nix::sched::CloneFlags::CLONE_NEWNET) {
                     tracing::warn!(ns = %ns_path, error = %e, "dns: setns failed");
                     return;
                 }
