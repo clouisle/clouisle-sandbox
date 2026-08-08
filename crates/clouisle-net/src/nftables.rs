@@ -71,7 +71,6 @@ table ip filter {{
     chain input {{
         type filter hook input priority 0; policy drop;
         iif "lo" accept
-        iif "tap0" accept
         iif "{veth_ns}" tcp dport 5201 accept
         iif "{veth_ns}" udp dport 53 accept
         ct state established,related accept

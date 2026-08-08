@@ -90,9 +90,8 @@ pub fn create_netns(sandbox_id: &str) -> Result<NetInfo> {
     run_in_ns(&info.ns_name, &["addr", "add", &format!("{}/30", info.gateway), "dev", &info.veth_ns])?;
     run_in_ns(&info.ns_name, &["link", "set", &info.veth_ns, "up"])?;
 
-    // 4. netns 内创建 TAP + 配置 guest IP
+    // 4. netns 内创建 TAP（纯 L2，不配 IP；guest eth0 自己配 IP）
     run_in_ns(&info.ns_name, &["tuntap", "add", "tap0", "mode", "tap"])?;
-    run_in_ns(&info.ns_name, &["addr", "add", &format!("{}/30", info.guest_ip), "dev", "tap0"])?;
     run_in_ns(&info.ns_name, &["link", "set", "tap0", "up"])?;
 
     // 5. netns 内开启 IP 转发
