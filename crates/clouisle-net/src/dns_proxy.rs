@@ -136,11 +136,11 @@ impl DnsProxy {
             RecordType::A => {
                 if let Ok(addrs) = self.upstream.lookup_ip(domain).await {
                     for addr in addrs.iter() {
-                        if let std::net::IpAddr::V4(ipv4) = addr {
+                        if let hickory_proto::rr::RData::A(ipv4) = addr {
                             response.add_answer(hickory_proto::rr::Record::from_rdata(
                                 Name::from_ascii(domain).unwrap(),
                                 60,
-                                hickory_proto::rr::RData::A(ipv4),
+                                hickory_proto::rr::RData::A(*ipv4),
                             ));
                         }
                     }
@@ -151,11 +151,11 @@ impl DnsProxy {
             RecordType::AAAA => {
                 if let Ok(addrs) = self.upstream.lookup_ip(domain).await {
                     for addr in addrs.iter() {
-                        if let std::net::IpAddr::V6(ipv6) = addr {
+                        if let hickory_proto::rr::RData::AAAA(ipv6) = addr {
                             response.add_answer(hickory_proto::rr::Record::from_rdata(
                                 Name::from_ascii(domain).unwrap(),
                                 60,
-                                hickory_proto::rr::RData::AAAA(ipv6),
+                                hickory_proto::rr::RData::AAAA(*ipv6),
                             ));
                         }
                     }
