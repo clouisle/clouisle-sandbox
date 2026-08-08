@@ -180,6 +180,8 @@ impl AgentConnection for MockAgentConnection {
         let dir = std::env::temp_dir()
             .join("clouisle-mock-fs")
             .join(&self.sandbox_id);
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| ClouisleError::io(format!("mkdir sandbox: {e}")))?;
         let path = path.trim_start_matches('/');
         if path.split('/').any(|seg| seg == "..") {
             return Err(ClouisleError::validation(format!(
