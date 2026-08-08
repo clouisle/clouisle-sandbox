@@ -7,7 +7,6 @@ use axum::response::IntoResponse;
 use serde::{Deserialize, Serialize};
 
 use clouisle_core::{ClouisleError, Sandbox, SandboxEvent, SandboxSpec, SandboxStatus};
-use tracing;
 
 use crate::error::ApiError;
 use crate::state::AppState;
@@ -111,7 +110,7 @@ pub async fn create_sandbox(
             .setup_sandbox_network(&id, &veth_host_ip, &allow)
             .await
         {
-            warn!(sandbox_id = %id, error = %e, "firewall setup failed (non-fatal)");
+            tracing::warn!(sandbox_id = %id, error = %e, "firewall setup failed (non-fatal)");
         }
     }
 
@@ -215,7 +214,7 @@ pub async fn delete_sandbox(
     #[cfg(target_os = "linux")]
     {
         if let Err(e) = state.firewall.teardown_sandbox_network(&id).await {
-            warn!(sandbox_id = %id, error = %e, "firewall teardown failed");
+            tracing::warn!(sandbox_id = %id, error = %e, "firewall teardown failed");
         }
     }
     Ok(StatusCode::NO_CONTENT)
