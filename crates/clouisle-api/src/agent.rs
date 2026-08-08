@@ -384,51 +384,64 @@ impl AgentConnector for VsockAgentConnector {
                 format!("VmHandle {} has no vsock_socket", handle.id),
             )
         })?;
-        let stream = tokio::time::timeout(
-            self.connect_timeout,
-            tokio::net::UnixStream::connect(vsock_path),
-        )
-        .await
-        .map_err(|_| {
-            ClouisleError::new(
-                clouisle_core::ErrorKind::Vmm,
-                format!("vsock UDS connect timeout ({vsock_path})"),
+
+        // guest 启动需要时间：vsock 桥接就绪前连接会 WouldBlock/ECONNREFUSED，
+        // 所以轮询重试直到超时。
+        let deadline = tokio::time::Instant::now() + self.connect_timeout;
+        let mut last_err = String::new();
+        loop {
+            match tokio::time::timeout(
+                std::time::Duration::from_millis(500),
+                tokio::net::UnixStream::connect(vsock_path),
             )
-        })?
-        .map_err(|e| {
-            ClouisleError::new(
-                clouisle_core::ErrorKind::Vmm,
-                format!("vsock UDS connect {vsock_path}: {e}"),
-            )
-        })?;
+            .await
+            {
+                Ok(Ok(stream)) => {
+                    let mut conn = VsockFrameConnection {
+                        sandbox_id: sandbox_id.to_string(),
+                        stream: tokio::sync::Mutex::new(tokio::io::BufStream::new(stream)),
+                    };
 
-        let mut conn = VsockFrameConnection {
-            sandbox_id: sandbox_id.to_string(),
-            stream: tokio::sync::Mutex::new(tokio::io::BufStream::new(stream)),
-        };
+                    // 发送 Hello，等待 guest 回应 Hello。
+                    write_frame(
+                        &mut *conn.stream.lock().await,
+                        &Frame::Hello {
+                            agent_version: env!("CARGO_PKG_VERSION").to_string(),
+                        },
+                    )
+                    .await
+                    .map_err(|e| {
+                        ClouisleError::io(format!("write Hello to {vsock_path}: {e}"))
+                    })?;
 
-        // 发送 Hello，等待 guest 回应 Hello。
-        write_frame(
-            &mut *conn.stream.lock().await,
-            &Frame::Hello {
-                agent_version: env!("CARGO_PKG_VERSION").to_string(),
-            },
-        )
-        .await
-        .map_err(|e| {
-            ClouisleError::io(format!("write Hello to {vsock_path}: {e}"))
-        })?;
-
-        let resp = read_frame(&mut *conn.stream.lock().await).await.map_err(|e| {
-            ClouisleError::io(format!("read Hello response from {vsock_path}: {e}"))
-        })?;
-        if !matches!(resp, Frame::Hello { .. }) {
-            return Err(ClouisleError::invalid_state(format!(
-                "expected Hello from guest, got unexpected frame"
-            )));
+                    let resp = read_frame(&mut *conn.stream.lock().await)
+                        .await
+                        .map_err(|e| {
+                            ClouisleError::io(format!("read Hello response from {vsock_path}: {e}"))
+                        })?;
+                    if !matches!(resp, Frame::Hello { .. }) {
+                        return Err(ClouisleError::invalid_state(format!(
+                            "expected Hello from guest, got unexpected frame"
+                        )));
+                    }
+                    return Ok(Box::new(conn));
+                }
+                Ok(Err(e)) => {
+                    last_err = format!("{e}");
+                    // guest 未就绪，重试
+                }
+                Err(_) => {
+                    last_err = "connect timed out".into();
+                }
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(ClouisleError::new(
+                    clouisle_core::ErrorKind::Vmm,
+                    format!("vsock UDS connect {vsock_path} failed after retries: {last_err}"),
+                ));
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         }
-
-        Ok(Box::new(conn))
     }
 }
 
