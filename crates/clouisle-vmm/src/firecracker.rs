@@ -379,6 +379,7 @@ impl Vmm for FirecrackerVmm {
         // 3. 配置根文件系统
         #[derive(Serialize)]
         struct DriveAdd<'a> {
+            drive_id: &'a str,
             path_on_host: &'a str,
             is_root_device: bool,
             is_read_only: bool,
@@ -388,6 +389,7 @@ impl Vmm for FirecrackerVmm {
             &handle,
             "/drives/rootfs",
             &DriveAdd {
+                drive_id: "rootfs",
                 path_on_host: &rootfs,
                 is_root_device: true,
                 is_read_only: false,
