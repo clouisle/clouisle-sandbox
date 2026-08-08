@@ -79,13 +79,12 @@ impl FirecrackerVmm {
         }
         if self.config.use_jailer
             && let Some(j) = &self.config.jailer_bin
+            && !j.exists()
         {
-            if !j.exists() {
-                return Err(ClouisleError::new(
-                    ErrorKind::Vmm,
-                    format!("jailer not found at {}", j.display()),
-                ));
-            }
+            return Err(ClouisleError::new(
+                ErrorKind::Vmm,
+                format!("jailer not found at {}", j.display()),
+            ));
         }
         if !std::path::Path::new("/dev/kvm").exists() {
             return Err(ClouisleError::new(
