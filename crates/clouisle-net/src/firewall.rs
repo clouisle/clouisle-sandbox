@@ -68,6 +68,11 @@ impl FirewallManager {
         let ns = netns::ns_name(sandbox_id);
         let veth_ns = netns::short_name(sandbox_id, "vn");
 
+        // 0. 将 Firecracker 创建的 tap0 加入网桥
+        if let Err(e) = netns::attach_tap(sandbox_id) {
+            tracing::warn!(sandbox_id = %sandbox_id, error = %e, "attach tap0 to br0 failed");
+        }
+
         // 1. netns 内加载 nftables 规则
         nftables::setup_ruleset(sandbox_id, &ns, &veth_ns, veth_host_ip)?;
 

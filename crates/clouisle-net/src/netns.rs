@@ -60,10 +60,12 @@ pub type Result<T> = std::result::Result<T, ClouisleError>;
 /// 1. `ip netns add clo-<hash>`
 /// 2. 创建 veth pair `vh-<hash>` + `vn-<hash>`
 /// 3. `vn-<hash>` 移入 netns，加入网桥 `br0`
-/// 4. netns 内创建 TAP `tap0`，加入 `br0`
-/// 5. `br0` 配网关 IP（ARP 经网桥在 vn/tap0 间 L2 转发）
-/// 6. netns 内开启 IP 转发
-/// 7. 宿主侧 `vh-<hash>` up + 添加指向沙盒网段的路由
+/// 4. `br0` 配网关 IP
+/// 5. netns 内开启 IP 转发
+/// 6. 宿主侧 `vh-<hash>` up + 添加指向沙盒网段的路由
+///
+/// 注意：**不预建 tap0**。tap0 由 Firecracker 在 VMM.create 时创建
+/// （host_dev_name="tap0"），随后由 [`attach_tap`] 加入 br0。
 pub fn create_netns(sandbox_id: &str) -> Result<NetInfo> {
     let (a, b) = sandbox_subnet(sandbox_id);
     let info = NetInfo {
@@ -92,19 +94,14 @@ pub fn create_netns(sandbox_id: &str) -> Result<NetInfo> {
     run_in_ns(&info.ns_name, &["link", "set", &info.veth_ns, "master", "br0"])?;
     run_in_ns(&info.ns_name, &["link", "set", &info.veth_ns, "up"])?;
 
-    // 4. netns 内创建 TAP（纯 L2），加入网桥
-    run_in_ns(&info.ns_name, &["tuntap", "add", "tap0", "mode", "tap"])?;
-    run_in_ns(&info.ns_name, &["link", "set", "tap0", "master", "br0"])?;
-    run_in_ns(&info.ns_name, &["link", "set", "tap0", "up"])?;
-
-    // 5. br0 配网关 IP
+    // 4. br0 配网关 IP
     run_in_ns(&info.ns_name, &["addr", "add", &format!("{}/30", info.gateway), "dev", "br0"])?;
     run_in_ns(&info.ns_name, &["link", "set", "br0", "up"])?;
 
-    // 6. netns 内开启 IP 转发
+    // 5. netns 内开启 IP 转发
     run_sysctl_in_ns(&info.ns_name, &["-w", "net.ipv4.ip_forward=1"])?;
 
-    // 7. 宿主侧 veth up + 路由
+    // 6. 宿主侧 veth up + 路由
     run("ip", &["link", "set", &info.veth_host, "up"])?;
     run(
         "ip",
@@ -112,6 +109,14 @@ pub fn create_netns(sandbox_id: &str) -> Result<NetInfo> {
     )?;
 
     Ok(info)
+}
+
+/// 将 Firecracker 创建的 tap0 加入网桥（VMM.create 之后调用）。
+pub fn attach_tap(sandbox_id: &str) -> Result<()> {
+    let ns = ns_name(sandbox_id);
+    run_in_ns(&ns, &["link", "set", "tap0", "master", "br0"])?;
+    run_in_ns(&ns, &["link", "set", "tap0", "up"])?;
+    Ok(())
 }
 
 /// 删除沙盒 netns（自动清理 veth/tap/路由不自动删，需手动删路由）。
