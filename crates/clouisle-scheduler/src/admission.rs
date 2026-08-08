@@ -213,6 +213,7 @@ impl std::fmt::Debug for Reservation {
 mod tests {
     use super::*;
     use clouisle_core::ImageRef;
+    use clouisle_core::error::ErrorKind;
 
     fn spec(vcpu: u16, mem: u32, disk: u32) -> SandboxSpec {
         SandboxSpec {

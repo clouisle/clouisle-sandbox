@@ -30,6 +30,12 @@ pub struct TestVmm {
 
 impl TestVmm {
     pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl Default for TestVmm {
+    fn default() -> Self {
         Self {
             running: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }

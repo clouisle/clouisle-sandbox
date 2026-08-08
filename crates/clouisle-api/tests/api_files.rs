@@ -88,6 +88,7 @@ fn app() -> Router {
 }
 
 /// 使用唯一的测试 ID 作为沙盒 ID，避免并发测试在 `/tmp/clouisle-mock-fs/` 下的冲突。
+#[allow(dead_code)]
 fn unique_id() -> String {
     uuid::Uuid::now_v7().to_string()
 }

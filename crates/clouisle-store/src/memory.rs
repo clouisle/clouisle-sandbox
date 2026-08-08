@@ -166,7 +166,7 @@ mod tests {
     #[tokio::test]
     async fn update_status() {
         let s = InMemoryStore::new();
-        let mut sb = make_sandbox("sbx-1");
+        let sb = make_sandbox("sbx-1");
         s.create_sandbox(&sb).await.unwrap();
         s.update_sandbox_status("sbx-1", &SandboxStatus::Running)
             .await

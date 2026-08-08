@@ -170,6 +170,7 @@ fn compute_hash(event: &AuditEvent, prev_hash: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Utc;
     use serde_json::json;
 
     fn test_event(seq: u64) -> AuditEvent {

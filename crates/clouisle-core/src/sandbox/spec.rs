@@ -134,7 +134,7 @@ mod tests {
 
     #[test]
     fn pool_key_distinct_by_resources() {
-        let mut a = valid_spec();
+        let a = valid_spec();
         let mut b = valid_spec();
         b.resources.vcpu = 2;
         assert_ne!(a.pool_key(), b.pool_key());

@@ -180,7 +180,7 @@ mod tests {
 
     #[tokio::test]
     async fn serve_loop_exec() {
-        let (mut a, mut b) = duplex(128);
+        let (mut a, b) = duplex(128);
         // 拆出独立读写半部
         let (mut br, mut bw) = tokio::io::split(b);
         let server = tokio::spawn(async move { serve_loop(&mut br, &mut bw).await });
