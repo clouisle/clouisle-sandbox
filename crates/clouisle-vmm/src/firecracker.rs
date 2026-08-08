@@ -383,6 +383,7 @@ impl Vmm for FirecrackerVmm {
             path_on_host: &'a str,
             is_root_device: bool,
             is_read_only: bool,
+            cache_type: &'a str,
         }
         let rootfs = self.rootfs_path(spec).to_string_lossy().into_owned();
         self.fc_put(
@@ -393,6 +394,7 @@ impl Vmm for FirecrackerVmm {
                 path_on_host: &rootfs,
                 is_root_device: true,
                 is_read_only: false,
+                cache_type: "Unsafe",
             },
         )
         .await?;
