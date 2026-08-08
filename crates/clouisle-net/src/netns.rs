@@ -96,7 +96,7 @@ pub fn create_netns(sandbox_id: &str) -> Result<NetInfo> {
     run_in_ns(&info.ns_name, &["link", "set", "tap0", "up"])?;
 
     // 5. netns 内开启 IP 转发
-    run_in_ns(&info.ns_name, &["-w", "net.ipv4.ip_forward=1"])?;
+    run_sysctl_in_ns(&info.ns_name, &["-w", "net.ipv4.ip_forward=1"])?;
 
     // 6. 宿主侧 veth up + 路由
     run("ip", &["link", "set", &info.veth_host, "up"])?;
@@ -129,6 +129,13 @@ pub fn delete_netns(sandbox_id: &str) -> Result<()> {
 pub(crate) fn run_in_ns(ns: &str, args: &[&str]) -> Result<String> {
     let mut full = vec!["netns", "exec", ns];
     full.push("ip");
+    full.extend_from_slice(args);
+    run("ip", &full)
+}
+
+/// 在沙盒 netns 内执行 sysctl 命令。
+pub(crate) fn run_sysctl_in_ns(ns: &str, args: &[&str]) -> Result<String> {
+    let mut full = vec!["netns", "exec", ns, "sysctl"];
     full.extend_from_slice(args);
     run("ip", &full)
 }
