@@ -21,14 +21,6 @@ use crate::dns_proxy::DnsProxy;
 use crate::netns;
 use crate::nftables;
 
-/// 沙盒网络配置状态。
-#[derive(Debug)]
-struct SandboxNet {
-    ns_name: String,
-    veth_ns: String,
-    guest_ip: String,
-}
-
 /// 运行中的 DNS 代理句柄。
 #[derive(Debug)]
 struct DnsHandle {
@@ -39,7 +31,7 @@ struct DnsHandle {
 /// 防火墙编排器。
 #[derive(Debug, Clone)]
 pub struct FirewallManager {
-    nets: Arc<RwLock<HashMap<String, SandboxNet>>>,
+    nets: Arc<RwLock<HashMap<String, ()>>>,
     dns_proxies: Arc<Mutex<HashMap<String, DnsHandle>>>,
 }
 
@@ -76,9 +68,7 @@ impl FirewallManager {
         let veth_ns = netns::short_name(sandbox_id, "vn");
 
         // 0. 将 Firecracker 创建的 tap0 加入网桥
-        if let Err(e) = netns::attach_tap(sandbox_id) {
-            tracing::warn!(sandbox_id = %sandbox_id, error = %e, "attach tap0 to br0 failed");
-        }
+        netns::attach_tap(sandbox_id)?;
 
         // 1. netns 内加载 nftables 规则
         nftables::setup_ruleset(sandbox_id, &ns, &veth_ns, veth_host_ip)?;
@@ -139,14 +129,7 @@ impl FirewallManager {
         );
 
         // 记录状态
-        self.nets.write().await.insert(
-            sandbox_id.to_string(),
-            SandboxNet {
-                ns_name: ns,
-                veth_ns,
-                guest_ip: netns::guest_ip(sandbox_id),
-            },
-        );
+        self.nets.write().await.insert(sandbox_id.to_string(), ());
 
         Ok(())
     }

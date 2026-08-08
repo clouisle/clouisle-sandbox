@@ -97,7 +97,7 @@ pub fn allow_ip(sandbox_id: &str, ns: &str, ip: &str, _ttl_secs: u64) -> Result<
 }
 
 /// 删除沙盒 netns 内的 nftables 表。
-pub fn teardown_ruleset(sandbox_id: &str, ns: &str) -> Result<()> {
+pub fn teardown_ruleset(_sandbox_id: &str, ns: &str) -> Result<()> {
     let _ = crate::netns::run_nft_in_ns(ns, &["delete", "table", "ip", "filter"]);
     Ok(())
 }
