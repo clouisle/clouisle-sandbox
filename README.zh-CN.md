@@ -396,6 +396,69 @@ Pending → Starting → Running → Stopping → Stopped → (delete)
            Error      Error
 ```
 
+## SDK 客户端
+
+官方 SDK，覆盖主流语言。**全部强类型**，公开 API 无 `any` / `Any` / `Value`。
+
+| 语言 | 包名 | 位置 | 状态 |
+|------|------|------|------|
+| **Rust** | `clouisle-sdk` | [`sdk/rust/`](sdk/rust) | ✅ 异步，`reqwest` |
+| **Python** | `clouisle-sandbox` | [`sdk/python/`](sdk/python) | ✅ `httpx` + `dataclass` 类型 |
+| **TypeScript** | `@clouisle/sdk` | [`sdk/typescript/`](sdk/typescript) | ✅ `axios` + `.d.ts`，编译出 JS |
+
+### Rust
+
+```rust
+use clouisle_sdk::{Client, SandboxSpec, ExecRequest};
+
+let client = Client::new("http://localhost:8080", "my-api-key");
+
+// 创建沙盒
+let sb = client.create_sandbox(&SandboxSpec {
+    image: ImageRef { reference: "alpine:latest".into(), digest: None },
+    ..SandboxSpec::default()
+}).await.unwrap();
+
+// 执行命令
+let result = client.exec_cmd(&sb.id, vec!["echo", "hello"], 5000).await.unwrap();
+println!("exit: {}", result.exit_code);
+```
+
+### Python
+
+```python
+from clouisle import Client, SandboxSpec, ImageRef, ExecRequest
+
+client = Client("http://localhost:8080", "my-api-key")
+
+# 创建沙盒
+sb = client.create_sandbox(SandboxSpec(
+    image=ImageRef(reference="alpine:latest"),
+))
+
+# 执行命令
+result = client.exec_cmd(sb.id, ["echo", "hello"])
+print(f"exit: {result.exit_code}, stdout: {result.stdout}")
+```
+
+### TypeScript / JavaScript
+
+```ts
+import { Client } from "@clouisle/sdk";
+
+const client = new Client("http://localhost:8080", "my-api-key");
+
+// 创建沙盒
+const sb = await client.createSandbox({
+  image: { reference: "alpine:latest" },
+  resources: { vcpu: 1, memory_mb: 256, disk_mb: 512 },
+});
+
+// 执行命令
+const result = await client.execCmd(sb.id, ["echo", "hello"]);
+console.log("exit:", result.exit_code, "stdout:", result.stdout);
+```
+
 ## Workspace 结构
 
 | Crate | 职责 |
@@ -415,6 +478,9 @@ Pending → Starting → Running → Stopping → Stopped → (delete)
 | `clouisle-audit` | 审计日志哈希链 + Ed25519 签名（SR-05） |
 | `clouisle-obs` | Prometheus 指标 / tracing 日志 |
 | `benches` | Criterion 性能基准 |
+| `sdk/rust` | Rust SDK (`clouisle-sdk`) |
+| `sdk/python` | Python SDK (`clouisle-sandbox`) |
+| `sdk/typescript` | TypeScript/JS SDK (`@clouisle/sdk`)
 
 ## 测试
 

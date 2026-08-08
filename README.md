@@ -403,6 +403,69 @@ Pending → Starting → Running → Stopping → Stopped → (delete)
            Error      Error
 ```
 
+## SDKs
+
+Official SDKs for all major languages. Fully typed — no `any` / `Any` / `Value` in the public API.
+
+| Language | Package | Location | Status |
+|----------|---------|----------|--------|
+| **Rust** | `clouisle-sdk` | [`sdk/rust/`](sdk/rust) | ✅ async, `reqwest` |
+| **Python** | `clouisle-sandbox` | [`sdk/python/`](sdk/python) | ✅ `httpx` + `dataclass` types |
+| **TypeScript** | `@clouisle/sdk` | [`sdk/typescript/`](sdk/typescript) | ✅ `axios` + `.d.ts`, compiles to JS |
+
+### Rust
+
+```rust
+use clouisle_sdk::{Client, SandboxSpec, ExecRequest};
+
+let client = Client::new("http://localhost:8080", "my-api-key");
+
+// Create sandbox
+let sb = client.create_sandbox(&SandboxSpec {
+    image: ImageRef { reference: "alpine:latest".into(), digest: None },
+    ..SandboxSpec::default()
+}).await.unwrap();
+
+// Exec command
+let result = client.exec_cmd(&sb.id, vec!["echo", "hello"], 5000).await.unwrap();
+println!("exit: {}", result.exit_code);
+```
+
+### Python
+
+```python
+from clouisle import Client, SandboxSpec, ImageRef, ExecRequest
+
+client = Client("http://localhost:8080", "my-api-key")
+
+# Create sandbox
+sb = client.create_sandbox(SandboxSpec(
+    image=ImageRef(reference="alpine:latest"),
+))
+
+# Exec command
+result = client.exec_cmd(sb.id, ["echo", "hello"])
+print(f"exit: {result.exit_code}, stdout: {result.stdout}")
+```
+
+### TypeScript / JavaScript
+
+```ts
+import { Client } from "@clouisle/sdk";
+
+const client = new Client("http://localhost:8080", "my-api-key");
+
+// Create sandbox
+const sb = await client.createSandbox({
+  image: { reference: "alpine:latest" },
+  resources: { vcpu: 1, memory_mb: 256, disk_mb: 512 },
+});
+
+// Exec command
+const result = await client.execCmd(sb.id, ["echo", "hello"]);
+console.log("exit:", result.exit_code, "stdout:", result.stdout);
+```
+
 ## Workspace Structure
 
 | Crate | Responsibility |
@@ -422,6 +485,9 @@ Pending → Starting → Running → Stopping → Stopped → (delete)
 | `clouisle-audit` | Audit hash chain + Ed25519 signing (SR-05) |
 | `clouisle-obs` | Prometheus metrics / tracing logs |
 | `benches` | Criterion benchmarks |
+| `sdk/rust` | Rust SDK (`clouisle-sdk`) |
+| `sdk/python` | Python SDK (`clouisle-sandbox`) |
+| `sdk/typescript` | TypeScript/JS SDK (`@clouisle/sdk`)
 
 ## Testing
 
