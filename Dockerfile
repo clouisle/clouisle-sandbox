@@ -47,6 +47,10 @@ RUN apt-get update -qq && apt-get install -y -qq \
 COPY --from=builder /build/target/release/clouisle-api /usr/local/bin/
 COPY --from=builder /build/target/release/clouislectl /usr/local/bin/
 
+# 创建 firecracker / jailer 符号链接（解压后文件名带版本号）
+RUN ln -sf firecracker-v1.10.1-x86_64 /usr/local/bin/firecracker \
+    && ln -sf jailer-v1.10.1-x86_64 /usr/local/bin/jailer
+
 # 健康检查
 HEALTHCHECK --interval=10s --timeout=3s --start-period=5s --retries=3 \
   CMD curl -sf http://localhost:8080/health || exit 1
