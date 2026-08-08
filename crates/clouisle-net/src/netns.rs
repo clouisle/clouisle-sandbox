@@ -59,10 +59,11 @@ pub type Result<T> = std::result::Result<T, ClouisleError>;
 ///
 /// 1. `ip netns add clo-<hash>`
 /// 2. 创建 veth pair `vh-<hash>` + `vn-<hash>`
-/// 3. `vn-<hash>` 移入 netns，配网关 IP
-/// 4. netns 内创建 TAP `tap0`，配 guest IP
-/// 5. netns 内开启 IP 转发
-/// 6. 宿主侧 `vh-<hash>` up + 添加指向沙盒网段的路由
+/// 3. `vn-<hash>` 移入 netns，加入网桥 `br0`
+/// 4. netns 内创建 TAP `tap0`，加入 `br0`
+/// 5. `br0` 配网关 IP（ARP 经网桥在 vn/tap0 间 L2 转发）
+/// 6. netns 内开启 IP 转发
+/// 7. 宿主侧 `vh-<hash>` up + 添加指向沙盒网段的路由
 pub fn create_netns(sandbox_id: &str) -> Result<NetInfo> {
     let (a, b) = sandbox_subnet(sandbox_id);
     let info = NetInfo {
@@ -85,19 +86,25 @@ pub fn create_netns(sandbox_id: &str) -> Result<NetInfo> {
         ],
     )?;
 
-    // 3. veth_ns 移入 netns + 配置网关 IP
+    // 3. veth_ns 移入 netns，创建网桥并桥接
     run("ip", &["link", "set", &info.veth_ns, "netns", &info.ns_name])?;
-    run_in_ns(&info.ns_name, &["addr", "add", &format!("{}/30", info.gateway), "dev", &info.veth_ns])?;
+    run_in_ns(&info.ns_name, &["link", "add", "br0", "type", "bridge"])?;
+    run_in_ns(&info.ns_name, &["link", "set", &info.veth_ns, "master", "br0"])?;
     run_in_ns(&info.ns_name, &["link", "set", &info.veth_ns, "up"])?;
 
-    // 4. netns 内创建 TAP（纯 L2，不配 IP；guest eth0 自己配 IP）
+    // 4. netns 内创建 TAP（纯 L2），加入网桥
     run_in_ns(&info.ns_name, &["tuntap", "add", "tap0", "mode", "tap"])?;
+    run_in_ns(&info.ns_name, &["link", "set", "tap0", "master", "br0"])?;
     run_in_ns(&info.ns_name, &["link", "set", "tap0", "up"])?;
 
-    // 5. netns 内开启 IP 转发
+    // 5. br0 配网关 IP
+    run_in_ns(&info.ns_name, &["addr", "add", &format!("{}/30", info.gateway), "dev", "br0"])?;
+    run_in_ns(&info.ns_name, &["link", "set", "br0", "up"])?;
+
+    // 6. netns 内开启 IP 转发
     run_sysctl_in_ns(&info.ns_name, &["-w", "net.ipv4.ip_forward=1"])?;
 
-    // 6. 宿主侧 veth up + 路由
+    // 7. 宿主侧 veth up + 路由
     run("ip", &["link", "set", &info.veth_host, "up"])?;
     run(
         "ip",
