@@ -25,8 +25,11 @@ use crate::nftables;
 /// 沙盒网络配置状态。
 #[derive(Debug)]
 struct SandboxNet {
+    #[allow(dead_code)]
     veth_host: String,
+    #[allow(dead_code)]
     veth_ns: String,
+    #[allow(dead_code)]
     host_ip: String,
 }
 
