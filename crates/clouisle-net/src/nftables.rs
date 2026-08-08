@@ -51,33 +51,30 @@ fn apply_ruleset(ruleset: &str) -> Result<()> {
 
 /// 为沙盒创建 nftables 规则集。
 ///
-/// 语义：
-/// - `tap` 设备入站默认 drop，仅放行 DNS(53)、agent(5201)、已建立连接
-/// - 出站 SNAT masquerade
+/// 语义（全部 policy accept，只限定 TAP 接口流量，绝不影响宿主自身）：
+/// - guest 出站（来自 TAP）：放行
+/// - host → guest（去往 TAP）：仅放行 agent(5201)、DNS(53)、已建立连接，其余 drop
+/// - SNAT：仅对 TAP 源流量 masquerade
 pub fn setup_ruleset(sandbox_id: &str, tap: &str, _host_ip: &str) -> Result<()> {
     let table = format!("clo_{}", crate::netns::short_name(sandbox_id, ""));
     let ruleset = format!(
         r#"
 table ip {table} {{
-    chain input {{
-        type filter hook input priority 0; policy drop;
-        iif "lo" accept
-        iif "{tap}" accept
-        ct state established,related accept
-        counter drop
-    }}
-
     chain forward {{
-        type filter hook forward priority 0; policy drop;
-        iif "{tap}" accept
-        oif "{tap}" accept
-        ct state established,related accept
-        counter drop
+        type filter hook forward priority 0; policy accept;
+        # guest 出站放行
+        iifname "{tap}" accept
+        # host → guest：仅 agent / DNS / 已建立
+        oifname "{tap}" tcp dport 5201 accept
+        oifname "{tap}" udp dport 53 accept
+        oifname "{tap}" ct state established,related accept
+        oifname "{tap}" drop
     }}
 
     chain postrouting {{
         type nat hook postrouting priority 100; policy accept;
-        oif != "{tap}" masquerade
+        # 仅 TAP 出站流量 SNAT（绝不碰宿主其它接口）
+        iifname "{tap}" oifname != "{tap}" masquerade
     }}
 }}
 "#
@@ -86,7 +83,8 @@ table ip {table} {{
 }
 
 /// 向 nftables 放行一个 IP（出站白名单）。
-pub fn allow_ip(sandbox_id: &str, ip: &str, ttl_secs: u64) -> Result<()> {
+pub fn allow_ip(sandbox_id: &str, ip: &str, _ttl_secs: u64) -> Result<()> {
+    let tap = tap_name(sandbox_id);
     run(
         "nft",
         &[
@@ -94,6 +92,8 @@ pub fn allow_ip(sandbox_id: &str, ip: &str, ttl_secs: u64) -> Result<()> {
             "rule",
             &format!("ip clo_{}", crate::netns::short_name(sandbox_id, "")),
             "forward",
+            "iifname",
+            &tap,
             "ip",
             "daddr",
             ip,
