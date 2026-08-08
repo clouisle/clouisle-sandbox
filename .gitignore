@@ -1,0 +1,9 @@
+/target
+*.db
+*.sqlite
+*.db-journal
+*.db-wal
+.env
+.env.local
+dist/
+.DS_Store

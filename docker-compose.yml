@@ -1,0 +1,51 @@
+version: "3.9"
+
+x-firecracker-volumes: &fc-volumes
+  - /dev/kvm:/dev/kvm                     # KVM 透传（必须）
+  - /opt/clouisle/vmlinux:/opt/clouisle/vmlinux:ro  # guest 内核
+  - /opt/clouisle/rootfs:/opt/clouisle/rootfs:ro    # 基础 rootfs
+
+services:
+  # ============ 控制平面：apiserver ============
+  apiserver:
+    build: .
+    image: clouisle-apiserver:0.1.0
+    container_name: clouisle-apiserver
+    privileged: true                        # 访问 /dev/kvm + 创建 netns
+    network_mode: host                      # netns / nftables 需要宿主网络
+    environment:
+      - RUST_LOG=info
+    # 用 postgres 连接串（HA 就绪）
+    command:
+      - --addr=0.0.0.0:8080
+      - --db=postgres://clouisle:changeme@apiserver:5432/clouisle
+    volumes:
+      - *fc-volumes
+      - clouisle-data:/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+    restart: unless-stopped
+
+  # ============ 存储：PostgreSQL（HA 就绪） ============
+  postgres:
+    image: postgres:16-alpine
+    container_name: clouisle-postgres
+    environment:
+      - POSTGRES_USER=clouisle
+      - POSTGRES_PASSWORD=changeme
+      - POSTGRES_DB=clouisle
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U clouisle"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+volumes:
+  clouisle-data:
+  pg-data:

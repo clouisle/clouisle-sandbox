@@ -1,0 +1,17 @@
+[package]
+name = "clouisle-pool"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+clouisle-core = { path = "../clouisle-core" }
+clouisle-vmm = { path = "../clouisle-vmm" }
+clouisle-store = { path = "../clouisle-store" }
+serde.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+async-trait.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+

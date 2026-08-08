@@ -1,0 +1,32 @@
+[package]
+name = "clouisle-api"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+clouisle-core = { path = "../clouisle-core" }
+clouisle-vmm = { path = "../clouisle-vmm" }
+clouisle-store = { path = "../clouisle-store" }
+clouisle-scheduler = { path = "../clouisle-scheduler" }
+clouisle-proto = { path = "../clouisle-proto" }
+clouisle-obs = { path = "../clouisle-obs" }
+clouisle-net = { path = "../clouisle-net" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+async-trait.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+axum.workspace = true
+axum-extra.workspace = true
+tower.workspace = true
+tower-http.workspace = true
+metrics.workspace = true
+metrics-exporter-prometheus.workspace = true
+futures.workspace = true
+bytes.workspace = true
+chrono.workspace = true
+clap.workspace = true
+tracing-subscriber.workspace = true
+

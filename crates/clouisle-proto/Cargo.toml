@@ -1,0 +1,13 @@
+[package]
+name = "clouisle-proto"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde.workspace = true
+thiserror.workspace = true
+bytes.workspace = true
+postcard.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+tokio.workspace = true

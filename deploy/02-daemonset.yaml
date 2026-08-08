@@ -1,0 +1,80 @@
+# Node agent: clouisled DaemonSet
+#
+# 每节点一个 Pod，直管 firecracker 进程。
+# 需要 /dev/kvm 透传 + privileged。
+
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: clouisled
+  namespace: clouisle
+spec:
+  selector:
+    matchLabels: { app: clouisled }
+  template:
+    metadata:
+      labels: { app: clouisled }
+    spec:
+      serviceAccountName: clouisled
+      # 沙盒不含 K8s token：逃逸后无法操作集群
+      automountServiceAccountToken: false
+      # hostNetwork: 需要访问宿主网络（netns / nftables）
+      hostNetwork: true
+      hostPID: true
+      containers:
+        - name: clouisled
+          image: registry.example.com/clouisle-node:0.1.0
+          args:
+            - --apiserver=apiserver.clouisle.svc:9090
+            - --node-id=$(NODE_NAME)
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef: { fieldPath: spec.nodeName }
+          securityContext:
+            privileged: true
+            capabilities:
+              add: ["SYS_ADMIN", "NET_ADMIN", "SYS_PTRACE"]
+          volumeMounts:
+            - name: kvm
+              mountPath: /dev/kvm
+            - name: vmlinux
+              mountPath: /opt/clouisle/vmlinux
+              readOnly: true
+            - name: rootfs
+              mountPath: /opt/clouisle/rootfs
+              readOnly: true
+            - name: cgroup
+              mountPath: /sys/fs/cgroup
+        - name: firecracker
+          image: firecracker-microvm/firecracker:v1.10.1
+          command: ["tail", "-f", "/dev/null"]
+          securityContext:
+            privileged: true
+          volumeMounts:
+            - name: kvm
+              mountPath: /dev/kvm
+            - name: vmlinux
+              mountPath: /opt/clouisle/vmlinux
+              readOnly: true
+            - name: rootfs
+              mountPath: /opt/clouisle/rootfs
+              readOnly: true
+      volumes:
+        - name: kvm
+          hostPath: { path: /dev/kvm }
+        - name: vmlinux
+          hostPath:
+            path: /opt/clouisle/vmlinux   # 宿主机内核镜像
+            type: File
+        - name: rootfs
+          hostPath:
+            path: /opt/clouisle/rootfs     # 宿主机基础 rootfs
+            type: Directory
+        - name: cgroup
+          hostPath: { path: /sys/fs/cgroup }
+
+# 说明：
+# - /dev/kvm 必须存在于所有 K8s 节点（裸金属或嵌套虚拟化）
+# - vmlinux / rootfs 需预置到每个节点（或用 DaemonSet initContainer 分发）
+# - firecracker 二进制打包进 clouisle-node 镜像，无需宿主机安装

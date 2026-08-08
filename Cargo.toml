@@ -1,0 +1,56 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/clouisle-core",
+    "crates/clouisle-vmm",
+    "crates/clouisle-proto",
+    "crates/clouisle-store",
+    "crates/clouisle-scheduler",
+    "crates/clouisle-api",
+    "crates/clouisle-agent",
+    "crates/clouislectl",
+    "crates/clouisle-net",
+    "crates/clouisle-pool",
+    "crates/clouisle-images",
+    "crates/clouisle-audit",
+    "crates/clouisle-obs",
+    "crates/clouisled",
+    "benches",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[workspace.dependencies]
+tokio = { version = "1.41", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-appender = "0.2"
+async-trait = "0.1"
+uuid = { version = "1.11", features = ["v7", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+metrics = "0.24"
+metrics-exporter-prometheus = "0.16"
+rusqlite = { version = "0.32", features = ["bundled", "serde_json"] }
+deadpool-sqlite = "0.1"
+clap = { version = "4.5", features = ["derive"] }
+axum = { version = "0.8", features = ["macros"] }
+axum-extra = "0.10"
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "trace", "request-id"] }
+hyper = { version = "1.6", features = ["full"] }
+hyperlocal = "0.9"
+futures = "0.3"
+postcard = { version = "1.1", features = ["alloc"] }
+base64 = "0.22"
+sha2 = "0.10"
+hex = "0.4"
+rand = "0.8"
+bytes = { version = "1.8", features = ["serde"] }
+derive_more = "1.0"
+pin-project = "1.1"

@@ -1,0 +1,83 @@
+# Clouisle Sandbox K8s 部署
+#
+# 架构：
+# - apiserver: Deployment（无状态，多副本）→ PostgreSQL
+# - clouisled: DaemonSet（每节点一个 Pod，直管 firecracker）
+# - postgres: StatefulSet（控制平面共享状态）
+#
+# 部署步骤：
+#   1. kubectl apply -k deploy/
+#   2. kubectl -n clouisle wait --for=condition=ready pod -l app=postgres
+#   3. kubectl -n clouisle apply -f deploy/01-apiserver.yaml
+#   4. kubectl -n clouisle apply -f deploy/02-daemonset.yaml
+#
+# 注意：需要先构建镜像并推送到 registry
+
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: clouisle
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: clouisled
+  namespace: clouisle
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: clouisled
+  namespace: clouisle
+rules:
+  # 只读自己 Pod（用于节点标识）
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: clouisled
+  namespace: clouisle
+roleRef:
+  kind: Role
+  name: clouisled
+  apiGroup: rbac.authorization.k8s.io/v1
+subjects:
+  - kind: ServiceAccount
+    name: clouisled
+    namespace: clouisle
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: apiserver
+  namespace: clouisle
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: apiserver
+  namespace: clouisle
+rules:
+  # apiserver 不操作 K8s 资源（通过 gRPC 转发到 clouisled）
+  # 此 Role 仅用于健康检查
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: apiserver
+  namespace: clouisle
+roleRef:
+  kind: Role
+  name: apiserver
+  apiGroup: rbac.authorization.k8s.io/v1
+subjects:
+  - kind: ServiceAccount
+    name: apiserver
+    namespace: clouisle

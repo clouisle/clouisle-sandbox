@@ -1,0 +1,24 @@
+# Criterion 性能基准（PERF-001 ~ PERF-004）。
+# 冷启动 / 热启动 / 池分配 / 镜像构建的时延基准。
+
+[package]
+name = "clouisle-bench"
+version.workspace = true
+edition.workspace = true
+
+[[bench]]
+name = "boot_latency"
+harness = false
+
+[dependencies]
+criterion = "0.5"
+
+[dependencies.clouisle-core]
+path = "../crates/clouisle-core"
+
+[dependencies.clouisle-vmm]
+path = "../crates/clouisle-vmm"
+
+[dependencies.tokio]
+version = "1"
+features = ["rt-multi-thread", "macros", "time"]

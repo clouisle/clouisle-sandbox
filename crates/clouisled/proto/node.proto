@@ -1,0 +1,106 @@
+syntax = "proto3";
+
+package clouisle;
+
+service NodeService {
+    // 节点注册：启动时调用
+    rpc Register(NodeInfo) returns (NodeId);
+
+    // 双向心跳流：clouisled 每 3s 上报，apiserver 下发命令
+    rpc Heartbeat(stream HeartbeatReport) returns (stream HeartbeatCommand);
+
+    // 转发沙盒创建
+    rpc CreateSandbox(CreateSandboxRequest) returns (SandboxHandle);
+
+    // 转发沙盒删除
+    rpc DeleteSandbox(SandboxId) returns (DeleteResult);
+
+    // 转发命令执行
+    rpc Exec(stream ExecStream) returns (stream ExecStream);
+}
+
+message NodeInfo {
+    string node_id = 1;
+    string hostname = 2;
+    uint32 total_vcpu = 3;
+    uint64 total_memory_mb = 4;
+    uint64 total_disk_mb = 5;
+    bool kvm_available = 6;
+    string kernel_version = 7;
+    string firecracker_version = 8;
+    map<string, string> labels = 9;
+}
+
+message NodeId {
+    string node_id = 1;
+}
+
+message HeartbeatReport {
+    string node_id = 1;
+    uint32 allocated_vcpu = 2;
+    uint64 allocated_memory_mb = 3;
+    repeated string running_sandboxes = 4;
+    map<string, uint32> pool_ready = 5;
+    repeated double load_avg = 6;
+}
+
+message HeartbeatCommand {
+    oneof cmd {
+        string shutdown = 1;       // "immediate" | "graceful"
+        string reconcile = 2;      // "force"
+        DrainCommand drain = 3;
+    }
+}
+
+message DrainCommand {
+    uint32 drain_seconds = 1;
+    bool migrate_sandboxes = 2;
+}
+
+message CreateSandboxRequest {
+    string spec_json = 1;  // JSON 序列化的 SandboxSpec
+}
+
+message SandboxHandle {
+    string sandbox_id = 1;
+    string backend = 2;
+    uint64 pid = 3;
+    string api_socket = 4;
+    string vsock_socket = 5;
+}
+
+message SandboxId {
+    string sandbox_id = 1;
+}
+
+message DeleteResult {
+    bool ok = 1;
+    string error = 2;
+}
+
+message ExecStream {
+    oneof msg {
+        ExecRequest exec_req = 1;
+        ExecOutput exec_stdout = 2;
+        ExecOutput exec_stderr = 3;
+        ExecExit exec_exit = 4;
+    }
+}
+
+message ExecRequest {
+    string sandbox_id = 1;
+    repeated string argv = 2;
+    map<string, string> env = 3;
+    string cwd = 4;
+    uint64 timeout_ms = 5;
+}
+
+message ExecOutput {
+    string sandbox_id = 1;
+    bytes data = 2;
+}
+
+message ExecExit {
+    string sandbox_id = 1;
+    int32 exit_code = 2;
+}

@@ -1,0 +1,23 @@
+[package]
+name = "clouisle-vmm"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+clouisle-core = { path = "../clouisle-core" }
+clouisle-proto = { path = "../clouisle-proto" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+async-trait.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+hyper.workspace = true
+hyperlocal.workspace = true
+futures.workspace = true
+bytes.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+nix = { version = "0.29", features = ["fs", "process", "signal"] }
+

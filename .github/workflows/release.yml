@@ -1,0 +1,77 @@
+# Release 发布工作流
+#
+# 触发：git tag v* 时自动构建并发布
+# 产出：GitHub Release（二进制 tarball）+ 多平台 Docker image
+#
+# 注意：GitHub Actions runner 无 /dev/kvm，不运行测试
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    name: Release ${{ github.ref_name }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq protobuf-compiler pkg-config libssl-dev
+      - name: Build release
+        run: cargo build --release -p clouisle-api -p clouislectl
+
+      # ============ 打包二进制 ============
+      - name: Package binaries
+        run: |
+          mkdir -p dist
+          cp target/release/clouisle-api dist/
+          cp target/release/clouislectl dist/
+          cp Dockerfile docker-compose.yml dist/
+          cp deploy/*.yaml dist/
+          cp README.md CHANGELOG.md dist/
+          tar czf clouisle-sandbox-${{ github.ref_name }}-linux-x86_64.tar.gz -C dist .
+
+      # ============ Docker 多平台镜像 ============
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Login to Aliyun ACR
+        uses: docker/login-action@v3
+        with:
+          registry: registry.cn-shanghai.aliyuncs.com
+          username: ${{ secrets.ACR_USERNAME }}
+          password: ${{ secrets.ACR_PASSWORD }}
+      - name: Build and push Docker image (multi-arch)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            registry.cn-shanghai.aliyuncs.com/${{ secrets.ACR_NAMESPACE }}/clouisle-sandbox:latest
+            registry.cn-shanghai.aliyuncs.com/${{ secrets.ACR_NAMESPACE }}/clouisle-sandbox:${{ github.ref_name }}
+
+      # ============ GitHub Release ============
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          name: ${{ github.ref_name }}
+          body: |
+            ## Clouisle Sandbox ${{ github.ref_name }}
+
+            Release 包含：
+            - `clouisle-api` / `clouislectl` 二进制（linux-x86_64）
+            - Docker 多平台镜像（linux/amd64, linux/arm64）
+            - Docker Compose + K8s 部署清单
+
+            端到端测试需在具有 `/dev/kvm` 的宿主机上执行（GitHub Actions 无 KVM）。
+          files: |
+            clouisle-sandbox-${{ github.ref_name }}-linux-x86_64.tar.gz

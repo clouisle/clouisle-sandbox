@@ -1,0 +1,54 @@
+# 网络策略：默认拒绝跨命名空间通信
+
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny
+  namespace: clouisle
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+    - Egress
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-apiserver
+  namespace: clouisle
+spec:
+  podSelector:
+    matchLabels: { app: apiserver }
+  ingress:
+    - from:
+        - namespaceSelector: {}  # 允许来自集群内的请求
+      ports:
+        - port: 8080
+  egress:
+    - to:
+        - podSelector: { matchLabels: { app: postgres } }
+      ports:
+        - port: 5432
+    - to:
+        - podSelector: { matchLabels: { app: clouisled } }
+      ports:
+        - port: 9090
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-clouisled
+  namespace: clouisle
+spec:
+  podSelector:
+    matchLabels: { app: clouisled }
+  ingress:
+    - from:
+        - podSelector: { matchLabels: { app: apiserver } }
+      ports:
+        - port: 9090
+  egress:
+    - to:
+        - podSelector: { matchLabels: { app: postgres } }
+      ports:
+        - port: 5432
