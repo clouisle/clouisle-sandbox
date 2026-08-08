@@ -94,14 +94,19 @@ pub fn create_netns(sandbox_id: &str) -> Result<NetInfo> {
     run_in_ns(&info.ns_name, &["link", "set", &info.veth_ns, "master", "br0"])?;
     run_in_ns(&info.ns_name, &["link", "set", &info.veth_ns, "up"])?;
 
-    // 4. br0 配网关 IP
+    // 4. 预建普通 tap0（非 bridge slave）供 Firecracker 打开。
+    //    Firecracker 的 host_dev_name 引用已存在的 tap，不会自己创建。
+    //    VMM.start 后由 attach_tap 将其加入 br0。
+    run_in_ns(&info.ns_name, &["tuntap", "add", "tap0", "mode", "tap"])?;
+
+    // 5. br0 配网关 IP
     run_in_ns(&info.ns_name, &["addr", "add", &format!("{}/30", info.gateway), "dev", "br0"])?;
     run_in_ns(&info.ns_name, &["link", "set", "br0", "up"])?;
 
-    // 5. netns 内开启 IP 转发
+    // 6. netns 内开启 IP 转发
     run_sysctl_in_ns(&info.ns_name, &["-w", "net.ipv4.ip_forward=1"])?;
 
-    // 6. 宿主侧 veth up + 路由
+    // 7. 宿主侧 veth up + 路由
     run("ip", &["link", "set", &info.veth_host, "up"])?;
     run(
         "ip",
