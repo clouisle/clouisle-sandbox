@@ -104,7 +104,13 @@ pub fn create_netns(sandbox_id: &str) -> Result<NetInfo> {
     // 6. netns 内开启 IP 转发
     run_sysctl_in_ns(&info.ns_name, &["-w", "net.ipv4.ip_forward=1"])?;
 
-    // 7. 宿主侧 veth up + 路由
+    // 7. 宿主侧 veth 配置网关 IP、up + 添加指向沙盒网段的路由。
+    //    没有地址时仅添加 link-scope 路由会导致宿主 ARP 使用 0.0.0.0，
+    //    guest 不会回 ARP，host→guest 连接始终卡在 INCOMPLETE。
+    run(
+        "ip",
+        &["addr", "add", &format!("{}/30", info.gateway), "dev", &info.veth_host],
+    )?;
     run("ip", &["link", "set", &info.veth_host, "up"])?;
     run(
         "ip",
