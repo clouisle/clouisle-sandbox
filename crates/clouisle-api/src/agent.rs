@@ -375,24 +375,16 @@ impl AgentConnector for VsockAgentConnector {
         use clouisle_proto::codec::{read_frame, write_frame};
         use clouisle_proto::Frame;
 
-        // Firecracker vsock 使用 UDS 而非 AF_VSOCK：host 连接
-        // handle.vsock_socket 路径下的 Unix socket，Firecracker 作为代理
-        // 桥接到 guest 的 vsock 设备。
-        let vsock_path = handle.vsock_socket.as_ref().ok_or_else(|| {
-            ClouisleError::new(
-                clouisle_core::ErrorKind::Vmm,
-                format!("VmHandle {} has no vsock_socket", handle.id),
-            )
-        })?;
-
-        // guest 启动需要时间：vsock 桥接就绪前连接会 WouldBlock/ECONNREFUSED，
-        // 所以轮询重试直到超时。
+        // 通过 guest 的 TAP 网络 IP (10.0.0.2) 进行 TCP 通信。
+        // 不使用 vsock，因为 Firecracker 的 vsock 需要 guest 内核驱动支持。
+        // TCP 隧道通过 TAP/veth 对，无需额外内核模块。
+        let guest_addr = std::net::SocketAddr::from(([10, 0, 0, 2], 5201));
         let deadline = tokio::time::Instant::now() + self.connect_timeout;
         let mut last_err = String::new();
         loop {
             match tokio::time::timeout(
                 std::time::Duration::from_millis(500),
-                tokio::net::UnixStream::connect(vsock_path),
+                tokio::net::TcpStream::connect(guest_addr),
             )
             .await
             {
@@ -402,7 +394,6 @@ impl AgentConnector for VsockAgentConnector {
                         stream: tokio::sync::Mutex::new(tokio::io::BufStream::new(stream)),
                     };
 
-                    // 发送 Hello，等待 guest 回应 Hello。
                     write_frame(
                         &mut *conn.stream.lock().await,
                         &Frame::Hello {
@@ -411,13 +402,13 @@ impl AgentConnector for VsockAgentConnector {
                     )
                     .await
                     .map_err(|e| {
-                        ClouisleError::io(format!("write Hello to {vsock_path}: {e}"))
+                        ClouisleError::io(format!("write Hello to guest: {e}"))
                     })?;
 
                     let resp = read_frame(&mut *conn.stream.lock().await)
                         .await
                         .map_err(|e| {
-                            ClouisleError::io(format!("read Hello response from {vsock_path}: {e}"))
+                            ClouisleError::io(format!("read Hello response from guest: {e}"))
                         })?;
                     if !matches!(resp, Frame::Hello { .. }) {
                         return Err(ClouisleError::invalid_state(format!(
@@ -428,7 +419,6 @@ impl AgentConnector for VsockAgentConnector {
                 }
                 Ok(Err(e)) => {
                     last_err = format!("{e}");
-                    // guest 未就绪，重试
                 }
                 Err(_) => {
                     last_err = "connect timed out".into();
@@ -437,7 +427,7 @@ impl AgentConnector for VsockAgentConnector {
             if tokio::time::Instant::now() >= deadline {
                 return Err(ClouisleError::new(
                     clouisle_core::ErrorKind::Vmm,
-                    format!("vsock UDS connect {vsock_path} failed after retries: {last_err}"),
+                    format!("guest TCP connect to 10.0.0.2:5201 failed: {last_err}"),
                 ));
             }
             tokio::time::sleep(std::time::Duration::from_millis(300)).await;
@@ -445,12 +435,12 @@ impl AgentConnector for VsockAgentConnector {
     }
 }
 
-/// 真实 vsock 连接：通过 Frame 协议与 guest agent 通信。
-/// 连接方式为 Firecracker 的 vsock UDS 代理。
+/// 真实 guest 连接：通过 TCP 与 guest agent 通信（在 TAP 网络 10.0.0.2:5201）。
+/// 绕过 vsock 内核驱动依赖，使用 TAP/veth 对进行 TCP 隧道。
 #[cfg(target_os = "linux")]
 pub struct VsockFrameConnection {
     sandbox_id: String,
-    stream: tokio::sync::Mutex<tokio::io::BufStream<tokio::net::UnixStream>>,
+    stream: tokio::sync::Mutex<tokio::io::BufStream<tokio::net::TcpStream>>,
 }
 
 #[cfg(target_os = "linux")]

@@ -136,26 +136,26 @@ where
     }
 }
 
-/// guest agent 监听的 vsock 端口。
-pub const AGENT_PORT: u32 = 5201;
+/// guest agent 监听的端口（通过 TAP 网络 TCP 通信）。
+pub const AGENT_PORT: u16 = 5201;
 
 /// serve 模式入口：
-/// - Linux：绑定 vsock 端口 5201，接受 host 连接，逐连接跑 [`serve_loop`]。
-/// - 其他平台（macOS 测试）：无 AF_VSOCK，仅占位返回。
+/// - Linux：绑定 TCP 端口 5201 在所有接口，通过 TAP/veth 对接受 host 连接。
+/// - 其他平台（macOS 测试）：占位返回。
 #[cfg(target_os = "linux")]
 pub async fn run_serve() -> AgentResult<()> {
-    use tokio_vsock::{VsockAddr, VsockListener, VMADDR_CID_ANY};
-
-    let addr = VsockAddr::new(VMADDR_CID_ANY, AGENT_PORT);
-    let mut listener = VsockListener::bind(addr).map_err(AgentError::Io)?;
-    tracing::info!("vsock agent listening on port {AGENT_PORT}");
+    let addr = format!("0.0.0.0:{AGENT_PORT}");
+    let listener = tokio::net::TcpListener::bind(&addr)
+        .await
+        .map_err(|e| AgentError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+    tracing::info!("agent listening on TCP {addr}");
 
     loop {
         let (stream, peer) = listener
             .accept()
             .await
-            .map_err(AgentError::Io)?;
-        tracing::info!("vsock connection from {peer:?}");
+            .map_err(|e| AgentError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+        tracing::info!("connection from {peer}");
         let (mut reader, mut writer) = tokio::io::split(stream);
         tokio::spawn(async move {
             if let Err(e) = serve_loop(&mut reader, &mut writer).await {

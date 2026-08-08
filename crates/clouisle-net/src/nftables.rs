@@ -88,6 +88,7 @@ table ip filter {{
         iif "lo" accept
         iif "tap0" accept
         udp dport 53 accept
+        tcp dport 5201 accept
         ct state established,related accept
     }}
 
