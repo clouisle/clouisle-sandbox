@@ -8,12 +8,12 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use axum::{
+    Router,
     body::{Body, to_bytes},
     http::{Request, StatusCode},
-    Router,
 };
 
-use clouisle_api::{agent, auth, build_router, AppState};
+use clouisle_api::{AppState, agent, auth, build_router};
 use clouisle_core::{Result, SandboxSpec};
 use clouisle_scheduler::ResourcePool;
 use clouisle_store::InMemoryStore;
@@ -48,7 +48,8 @@ impl Vmm for TestVmm {
         })
     }
     async fn start(&self, _h: &VmHandle) -> Result<()> {
-        self.running.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.running
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Ok(())
     }
     async fn pause(&self, _h: &VmHandle) -> Result<()> {
@@ -70,7 +71,8 @@ impl Vmm for TestVmm {
         })
     }
     async fn stop(&self, _h: &VmHandle, _m: StopMode) -> Result<()> {
-        self.running.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        self.running
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
         Ok(())
     }
     async fn stats(&self, _h: &VmHandle) -> Result<VmStats> {
@@ -132,7 +134,13 @@ async fn post_json(
 async fn get(app: &Router, uri: &str) -> (StatusCode, serde_json::Value) {
     let resp = app
         .clone()
-        .oneshot(Request::builder().method("GET").uri(uri).body(Body::empty()).unwrap())
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(uri)
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
     let status = resp.status();
@@ -144,7 +152,13 @@ async fn get(app: &Router, uri: &str) -> (StatusCode, serde_json::Value) {
 async fn delete(app: &Router, uri: &str) -> StatusCode {
     let resp = app
         .clone()
-        .oneshot(Request::builder().method("DELETE").uri(uri).body(Body::empty()).unwrap())
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(uri)
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
     resp.status()
@@ -199,7 +213,11 @@ async fn invalid_spec_rejected() {
         }),
     )
     .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "vcpu=0 should 400, got {body}");
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "vcpu=0 should 400, got {body}"
+    );
     assert_eq!(body["error"]["code"], "VALIDATION");
 
     let (status, _) = post_json(
@@ -274,7 +292,13 @@ async fn health_and_metrics() {
     let app = app();
     let resp = app
         .clone()
-        .oneshot(Request::builder().method("GET").uri("/health").body(Body::empty()).unwrap())
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/health")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -285,7 +309,13 @@ async fn health_and_metrics() {
 
     let resp = app
         .clone()
-        .oneshot(Request::builder().method("GET").uri("/metrics").body(Body::empty()).unwrap())
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/metrics")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -306,10 +336,7 @@ async fn request_id_reflected() {
         )
         .await
         .unwrap();
-    assert_eq!(
-        resp.headers().get("x-request-id").unwrap(),
-        "test-123"
-    );
+    assert_eq!(resp.headers().get("x-request-id").unwrap(), "test-123");
 }
 
 #[tokio::test]

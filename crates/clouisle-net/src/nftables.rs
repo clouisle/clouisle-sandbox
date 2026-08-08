@@ -33,11 +33,16 @@ fn apply_ruleset_in_ns(sandbox_id: &str, ruleset: &str) -> Result<()> {
         .spawn()
         .map_err(|e| ClouisleError::io(format!("nft in ns: {e}")))?;
 
-    child.stdin.as_mut().unwrap().write_all(ruleset.as_bytes())
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(ruleset.as_bytes())
         .map_err(|e| ClouisleError::io(format!("write ruleset: {e}")))?;
     drop(child.stdin.take());
 
-    let output = child.wait_with_output()
+    let output = child
+        .wait_with_output()
         .map_err(|e| ClouisleError::io(format!("nft wait: {e}")))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -100,8 +105,7 @@ table ip filter {{
 /// 向沙盒 nftables 动态集添加一个放行 IP。
 pub fn allow_ip(sandbox_id: &str, ip: &str, ttl_secs: u64) -> Result<()> {
     let cmd = format!("add element ip filter allowed_v4 {{ {ip} timeout {ttl_secs}s }}");
-    nft_in_ns(sandbox_id, &cmd.split_whitespace().collect::<Vec<&str>>())
-        .map(|_| ())
+    nft_in_ns(sandbox_id, &cmd.split_whitespace().collect::<Vec<&str>>()).map(|_| ())
 }
 
 /// 删除沙盒的 nftables 表。

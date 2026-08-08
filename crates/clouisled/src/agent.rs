@@ -12,7 +12,7 @@ use clouisle_core::{
     ClouisleError, ErrorKind, NodeInfo, Resources, Sandbox, SandboxEvent, SandboxSpec,
     SandboxStatus,
 };
-use clouisle_scheduler::{Reservation, ResourcePool};
+use clouisle_scheduler::ResourcePool;
 use clouisle_store::Store;
 use clouisle_vmm::{StopMode, VmHandle, Vmm};
 
@@ -65,7 +65,7 @@ pub struct NodeAgent {
 impl NodeAgent {
     pub fn new(config: NodeAgentConfig, vmm: Arc<dyn Vmm>) -> Self {
         let capacity = Resources {
-            vcpu: config.total_vcpu as u16,
+            vcpu: config.total_vcpu,
             memory_mb: config.total_memory_mb as u32,
             disk_mb: config.total_disk_mb as u32,
             ..Resources::default()
@@ -98,10 +98,7 @@ impl NodeAgent {
         HeartbeatReport {
             node_id: self.config.node_id.clone(),
             allocated_vcpu: sb.values().map(|s| s.spec.resources.vcpu).sum(),
-            allocated_memory_mb: sb
-                .values()
-                .map(|s| s.spec.resources.memory_mb as u64)
-                .sum(),
+            allocated_memory_mb: sb.values().map(|s| s.spec.resources.memory_mb as u64).sum(),
             running_sandboxes: running,
             pool_ready: HashMap::new(),
             load_avg: [0.0; 3],
@@ -157,21 +154,26 @@ impl NodeAgent {
             .update_sandbox_status(&id, &SandboxStatus::Running)
             .await?;
 
-        self.sandboxes.write().await.insert(id.clone(), sandbox.clone());
-        self.reservations.lock().await.insert(id.clone(), reservation);
+        self.sandboxes
+            .write()
+            .await
+            .insert(id.clone(), sandbox.clone());
+        self.reservations
+            .lock()
+            .await
+            .insert(id.clone(), reservation);
         Ok(sandbox)
     }
 
     /// 停止并删除本机沙盒。
-    pub async fn delete_sandbox(
-        &self,
-        id: &str,
-        store: &dyn Store,
-    ) -> Result<(), ClouisleError> {
+    pub async fn delete_sandbox(&self, id: &str, store: &dyn Store) -> Result<(), ClouisleError> {
         let sandbox = {
             let sb = self.sandboxes.read().await;
             sb.get(id).cloned().ok_or_else(|| {
-                ClouisleError::new(ErrorKind::NotFound, format!("sandbox {id} not on this node"))
+                ClouisleError::new(
+                    ErrorKind::NotFound,
+                    format!("sandbox {id} not on this node"),
+                )
             })?
         };
 
@@ -217,9 +219,9 @@ impl NodeAgent {
         if let Some(c) = cwd {
             cmd.current_dir(c);
         }
-        let mut child = cmd.spawn().map_err(|e| {
-            ClouisleError::new(ErrorKind::Vmm, format!("spawn {argv:?}: {e}"))
-        })?;
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| ClouisleError::new(ErrorKind::Vmm, format!("spawn {argv:?}: {e}")))?;
 
         let stdout = child.stdout.take().expect("stdout piped");
         let stderr = child.stderr.take().expect("stderr piped");
@@ -242,7 +244,11 @@ impl NodeAgent {
         let duration_ms = start.elapsed().as_millis() as u64;
         let _ = sandbox_id;
         Ok(clouisle_core::execution::ExecutionResult {
-            exit_code: if timed_out { -1 } else { status.unwrap_or_default().code().unwrap_or(-1) },
+            exit_code: if timed_out {
+                -1
+            } else {
+                status.unwrap_or_default().code().unwrap_or(-1)
+            },
             stdout: bytes::Bytes::from(out_bytes),
             stderr: bytes::Bytes::from(err_bytes),
             duration_ms,
@@ -271,11 +277,11 @@ impl NodeAgent {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
     use clouisle_store::InMemoryStore;
     use clouisle_vmm::{
         SnapshotKind, SnapshotPaths, StopMode, VmHandle, VmStats, Vmm, VmmCapabilities,
     };
-    use async_trait::async_trait;
 
     #[derive(Clone)]
     struct TestVmm;
@@ -285,23 +291,54 @@ mod tests {
         async fn create(&self, _: &clouisle_core::SandboxSpec) -> clouisle_core::Result<VmHandle> {
             Ok(VmHandle {
                 id: uuid::Uuid::now_v7().to_string(),
-                backend: "test".into(), pid: None, api_socket: None, vsock_socket: None,
+                backend: "test".into(),
+                pid: None,
+                api_socket: None,
+                vsock_socket: None,
             })
         }
-        async fn start(&self, _: &VmHandle) -> clouisle_core::Result<()> { Ok(()) }
-        async fn pause(&self, _: &VmHandle) -> clouisle_core::Result<()> { Ok(()) }
-        async fn resume(&self, _: &VmHandle) -> clouisle_core::Result<()> { Ok(()) }
-        async fn snapshot(&self, _: &VmHandle, _k: SnapshotKind, _o: &SnapshotPaths) -> clouisle_core::Result<()> { Ok(()) }
-        async fn restore(&self, _: &clouisle_core::SandboxSpec, _: &SnapshotPaths) -> clouisle_core::Result<VmHandle> {
+        async fn start(&self, _: &VmHandle) -> clouisle_core::Result<()> {
+            Ok(())
+        }
+        async fn pause(&self, _: &VmHandle) -> clouisle_core::Result<()> {
+            Ok(())
+        }
+        async fn resume(&self, _: &VmHandle) -> clouisle_core::Result<()> {
+            Ok(())
+        }
+        async fn snapshot(
+            &self,
+            _: &VmHandle,
+            _k: SnapshotKind,
+            _o: &SnapshotPaths,
+        ) -> clouisle_core::Result<()> {
+            Ok(())
+        }
+        async fn restore(
+            &self,
+            _: &clouisle_core::SandboxSpec,
+            _: &SnapshotPaths,
+        ) -> clouisle_core::Result<VmHandle> {
             Ok(VmHandle {
                 id: uuid::Uuid::now_v7().to_string(),
-                backend: "test".into(), pid: None, api_socket: None, vsock_socket: None,
+                backend: "test".into(),
+                pid: None,
+                api_socket: None,
+                vsock_socket: None,
             })
         }
-        async fn stop(&self, _: &VmHandle, _m: StopMode) -> clouisle_core::Result<()> { Ok(()) }
-        async fn stats(&self, _: &VmHandle) -> clouisle_core::Result<VmStats> { Ok(VmStats::default()) }
+        async fn stop(&self, _: &VmHandle, _m: StopMode) -> clouisle_core::Result<()> {
+            Ok(())
+        }
+        async fn stats(&self, _: &VmHandle) -> clouisle_core::Result<VmStats> {
+            Ok(VmStats::default())
+        }
         fn capabilities(&self) -> VmmCapabilities {
-            VmmCapabilities { snapshot: true, vsock: true, balloon: false }
+            VmmCapabilities {
+                snapshot: true,
+                vsock: true,
+                balloon: false,
+            }
         }
     }
 

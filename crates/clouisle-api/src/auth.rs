@@ -20,7 +20,7 @@ pub enum Scope {
 }
 
 impl Scope {
-    pub fn from_str(s: &str) -> Self {
+    pub fn from_string(s: &str) -> Self {
         match s {
             "read" => Scope::Read,
             "full" | "admin" => Scope::Full,
@@ -90,9 +90,9 @@ impl Authenticator {
             .strip_prefix("Bearer ")
             .ok_or_else(|| ClouisleError::new(ErrorKind::Unauthenticated, "invalid auth scheme"))?;
         let keys = self.keys.read().await;
-        keys.get(key).cloned().ok_or_else(|| {
-            ClouisleError::new(ErrorKind::Unauthenticated, "invalid API key")
-        })
+        keys.get(key)
+            .cloned()
+            .ok_or_else(|| ClouisleError::new(ErrorKind::Unauthenticated, "invalid API key"))
     }
 
     /// 检查 scope 是否足够。
@@ -122,10 +122,7 @@ mod tests {
     #[tokio::test]
     async fn invalid_token_rejected() {
         let auth = Authenticator::new();
-        let err = auth
-            .authenticate(Some("Bearer garbage"))
-            .await
-            .unwrap_err();
+        let err = auth.authenticate(Some("Bearer garbage")).await.unwrap_err();
         assert_eq!(err.kind, ErrorKind::Unauthenticated);
     }
 
@@ -177,6 +174,6 @@ mod tests {
     fn scope_str() {
         assert_eq!(Scope::Full.as_str(), "full");
         assert_eq!(Scope::Read.as_str(), "read");
-        assert_eq!(Scope::from_str("admin"), Scope::Full);
+        assert_eq!(Scope::from_string("admin"), Scope::Full);
     }
 }

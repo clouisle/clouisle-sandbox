@@ -37,19 +37,63 @@ pub fn create_netns(sandbox_id: &str, host_side_ip: &str) -> Result<(String, Str
     run("ip", &["netns", "add", &ns_name])?;
 
     // 2. 创建 veth pair
-    run("ip", &["link", "add", &veth_host, "type", "veth", "peer", "name", &veth_ns])?;
+    run(
+        "ip",
+        &[
+            "link", "add", &veth_host, "type", "veth", "peer", "name", &veth_ns,
+        ],
+    )?;
 
     // 3. 将 veth_ns 移入 netns
     run("ip", &["link", "set", &veth_ns, "netns", &ns_name])?;
 
     // 4. 配置 veth_ns (guest 侧网关)
-    run("ip", &["netns", "exec", &ns_name, "ip", "addr", "add", "10.0.0.1/30", "dev", &veth_ns])?;
-    run("ip", &["netns", "exec", &ns_name, "ip", "link", "set", &veth_ns, "up"])?;
+    run(
+        "ip",
+        &[
+            "netns",
+            "exec",
+            &ns_name,
+            "ip",
+            "addr",
+            "add",
+            "10.0.0.1/30",
+            "dev",
+            &veth_ns,
+        ],
+    )?;
+    run(
+        "ip",
+        &[
+            "netns", "exec", &ns_name, "ip", "link", "set", &veth_ns, "up",
+        ],
+    )?;
 
     // 5. 配置 TAP (guest 侧)
-    run("ip", &["netns", "exec", &ns_name, "ip", "tuntap", "add", "tap0", "mode", "tap"])?;
-    run("ip", &["netns", "exec", &ns_name, "ip", "addr", "add", "10.0.0.2/30", "dev", "tap0"])?;
-    run("ip", &["netns", "exec", &ns_name, "ip", "link", "set", "tap0", "up"])?;
+    run(
+        "ip",
+        &[
+            "netns", "exec", &ns_name, "ip", "tuntap", "add", "tap0", "mode", "tap",
+        ],
+    )?;
+    run(
+        "ip",
+        &[
+            "netns",
+            "exec",
+            &ns_name,
+            "ip",
+            "addr",
+            "add",
+            "10.0.0.2/30",
+            "dev",
+            "tap0",
+        ],
+    )?;
+    run(
+        "ip",
+        &["netns", "exec", &ns_name, "ip", "link", "set", "tap0", "up"],
+    )?;
 
     // 6. 配置宿主机侧 veth
     run("ip", &["addr", "add", host_side_ip, "dev", &veth_host])?;

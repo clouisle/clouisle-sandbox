@@ -87,19 +87,19 @@ impl Resources {
             ));
         }
 
-        if let Some(bw) = self.bandwidth_mbps {
-            if bw == 0 {
-                errors.push(ValidationError::new(
-                    "bandwidth_mbps",
-                    "bandwidth_mbps must be >= 1 if set",
-                ));
-            }
+        if let Some(bw) = self.bandwidth_mbps
+            && bw == 0
+        {
+            errors.push(ValidationError::new(
+                "bandwidth_mbps",
+                "bandwidth_mbps must be >= 1 if set",
+            ));
         }
 
-        if let Some(iops) = self.iops {
-            if iops == 0 {
-                errors.push(ValidationError::new("iops", "iops must be >= 1 if set"));
-            }
+        if let Some(iops) = self.iops
+            && iops == 0
+        {
+            errors.push(ValidationError::new("iops", "iops must be >= 1 if set"));
         }
 
         if errors.is_empty() {

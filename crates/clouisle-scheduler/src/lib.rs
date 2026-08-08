@@ -3,5 +3,5 @@
 pub mod admission;
 pub mod placement;
 
-pub use admission::{ResourcePool, Reservation};
+pub use admission::{Reservation, ResourcePool};
 pub use placement::{PlacementStrategy, filter_nodes, score_nodes};

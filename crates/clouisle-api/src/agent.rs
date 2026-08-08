@@ -1,7 +1,5 @@
 //! Agent 连接抽象：连接 guest agent 并等待 Hello（Stage 0.6 的 host 侧语义）。
 
-use std::sync::Arc;
-
 use async_trait::async_trait;
 
 use clouisle_core::{ClouisleError, Result};
@@ -92,7 +90,10 @@ impl AgentConnection for MockAgentConnection {
             cmd.current_dir(c);
         }
         let mut child = cmd.spawn().map_err(|e| {
-            clouisle_core::ClouisleError::new(clouisle_core::ErrorKind::Vmm, format!("spawn {argv:?}: {e}"))
+            clouisle_core::ClouisleError::new(
+                clouisle_core::ErrorKind::Vmm,
+                format!("spawn {argv:?}: {e}"),
+            )
         })?;
 
         let stdout = child.stdout.take().expect("stdout piped");
@@ -117,7 +118,11 @@ impl AgentConnection for MockAgentConnection {
 
         let duration_ms = start.elapsed().as_millis() as u64;
         Ok(clouisle_core::execution::ExecutionResult {
-            exit_code: if timed_out { -1 } else { status.unwrap_or_default().code().unwrap_or(-1) },
+            exit_code: if timed_out {
+                -1
+            } else {
+                status.unwrap_or_default().code().unwrap_or(-1)
+            },
             stdout: bytes::Bytes::from(out_bytes),
             stderr: bytes::Bytes::from(err_bytes),
             duration_ms,
@@ -130,7 +135,9 @@ impl AgentConnection for MockAgentConnection {
 
     async fn write_file(&self, path: &str, content: bytes::Bytes, mode: u32) -> Result<()> {
         // Mock 模式：写入宿主机临时文件，模拟 guest 文件写入
-        let dir = std::env::temp_dir().join("clouisle-mock-fs").join(&self.sandbox_id);
+        let dir = std::env::temp_dir()
+            .join("clouisle-mock-fs")
+            .join(&self.sandbox_id);
         std::fs::create_dir_all(&dir).ok();
         // 路径穿越防护
         let path = path.trim_start_matches('/');
@@ -154,7 +161,9 @@ impl AgentConnection for MockAgentConnection {
     }
 
     async fn read_file(&self, path: &str) -> Result<bytes::Bytes> {
-        let dir = std::env::temp_dir().join("clouisle-mock-fs").join(&self.sandbox_id);
+        let dir = std::env::temp_dir()
+            .join("clouisle-mock-fs")
+            .join(&self.sandbox_id);
         let path = path.trim_start_matches('/');
         if path.split('/').any(|seg| seg == "..") {
             return Err(ClouisleError::validation(format!(
@@ -168,7 +177,9 @@ impl AgentConnection for MockAgentConnection {
     }
 
     async fn list_dir(&self, path: &str) -> Result<Vec<clouisle_core::DirEntry>> {
-        let dir = std::env::temp_dir().join("clouisle-mock-fs").join(&self.sandbox_id);
+        let dir = std::env::temp_dir()
+            .join("clouisle-mock-fs")
+            .join(&self.sandbox_id);
         let path = path.trim_start_matches('/');
         if path.split('/').any(|seg| seg == "..") {
             return Err(ClouisleError::validation(format!(
@@ -181,7 +192,9 @@ impl AgentConnection for MockAgentConnection {
             .map_err(|e| ClouisleError::not_found(format!("read_dir {path}: {e}")))?
         {
             let entry = entry.map_err(|e| ClouisleError::io(e.to_string()))?;
-            let meta = entry.metadata().map_err(|e| ClouisleError::io(e.to_string()))?;
+            let meta = entry
+                .metadata()
+                .map_err(|e| ClouisleError::io(e.to_string()))?;
             entries.push(clouisle_core::DirEntry {
                 name: entry.file_name().to_string_lossy().into_owned(),
                 size: meta.len(),
@@ -197,13 +210,11 @@ impl AgentConnection for MockAgentConnection {
 /// 独立的文件系统后端（Mock 用宿主机本地文件系统模拟 guest 文件系统）。
 /// 每个沙盒映射到 `<tmpdir>/clouisle-mock-fs/<sandbox_id>/`。
 #[derive(Debug, Clone, Default)]
-pub struct MockFsBackend {
-    root: Arc<std::sync::Mutex<std::collections::HashMap<String, std::path::PathBuf>>>,
-}
+pub struct MockFsBackend;
 
 impl MockFsBackend {
     pub fn new() -> Self {
-        Self::default()
+        Self
     }
 
     fn sandbox_dir(&self, sandbox_id: &str) -> std::path::PathBuf {
@@ -247,7 +258,9 @@ impl AgentConnection for MockFsConnection {
         _cwd: Option<String>,
         _timeout_ms: u64,
     ) -> Result<clouisle_core::execution::ExecutionResult> {
-        Err(ClouisleError::invalid_state("exec not supported on fs-only connection"))
+        Err(ClouisleError::invalid_state(
+            "exec not supported on fs-only connection",
+        ))
     }
 
     async fn write_file(&self, path: &str, content: bytes::Bytes, mode: u32) -> Result<()> {
@@ -284,7 +297,9 @@ impl AgentConnection for MockFsConnection {
             .map_err(|e| ClouisleError::not_found(format!("read_dir {path}: {e}")))?
         {
             let entry = entry.map_err(|e| ClouisleError::io(e.to_string()))?;
-            let meta = entry.metadata().map_err(|e| ClouisleError::io(e.to_string()))?;
+            let meta = entry
+                .metadata()
+                .map_err(|e| ClouisleError::io(e.to_string()))?;
             entries.push(clouisle_core::DirEntry {
                 name: entry.file_name().to_string_lossy().into_owned(),
                 size: meta.len(),
@@ -323,9 +338,16 @@ mod tests {
 
     #[tokio::test]
     async fn mock_exec_echo() {
-        let conn = MockAgentConnection { sandbox_id: "test-sbx".into() };
+        let conn = MockAgentConnection {
+            sandbox_id: "test-sbx".into(),
+        };
         let r = conn
-            .exec(vec!["echo".into(), "hello".into()], Default::default(), None, 5000)
+            .exec(
+                vec!["echo".into(), "hello".into()],
+                Default::default(),
+                None,
+                5000,
+            )
             .await
             .unwrap();
         assert_eq!(r.exit_code, 0);
@@ -334,11 +356,18 @@ mod tests {
 
     #[tokio::test]
     async fn mock_exec_env_injection() {
-        let conn = MockAgentConnection { sandbox_id: "test-sbx".into() };
+        let conn = MockAgentConnection {
+            sandbox_id: "test-sbx".into(),
+        };
         let mut env = std::collections::HashMap::new();
         env.insert("FOO".to_string(), "bar".to_string());
         let r = conn
-            .exec(vec!["sh".into(), "-c".into(), "echo $FOO".into()], env, None, 5000)
+            .exec(
+                vec!["sh".into(), "-c".into(), "echo $FOO".into()],
+                env,
+                None,
+                5000,
+            )
             .await
             .unwrap();
         assert_eq!(r.stdout.as_ref(), b"bar\n");
@@ -346,7 +375,9 @@ mod tests {
 
     #[tokio::test]
     async fn mock_exec_cwd() {
-        let conn = MockAgentConnection { sandbox_id: "test-sbx".into() };
+        let conn = MockAgentConnection {
+            sandbox_id: "test-sbx".into(),
+        };
         let dir = std::env::temp_dir();
         let r = conn
             .exec(
@@ -367,9 +398,16 @@ mod tests {
 
     #[tokio::test]
     async fn mock_exec_exit_code() {
-        let conn = MockAgentConnection { sandbox_id: "test-sbx".into() };
+        let conn = MockAgentConnection {
+            sandbox_id: "test-sbx".into(),
+        };
         let r = conn
-            .exec(vec!["sh".into(), "-c".into(), "exit 7".into()], Default::default(), None, 5000)
+            .exec(
+                vec!["sh".into(), "-c".into(), "exit 7".into()],
+                Default::default(),
+                None,
+                5000,
+            )
             .await
             .unwrap();
         assert_eq!(r.exit_code, 7);
@@ -377,10 +415,17 @@ mod tests {
 
     #[tokio::test]
     async fn mock_exec_timeout() {
-        let conn = MockAgentConnection { sandbox_id: "test-sbx".into() };
+        let conn = MockAgentConnection {
+            sandbox_id: "test-sbx".into(),
+        };
         let start = std::time::Instant::now();
         let r = conn
-            .exec(vec!["sleep".into(), "5".into()], Default::default(), None, 300)
+            .exec(
+                vec!["sleep".into(), "5".into()],
+                Default::default(),
+                None,
+                300,
+            )
             .await
             .unwrap();
         assert!(start.elapsed().as_millis() < 3000);
@@ -389,9 +434,16 @@ mod tests {
 
     #[tokio::test]
     async fn mock_exec_stderr() {
-        let conn = MockAgentConnection { sandbox_id: "test-sbx".into() };
+        let conn = MockAgentConnection {
+            sandbox_id: "test-sbx".into(),
+        };
         let r = conn
-            .exec(vec!["sh".into(), "-c".into(), "echo err >&2".into()], Default::default(), None, 5000)
+            .exec(
+                vec!["sh".into(), "-c".into(), "echo err >&2".into()],
+                Default::default(),
+                None,
+                5000,
+            )
             .await
             .unwrap();
         assert_eq!(r.stderr.as_ref(), b"err\n");

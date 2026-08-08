@@ -23,8 +23,7 @@ impl DnsProxy {
 
     pub async fn is_allowed(&self, domain: &str) -> bool {
         let allowed = self.allowed.read().await;
-        allowed.iter().any(|d| domain.ends_with(d.as_str()))
-            || allowed.contains(domain)
+        allowed.iter().any(|d| domain.ends_with(d.as_str())) || allowed.contains(domain)
     }
 
     pub async fn update(&self, domains: Vec<String>) {

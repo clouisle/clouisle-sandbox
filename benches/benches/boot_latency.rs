@@ -8,7 +8,7 @@ use std::time::Instant;
 
 use clouisle_core::timing::{BootTrace, SloKind};
 use clouisle_vmm::Vmm;
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, black_box, criterion_group, criterion_main};
 
 fn bench_slo_kind_str(c: &mut Criterion) {
     c.bench_function("slo_kind_as_str", |b| {
@@ -53,5 +53,10 @@ fn bench_mock_create(c: &mut Criterion) {
     });
 }
 
-criterion_group!(benches, bench_slo_kind_str, bench_boot_trace, bench_mock_create);
+criterion_group!(
+    benches,
+    bench_slo_kind_str,
+    bench_boot_trace,
+    bench_mock_create
+);
 criterion_main!(benches);

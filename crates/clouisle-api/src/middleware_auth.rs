@@ -3,11 +3,10 @@
 //! 受保护路径需要 `Bearer <key>`。`/health` 与 `/metrics` 例外（探测端点）。
 
 use axum::extract::{Request, State};
-use axum::http::StatusCode;
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 
-use crate::auth::{Authenticator, Principal};
+use crate::auth::Principal;
 use crate::state::AppState;
 
 /// 认证中间件。将 Principal 存入 request extensions。

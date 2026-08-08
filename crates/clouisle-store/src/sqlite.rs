@@ -68,18 +68,18 @@ struct RowData {
 impl SqliteStore {
     /// 打开（或创建）数据库文件。
     pub fn open(path: impl AsRef<Path>) -> StoreResult<Self> {
-        let conn = Connection::open(path.as_ref()).map_err(|e| StoreError::Sqlite(e.to_string()))?;
+        let conn =
+            Connection::open(path.as_ref()).map_err(|e| StoreError::Sqlite(e.to_string()))?;
         Self::init(conn)
     }
 
     /// 打开内存数据库（测试用）。
     pub fn open_in_memory() -> StoreResult<Self> {
-        let conn =
-            Connection::open_in_memory().map_err(|e| StoreError::Sqlite(e.to_string()))?;
+        let conn = Connection::open_in_memory().map_err(|e| StoreError::Sqlite(e.to_string()))?;
         Self::init(conn)
     }
 
-    fn init(mut conn: Connection) -> StoreResult<Self> {
+    fn init(conn: Connection) -> StoreResult<Self> {
         conn.execute_batch("PRAGMA journal_mode=WAL;")
             .map_err(|e| StoreError::Sqlite(e.to_string()))?;
         conn.execute_batch("PRAGMA synchronous=NORMAL;")
@@ -127,10 +127,8 @@ fn row_to_sandbox(row: RowData) -> StoreResult<Sandbox> {
         id: row.id,
         spec,
         status,
-        created_at: DateTime::from_timestamp_millis(row.created_at)
-            .unwrap_or_else(Utc::now),
-        updated_at: DateTime::from_timestamp_millis(row.updated_at)
-            .unwrap_or_else(Utc::now),
+        created_at: DateTime::from_timestamp_millis(row.created_at).unwrap_or_else(Utc::now),
+        updated_at: DateTime::from_timestamp_millis(row.updated_at).unwrap_or_else(Utc::now),
         ready_at: row.ready_at.and_then(DateTime::from_timestamp_millis),
         expires_at: row.expires_at.and_then(DateTime::from_timestamp_millis),
         vmm_meta,
@@ -180,14 +178,10 @@ impl Store for SqliteStore {
                  FROM sandboxes WHERE id = ?1",
             )
             .map_err(|e| StoreError::Sqlite(e.to_string()))?;
-        let row = stmt
-            .query_row([id], |r| row_data_from(r))
-            .map_err(|e| match e {
-                rusqlite::Error::QueryReturnedNoRows => {
-                    StoreError::NotFound(format!("sandbox {id}"))
-                }
-                other => StoreError::Sqlite(other.to_string()),
-            })?;
+        let row = stmt.query_row([id], row_data_from).map_err(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => StoreError::NotFound(format!("sandbox {id}")),
+            other => StoreError::Sqlite(other.to_string()),
+        })?;
         row_to_sandbox(row)
     }
 
@@ -208,8 +202,8 @@ impl Store for SqliteStore {
 
     async fn update_sandbox_vmm_meta(&self, id: &str, vmm_meta: &VmmMeta) -> StoreResult<()> {
         let conn = self.conn.lock().await;
-        let vmm_meta_json = serde_json::to_string(vmm_meta)
-            .map_err(|e| StoreError::Internal(e.to_string()))?;
+        let vmm_meta_json =
+            serde_json::to_string(vmm_meta).map_err(|e| StoreError::Internal(e.to_string()))?;
         let now = Utc::now().timestamp_millis();
         let n = conn
             .execute(
@@ -229,11 +223,14 @@ impl Store for SqliteStore {
             .prepare("SELECT id, spec_json, status, vmm_meta_json, created_at, updated_at, ready_at, expires_at, terminal_message, node_id FROM sandboxes")
             .map_err(|e| StoreError::Sqlite(e.to_string()))?;
         let rows: Vec<RowData> = stmt
-            .query_map([], |r| row_data_from(r))
+            .query_map([], row_data_from)
             .map_err(|e| StoreError::Sqlite(e.to_string()))?
             .filter_map(|r| r.ok())
             .collect();
-        let mut out: Vec<Sandbox> = rows.into_iter().filter_map(|r| row_to_sandbox(r).ok()).collect();
+        let mut out: Vec<Sandbox> = rows
+            .into_iter()
+            .filter_map(|r| row_to_sandbox(r).ok())
+            .collect();
         if let Some(s) = status {
             out.retain(|sb| sb.status == s);
         }
@@ -253,8 +250,8 @@ impl Store for SqliteStore {
 
     async fn save_execution(&self, record: &ExecutionRecord) -> StoreResult<()> {
         let conn = self.conn.lock().await;
-        let spec_json = serde_json::to_string(&record.spec)
-            .map_err(|e| StoreError::Internal(e.to_string()))?;
+        let spec_json =
+            serde_json::to_string(&record.spec).map_err(|e| StoreError::Internal(e.to_string()))?;
         conn.execute(
             "INSERT INTO executions (id, sandbox_id, spec_json, exit_code, stdout, stderr, started_at, finished_at, timed_out, stdout_truncated, stderr_truncated, node_id)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
@@ -287,8 +284,13 @@ impl Store for SqliteStore {
             .map_err(|e| StoreError::Sqlite(e.to_string()))?;
         stmt.query_row([id], |r| {
             let spec_json: String = r.get(2)?;
-            let spec: ExecutionSpec = serde_json::from_str(&spec_json)
-                .map_err(|e| rusqlite::Error::FromSqlConversionFailure(2, rusqlite::types::Type::Text, Box::new(e)))?;
+            let spec: ExecutionSpec = serde_json::from_str(&spec_json).map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    2,
+                    rusqlite::types::Type::Text,
+                    Box::new(e),
+                )
+            })?;
             Ok(ExecutionRecord {
                 id: r.get(0)?,
                 sandbox_id: r.get(1)?,
@@ -296,8 +298,10 @@ impl Store for SqliteStore {
                 exit_code: r.get(3)?,
                 stdout: bytes::Bytes::from(r.get::<_, Vec<u8>>(4)?),
                 stderr: bytes::Bytes::from(r.get::<_, Vec<u8>>(5)?),
-                started_at: DateTime::from_timestamp_millis(r.get::<_, i64>(6)?).unwrap_or_else(Utc::now),
-                finished_at: DateTime::from_timestamp_millis(r.get::<_, i64>(7)?).unwrap_or_else(Utc::now),
+                started_at: DateTime::from_timestamp_millis(r.get::<_, i64>(6)?)
+                    .unwrap_or_else(Utc::now),
+                finished_at: DateTime::from_timestamp_millis(r.get::<_, i64>(7)?)
+                    .unwrap_or_else(Utc::now),
                 timed_out: r.get::<_, i32>(8)? != 0,
                 stdout_truncated: r.get::<_, i32>(9)? != 0,
                 stderr_truncated: r.get::<_, i32>(10)? != 0,
@@ -321,8 +325,13 @@ impl Store for SqliteStore {
         let rows = stmt
             .query_map([sandbox_id], |r| {
                 let spec_json: String = r.get(2)?;
-                let spec: ExecutionSpec = serde_json::from_str(&spec_json)
-                    .map_err(|e| rusqlite::Error::FromSqlConversionFailure(2, rusqlite::types::Type::Text, Box::new(e)))?;
+                let spec: ExecutionSpec = serde_json::from_str(&spec_json).map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        2,
+                        rusqlite::types::Type::Text,
+                        Box::new(e),
+                    )
+                })?;
                 Ok(ExecutionRecord {
                     id: r.get(0)?,
                     sandbox_id: r.get(1)?,
@@ -330,8 +339,10 @@ impl Store for SqliteStore {
                     exit_code: r.get(3)?,
                     stdout: bytes::Bytes::from(r.get::<_, Vec<u8>>(4)?),
                     stderr: bytes::Bytes::from(r.get::<_, Vec<u8>>(5)?),
-                    started_at: DateTime::from_timestamp_millis(r.get::<_, i64>(6)?).unwrap_or_else(Utc::now),
-                    finished_at: DateTime::from_timestamp_millis(r.get::<_, i64>(7)?).unwrap_or_else(Utc::now),
+                    started_at: DateTime::from_timestamp_millis(r.get::<_, i64>(6)?)
+                        .unwrap_or_else(Utc::now),
+                    finished_at: DateTime::from_timestamp_millis(r.get::<_, i64>(7)?)
+                        .unwrap_or_else(Utc::now),
                     timed_out: r.get::<_, i32>(8)? != 0,
                     stdout_truncated: r.get::<_, i32>(9)? != 0,
                     stderr_truncated: r.get::<_, i32>(10)? != 0,
@@ -399,7 +410,10 @@ mod tests {
             }
             s.create_sandbox(&sb).await.unwrap();
         }
-        let running = s.list_sandboxes(Some(SandboxStatus::Running)).await.unwrap();
+        let running = s
+            .list_sandboxes(Some(SandboxStatus::Running))
+            .await
+            .unwrap();
         assert_eq!(running.len(), 2);
         let all = s.list_sandboxes(None).await.unwrap();
         assert_eq!(all.len(), 5);

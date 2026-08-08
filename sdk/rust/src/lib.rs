@@ -34,13 +34,25 @@ pub struct Resources {
     pub iops: Option<u32>,
 }
 
-const fn default_vcpu() -> u16 { 1 }
-const fn default_memory_mb() -> u32 { 256 }
-const fn default_disk_mb() -> u32 { 512 }
+const fn default_vcpu() -> u16 {
+    1
+}
+const fn default_memory_mb() -> u32 {
+    256
+}
+const fn default_disk_mb() -> u32 {
+    512
+}
 
 impl Default for Resources {
     fn default() -> Self {
-        Self { vcpu: 1, memory_mb: 256, disk_mb: 512, bandwidth_mbps: None, iops: None }
+        Self {
+            vcpu: 1,
+            memory_mb: 256,
+            disk_mb: 512,
+            bandwidth_mbps: None,
+            iops: None,
+        }
     }
 }
 
@@ -54,11 +66,16 @@ pub struct NetworkConfig {
     pub allow_egress: Vec<String>,
 }
 
-const fn default_true() -> bool { true }
+const fn default_true() -> bool {
+    true
+}
 
 impl Default for NetworkConfig {
     fn default() -> Self {
-        Self { enabled: true, allow_egress: Vec::new() }
+        Self {
+            enabled: true,
+            allow_egress: Vec::new(),
+        }
     }
 }
 
@@ -81,12 +98,17 @@ pub struct SandboxSpec {
     pub restart_policy: String,
 }
 
-const fn default_start_timeout() -> u64 { 10 }
+const fn default_start_timeout() -> u64 {
+    10
+}
 
 impl Default for SandboxSpec {
     fn default() -> Self {
         Self {
-            image: ImageRef { reference: "alpine:latest".into(), digest: None },
+            image: ImageRef {
+                reference: "alpine:latest".into(),
+                digest: None,
+            },
             resources: Resources::default(),
             network: NetworkConfig::default(),
             env: HashMap::new(),
@@ -158,11 +180,20 @@ pub struct ExecRequest {
     pub stream: bool,
 }
 
-const fn default_timeout_ms() -> u64 { 30000 }
+#[allow(dead_code)]
+const fn default_timeout_ms() -> u64 {
+    30000
+}
 
 impl ExecRequest {
     pub fn new(argv: Vec<String>) -> Self {
-        Self { argv, env: HashMap::new(), cwd: None, timeout_ms: 30000, stream: false }
+        Self {
+            argv,
+            env: HashMap::new(),
+            cwd: None,
+            timeout_ms: 30000,
+            stream: false,
+        }
     }
 }
 
@@ -274,7 +305,11 @@ impl Client {
         let base_url = Url::parse(base_url).unwrap_or_else(|_| {
             Url::parse(&format!("http://{base_url}")).expect("invalid base_url")
         });
-        Self { http: HttpClient::new(), base_url, api_key: api_key.to_string() }
+        Self {
+            http: HttpClient::new(),
+            base_url,
+            api_key: api_key.to_string(),
+        }
     }
 
     // ──────────────────────────────────────────
@@ -293,12 +328,21 @@ impl Client {
 
     /// List sandboxes.
     pub async fn list_sandboxes(
-        &self, status: Option<SandboxStatus>, limit: Option<usize>, offset: Option<usize>,
+        &self,
+        status: Option<SandboxStatus>,
+        limit: Option<usize>,
+        offset: Option<usize>,
     ) -> Result<SandboxListResponse> {
         let mut q: Vec<(String, String)> = Vec::new();
-        if let Some(ref s) = status { q.push(("status".into(), format!("{:?}", s).to_lowercase())); }
-        if let Some(l) = limit { q.push(("limit".into(), l.to_string())); }
-        if let Some(o) = offset { q.push(("offset".into(), o.to_string())); }
+        if let Some(ref s) = status {
+            q.push(("status".into(), format!("{:?}", s).to_lowercase()));
+        }
+        if let Some(l) = limit {
+            q.push(("limit".into(), l.to_string()));
+        }
+        if let Some(o) = offset {
+            q.push(("offset".into(), o.to_string()));
+        }
         self.get_with_query("/api/v1/sandboxes", q).await
     }
 
@@ -313,26 +357,46 @@ impl Client {
 
     /// Execute a command synchronously.
     pub async fn exec(&self, sandbox_id: &str, req: &ExecRequest) -> Result<ExecResult> {
-        self.post(&format!("/api/v1/sandboxes/{sandbox_id}/exec"), req).await
+        self.post(&format!("/api/v1/sandboxes/{sandbox_id}/exec"), req)
+            .await
     }
 
     /// Convenience: exec with argv + timeout.
-    pub async fn exec_cmd(&self, sandbox_id: &str, argv: Vec<String>, timeout_ms: u64) -> Result<ExecResult> {
-        self.exec(sandbox_id, &ExecRequest {
-            argv, timeout_ms, ..ExecRequest::new(vec![])
-        }).await
+    pub async fn exec_cmd(
+        &self,
+        sandbox_id: &str,
+        argv: Vec<String>,
+        timeout_ms: u64,
+    ) -> Result<ExecResult> {
+        self.exec(
+            sandbox_id,
+            &ExecRequest {
+                argv,
+                timeout_ms,
+                ..ExecRequest::new(vec![])
+            },
+        )
+        .await
     }
 
     /// Get a single execution record.
     pub async fn get_execution(&self, sandbox_id: &str, exec_id: &str) -> Result<ExecutionRecord> {
-        self.get(&format!("/api/v1/sandboxes/{sandbox_id}/exec/{exec_id}")).await
+        self.get(&format!("/api/v1/sandboxes/{sandbox_id}/exec/{exec_id}"))
+            .await
     }
 
     /// List execution records.
-    pub async fn list_executions(&self, sandbox_id: &str, limit: Option<usize>) -> Result<Vec<ExecutionRecord>> {
+    pub async fn list_executions(
+        &self,
+        sandbox_id: &str,
+        limit: Option<usize>,
+    ) -> Result<Vec<ExecutionRecord>> {
         let mut q = Vec::new();
-        if let Some(l) = limit { q.push(("limit".into(), l.to_string())); }
-        self.get_with_query(&format!("/api/v1/sandboxes/{sandbox_id}/exec"), q).await
+        if let Some(l) = limit {
+            q.push(("limit".into(), l.to_string()));
+        }
+        self.get_with_query(&format!("/api/v1/sandboxes/{sandbox_id}/exec"), q)
+            .await
     }
 
     // ──────────────────────────────────────────
@@ -340,25 +404,45 @@ impl Client {
     // ──────────────────────────────────────────
 
     /// Upload a file.
-    pub async fn upload_file(&self, sandbox_id: &str, path: &str, data: &[u8]) -> Result<serde_json::Value> {
-        self.post_raw(&format!("/api/v1/sandboxes/{sandbox_id}/files/upload?path={path}"), data).await
+    pub async fn upload_file(
+        &self,
+        sandbox_id: &str,
+        path: &str,
+        data: &[u8],
+    ) -> Result<serde_json::Value> {
+        self.post_raw(
+            &format!("/api/v1/sandboxes/{sandbox_id}/files/upload?path={path}"),
+            data,
+        )
+        .await
     }
 
     /// Download a file as raw bytes.
     pub async fn download_file(&self, sandbox_id: &str, path: &str) -> Result<Vec<u8>> {
-        let resp = self.http.get(self.url(&format!("/api/v1/sandboxes/{sandbox_id}/files/download?path={path}")))
+        let resp = self
+            .http
+            .get(self.url(&format!(
+                "/api/v1/sandboxes/{sandbox_id}/files/download?path={path}"
+            )))
             .header("Authorization", format!("Bearer {}", self.api_key))
-            .send().await?;
+            .send()
+            .await?;
         let status = resp.status();
         if !status.is_success() {
-            return Err(SdkError::Http { status: status.as_u16(), body: resp.text().await? });
+            return Err(SdkError::Http {
+                status: status.as_u16(),
+                body: resp.text().await?,
+            });
         }
         Ok(resp.bytes().await?.to_vec())
     }
 
     /// List files in a directory.
     pub async fn list_files(&self, sandbox_id: &str, path: &str) -> Result<ListFilesResponse> {
-        self.get(&format!("/api/v1/sandboxes/{sandbox_id}/files/ls?path={path}")).await
+        self.get(&format!(
+            "/api/v1/sandboxes/{sandbox_id}/files/ls?path={path}"
+        ))
+        .await
     }
 
     // ──────────────────────────────────────────
@@ -375,50 +459,117 @@ impl Client {
         self.get_no_auth("/health/ready").await
     }
     pub async fn metrics(&self) -> Result<String> {
-        Ok(self.http.get(self.url("/metrics")).send().await?.text().await?)
+        Ok(self
+            .http
+            .get(self.url("/metrics"))
+            .send()
+            .await?
+            .text()
+            .await?)
     }
 
     // ──────────────────────────────────────────
     //  Internal HTTP
     // ──────────────────────────────────────────
 
-    fn url(&self, path: &str) -> String { format!("{}{}", self.base_url, path) }
+    fn url(&self, path: &str) -> String {
+        format!("{}{}", self.base_url, path)
+    }
 
     fn headers(&self) -> reqwest::header::HeaderMap {
         let mut h = reqwest::header::HeaderMap::new();
         if !self.api_key.is_empty() {
-            h.insert("Authorization", format!("Bearer {}", self.api_key).parse().unwrap());
+            h.insert(
+                "Authorization",
+                format!("Bearer {}", self.api_key).parse().unwrap(),
+            );
         }
         h
     }
 
     async fn get<T: for<'de> Deserialize<'de>>(&self, path: &str) -> Result<T> {
-        self.check_response(self.http.get(self.url(path)).headers(self.headers()).send().await?).await
+        self.check_response(
+            self.http
+                .get(self.url(path))
+                .headers(self.headers())
+                .send()
+                .await?,
+        )
+        .await
     }
     async fn get_no_auth<T: for<'de> Deserialize<'de>>(&self, path: &str) -> Result<T> {
-        self.check_response(self.http.get(self.url(path)).send().await?).await
+        self.check_response(self.http.get(self.url(path)).send().await?)
+            .await
     }
-    async fn get_with_query<T: for<'de> Deserialize<'de>>(&self, path: &str, q: Vec<(String, String)>) -> Result<T> {
-        self.check_response(self.http.get(self.url(path)).headers(self.headers()).query(&q).send().await?).await
+    async fn get_with_query<T: for<'de> Deserialize<'de>>(
+        &self,
+        path: &str,
+        q: Vec<(String, String)>,
+    ) -> Result<T> {
+        self.check_response(
+            self.http
+                .get(self.url(path))
+                .headers(self.headers())
+                .query(&q)
+                .send()
+                .await?,
+        )
+        .await
     }
-    async fn post<T: for<'de> Deserialize<'de>, B: Serialize>(&self, path: &str, body: &B) -> Result<T> {
-        self.check_response(self.http.post(self.url(path)).headers(self.headers()).json(body).send().await?).await
+    async fn post<T: for<'de> Deserialize<'de>, B: Serialize>(
+        &self,
+        path: &str,
+        body: &B,
+    ) -> Result<T> {
+        self.check_response(
+            self.http
+                .post(self.url(path))
+                .headers(self.headers())
+                .json(body)
+                .send()
+                .await?,
+        )
+        .await
     }
     async fn post_raw(&self, path: &str, data: &[u8]) -> Result<serde_json::Value> {
-        self.check_response(self.http.post(self.url(path)).headers(self.headers()).body(data.to_vec()).send().await?).await
+        self.check_response(
+            self.http
+                .post(self.url(path))
+                .headers(self.headers())
+                .body(data.to_vec())
+                .send()
+                .await?,
+        )
+        .await
     }
     async fn delete(&self, path: &str) -> Result<()> {
-        let resp = self.http.delete(self.url(path)).headers(self.headers()).send().await?;
+        let resp = self
+            .http
+            .delete(self.url(path))
+            .headers(self.headers())
+            .send()
+            .await?;
         let status = resp.status();
         if !status.is_success() {
-            return Err(SdkError::Http { status: status.as_u16(), body: resp.text().await? });
+            return Err(SdkError::Http {
+                status: status.as_u16(),
+                body: resp.text().await?,
+            });
         }
         Ok(())
     }
-    async fn check_response<T: for<'de> Deserialize<'de>>(&self, resp: reqwest::Response) -> Result<T> {
+    async fn check_response<T: for<'de> Deserialize<'de>>(
+        &self,
+        resp: reqwest::Response,
+    ) -> Result<T> {
         let status = resp.status();
         let body = resp.text().await?;
-        if !status.is_success() { return Err(SdkError::Http { status: status.as_u16(), body }); }
+        if !status.is_success() {
+            return Err(SdkError::Http {
+                status: status.as_u16(),
+                body,
+            });
+        }
         Ok(serde_json::from_str(&body)?)
     }
 }

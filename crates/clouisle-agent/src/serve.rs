@@ -8,13 +8,10 @@ use std::collections::HashMap;
 use bytes::Bytes;
 use clouisle_proto::{Frame, FrameDecoder};
 
-use crate::errors::{AgentError, AgentResult};
+use crate::errors::AgentResult;
 
 /// 在内存解码缓冲上处理一字节块中的完整帧，返回响应帧。
-pub fn process_frames(
-    decoder: &mut FrameDecoder,
-    data: &[u8],
-) -> AgentResult<Vec<Frame>> {
+pub fn process_frames(decoder: &mut FrameDecoder, data: &[u8]) -> AgentResult<Vec<Frame>> {
     let frames = decoder.push(data)?;
     let mut responses = Vec::new();
     for frame in frames {
@@ -51,10 +48,13 @@ fn run_exec(
     argv: Vec<String>,
     env: HashMap<String, String>,
     cwd: Option<String>,
-    timeout_ms: u64,
+    _timeout_ms: u64,
 ) -> Vec<Frame> {
     if argv.is_empty() {
-        return vec![Frame::Exited { id: id.into(), code: -1 }];
+        return vec![Frame::Exited {
+            id: id.into(),
+            code: -1,
+        }];
     }
     let mut cmd = std::process::Command::new(&argv[0]);
     cmd.args(&argv[1..]).envs(env);
@@ -92,17 +92,21 @@ fn run_exec(
 }
 
 /// 服务主循环原型（读一帧测一帧）。真实版本在 Linux 上用 vsock socket + tokio。
-pub async fn serve_loop<R, W>(
-    reader: &mut R,
-    writer: &mut W,
-) -> AgentResult<()>
+pub async fn serve_loop<R, W>(reader: &mut R, writer: &mut W) -> AgentResult<()>
 where
     R: tokio::io::AsyncRead + Unpin,
     W: tokio::io::AsyncWrite + Unpin,
 {
     loop {
         let frame = clouisle_proto::codec::read_frame(reader).await?;
-        if let Frame::ExecReq { id, argv, env, cwd, timeout_ms } = frame {
+        if let Frame::ExecReq {
+            id,
+            argv,
+            env,
+            cwd,
+            timeout_ms,
+        } = frame
+        {
             // 流式写回
             for f in run_exec(&id, argv, env, cwd, timeout_ms) {
                 clouisle_proto::codec::write_frame(writer, &f).await?;
@@ -174,22 +178,25 @@ mod tests {
         assert_eq!(out, b"hi\n");
     }
 
-#[tokio::test]
+    #[tokio::test]
     async fn serve_loop_exec() {
         let (mut a, mut b) = duplex(128);
         // 拆出独立读写半部
         let (mut br, mut bw) = tokio::io::split(b);
-        let server = tokio::spawn(async move {
-            serve_loop(&mut br, &mut bw).await
-        });
+        let server = tokio::spawn(async move { serve_loop(&mut br, &mut bw).await });
         // a 是 client 端：发 exec
-        write_frame(&mut a, &Frame::ExecReq {
-            id: "e1".into(),
-            argv: vec!["echo".into(), "yo".into()],
-            env: HashMap::new(),
-            cwd: None,
-            timeout_ms: 5000,
-        }).await.unwrap();
+        write_frame(
+            &mut a,
+            &Frame::ExecReq {
+                id: "e1".into(),
+                argv: vec!["echo".into(), "yo".into()],
+                env: HashMap::new(),
+                cwd: None,
+                timeout_ms: 5000,
+            },
+        )
+        .await
+        .unwrap();
         let n = read_frame(&mut a).await.unwrap();
         assert!(matches!(n, Frame::Stdout { .. }));
         let e = read_frame(&mut a).await.unwrap();

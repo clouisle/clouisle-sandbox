@@ -59,13 +59,8 @@ pub fn filter_nodes<'a>(
 }
 
 /// 检查 node_selector 是否全部匹配节点 labels。
-pub fn matches_selector(
-    node: &NodeInfo,
-    selector: &HashMap<String, String>,
-) -> bool {
-    selector
-        .iter()
-        .all(|(k, v)| node.labels.get(k) == Some(v))
+pub fn matches_selector(node: &NodeInfo, selector: &HashMap<String, String>) -> bool {
+    selector.iter().all(|(k, v)| node.labels.get(k) == Some(v))
 }
 
 /// Score 阶段：按策略打分（分数越低越优先）。
@@ -164,7 +159,14 @@ mod tests {
     fn filter_by_selector() {
         let mut labels = std::collections::HashMap::<String, String>::new();
         labels.insert("tier".to_string(), "gpu".to_string());
-        let nodes = vec![node("a", true, &labels.iter().map(|(k,v)|(k.as_str(),v.as_str())).collect::<Vec<_>>())];
+        let nodes = vec![node(
+            "a",
+            true,
+            &labels
+                .iter()
+                .map(|(k, v)| (k.as_str(), v.as_str()))
+                .collect::<Vec<_>>(),
+        )];
         let mut spec = SandboxSpec::default();
         spec.node_selector.insert("tier".into(), "gpu".into());
         assert_eq!(filter_nodes(&nodes, &[], &spec).len(), 1);
@@ -199,7 +201,14 @@ mod tests {
     fn matches_selector_works() {
         let mut labels = std::collections::HashMap::<String, String>::new();
         labels.insert("k".into(), "v".into());
-        let n = node("a", true, &labels.iter().map(|(k,v)|(k.as_str(),v.as_str())).collect::<Vec<_>>());
+        let n = node(
+            "a",
+            true,
+            &labels
+                .iter()
+                .map(|(k, v)| (k.as_str(), v.as_str()))
+                .collect::<Vec<_>>(),
+        );
         let mut sel = HashMap::new();
         sel.insert("k".into(), "v".into());
         assert!(matches_selector(&n, &sel));

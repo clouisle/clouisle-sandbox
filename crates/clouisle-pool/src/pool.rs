@@ -321,10 +321,7 @@ async fn replenish(inner: &Arc<Mutex<PoolInner>>, vmm: &Arc<dyn Vmm>) {
             return;
         }
         // 已有 Preparing 槽位在途（含其它键），避免并发 tick 重复冷启动。
-        if g.slots
-            .iter()
-            .any(|s| s.state == SlotState::Preparing)
-        {
+        if g.slots.iter().any(|s| s.state == SlotState::Preparing) {
             return;
         }
         let ready = g
@@ -343,10 +340,7 @@ async fn replenish(inner: &Arc<Mutex<PoolInner>>, vmm: &Arc<dyn Vmm>) {
                 .iter()
                 .filter(|s| s.pool_key == *key && s.state != SlotState::Destroyed)
                 .count();
-            if best
-                .as_ref()
-                .is_none_or(|(_, c)| in_pool < *c)
-            {
+            if best.as_ref().is_none_or(|(_, c)| in_pool < *c) {
                 best = Some((key.clone(), in_pool));
             }
         }
@@ -402,7 +396,9 @@ async fn replenish(inner: &Arc<Mutex<PoolInner>>, vmm: &Arc<dyn Vmm>) {
 mod tests {
     use super::*;
     use clouisle_core::ImageRef;
-    use clouisle_vmm::{SnapshotKind, SnapshotPaths, StopMode, VmHandle, VmStats, Vmm, VmmCapabilities};
+    use clouisle_vmm::{
+        SnapshotKind, SnapshotPaths, StopMode, VmHandle, VmStats, Vmm, VmmCapabilities,
+    };
 
     use async_trait::async_trait;
 
@@ -415,23 +411,54 @@ mod tests {
         async fn create(&self, _: &clouisle_core::SandboxSpec) -> clouisle_core::Result<VmHandle> {
             Ok(VmHandle {
                 id: uuid::Uuid::now_v7().to_string(),
-                backend: "test".into(), pid: None, api_socket: None, vsock_socket: None,
+                backend: "test".into(),
+                pid: None,
+                api_socket: None,
+                vsock_socket: None,
             })
         }
-        async fn start(&self, _: &VmHandle) -> clouisle_core::Result<()> { Ok(()) }
-        async fn pause(&self, _: &VmHandle) -> clouisle_core::Result<()> { Ok(()) }
-        async fn resume(&self, _: &VmHandle) -> clouisle_core::Result<()> { Ok(()) }
-        async fn snapshot(&self, _: &VmHandle, _k: SnapshotKind, _o: &SnapshotPaths) -> clouisle_core::Result<()> { Ok(()) }
-        async fn restore(&self, _: &clouisle_core::SandboxSpec, _: &SnapshotPaths) -> clouisle_core::Result<VmHandle> {
+        async fn start(&self, _: &VmHandle) -> clouisle_core::Result<()> {
+            Ok(())
+        }
+        async fn pause(&self, _: &VmHandle) -> clouisle_core::Result<()> {
+            Ok(())
+        }
+        async fn resume(&self, _: &VmHandle) -> clouisle_core::Result<()> {
+            Ok(())
+        }
+        async fn snapshot(
+            &self,
+            _: &VmHandle,
+            _k: SnapshotKind,
+            _o: &SnapshotPaths,
+        ) -> clouisle_core::Result<()> {
+            Ok(())
+        }
+        async fn restore(
+            &self,
+            _: &clouisle_core::SandboxSpec,
+            _: &SnapshotPaths,
+        ) -> clouisle_core::Result<VmHandle> {
             Ok(VmHandle {
                 id: uuid::Uuid::now_v7().to_string(),
-                backend: "test".into(), pid: None, api_socket: None, vsock_socket: None,
+                backend: "test".into(),
+                pid: None,
+                api_socket: None,
+                vsock_socket: None,
             })
         }
-        async fn stop(&self, _: &VmHandle, _m: StopMode) -> clouisle_core::Result<()> { Ok(()) }
-        async fn stats(&self, _: &VmHandle) -> clouisle_core::Result<VmStats> { Ok(VmStats::default()) }
+        async fn stop(&self, _: &VmHandle, _m: StopMode) -> clouisle_core::Result<()> {
+            Ok(())
+        }
+        async fn stats(&self, _: &VmHandle) -> clouisle_core::Result<VmStats> {
+            Ok(VmStats::default())
+        }
         fn capabilities(&self) -> VmmCapabilities {
-            VmmCapabilities { snapshot: true, vsock: true, balloon: false }
+            VmmCapabilities {
+                snapshot: true,
+                vsock: true,
+                balloon: false,
+            }
         }
     }
 
@@ -491,13 +518,11 @@ mod tests {
     async fn different_pool_key_does_not_match() {
         let pool = warm_pool().await;
         // 不同镜像 → 不同 cache_key → 不同 pool_key。
-        assert_eq!(
-            pool.acquire(&spec("busybox:latest", None)).await,
-            None
-        );
+        assert_eq!(pool.acquire(&spec("busybox:latest", None)).await, None);
         // 相同镜像不同 digest → 不同 pool_key。
         assert_eq!(
-            pool.acquire(&spec("alpine:latest", Some("sha256:abc"))).await,
+            pool.acquire(&spec("alpine:latest", Some("sha256:abc")))
+                .await,
             None
         );
     }

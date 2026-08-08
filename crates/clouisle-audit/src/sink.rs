@@ -1,14 +1,10 @@
 //! 审计日志 SQLite sink: 哈希链 + Ed25519 签名（SR-05 / ADR-003）。
 
-use std::path::Path;
-
-use chrono::{DateTime, Utc};
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use rand::rngs::OsRng;
-use serde::Serialize;
 use sha2::{Digest, Sha256};
 
-use crate::chain::{AuditEvent, ChainEntry, HashChain};
+use crate::chain::{AuditEvent, ChainEntry};
 
 /// 审计错误。
 #[derive(Debug, thiserror::Error)]
@@ -63,7 +59,6 @@ impl Ed25519Signer {
 pub struct AuditSink {
     events: Vec<ChainEntry>,
     signer: Option<Ed25519Signer>,
-    db_path: Option<std::path::PathBuf>,
 }
 
 impl AuditSink {
@@ -72,7 +67,6 @@ impl AuditSink {
         Self {
             events: Vec::new(),
             signer: None,
-            db_path: None,
         }
     }
 
@@ -81,7 +75,6 @@ impl AuditSink {
         Self {
             events: Vec::new(),
             signer: Some(signer),
-            db_path: None,
         }
     }
 
@@ -231,11 +224,8 @@ mod tests {
         // 用公钥验签
         let vk = sink.signer.as_ref().unwrap().verifying_key();
         let signature = Signature::from_slice(&sig).unwrap();
-        vk.verify_strict(
-            sink.events.last().unwrap().hash.as_bytes(),
-            &signature,
-        )
-        .unwrap();
+        vk.verify_strict(sink.events.last().unwrap().hash.as_bytes(), &signature)
+            .unwrap();
     }
 
     #[test]

@@ -1,21 +1,26 @@
 //! 命令执行 handler（FR-02）：同步 + 流式 + 历史查询。
 
+use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use axum::Json;
 use serde::{Deserialize, Serialize};
 
 use clouisle_core::{ClouisleError, ExecutionRecord, ExecutionSpec, truncate_output};
 
-use crate::agent::AgentConnector;
 use crate::error::ApiError;
 use crate::state::AppState;
 
 /// 由 VmmMeta 构造 VmHandle。
-pub(crate) fn meta_to_handle(meta: &clouisle_core::VmmMeta, sandbox_id: &str) -> clouisle_vmm::VmHandle {
+pub(crate) fn meta_to_handle(
+    meta: &clouisle_core::VmmMeta,
+    sandbox_id: &str,
+) -> clouisle_vmm::VmHandle {
     clouisle_vmm::VmHandle {
-        id: meta.vmm_id.clone().unwrap_or_else(|| sandbox_id.to_string()),
+        id: meta
+            .vmm_id
+            .clone()
+            .unwrap_or_else(|| sandbox_id.to_string()),
         backend: meta.backend.clone(),
         pid: meta.pid,
         api_socket: meta.api_socket.clone(),
@@ -66,10 +71,13 @@ pub struct ExecResponse {
 }
 
 /// 检查沙盒可执行，返回 vmm handle。
-async fn ensure_executable(state: &AppState, sandbox_id: &str) -> Result<clouisle_core::Sandbox, ApiError> {
-        let sb = state.store.get_sandbox(sandbox_id).await?;
-        if !sb.is_executable() {
-            return Err(ApiError(ClouisleError::invalid_state(format!(
+async fn ensure_executable(
+    state: &AppState,
+    sandbox_id: &str,
+) -> Result<clouisle_core::Sandbox, ApiError> {
+    let sb = state.store.get_sandbox(sandbox_id).await?;
+    if !sb.is_executable() {
+        return Err(ApiError(ClouisleError::invalid_state(format!(
             "sandbox {sandbox_id} is not running (status={})",
             sb.status
         ))));
@@ -163,7 +171,10 @@ pub async fn exec_stream(
     Ok(axum::response::Sse::new(stream))
 }
 
-fn tokio_stream_fallback(result: clouisle_core::execution::ExecutionResult) -> impl futures::Stream<Item = std::result::Result<axum::response::sse::Event, std::convert::Infallible>> {
+fn tokio_stream_fallback(
+    result: clouisle_core::execution::ExecutionResult,
+) -> impl futures::Stream<Item = std::result::Result<axum::response::sse::Event, std::convert::Infallible>>
+{
     use futures::stream;
     let mut events = Vec::new();
     if !result.stdout.is_empty() {

@@ -56,7 +56,11 @@ impl Store for InMemoryStore {
         Ok(())
     }
 
-    async fn update_sandbox_vmm_meta(&self, id: &str, vmm_meta: &clouisle_core::VmmMeta) -> StoreResult<()> {
+    async fn update_sandbox_vmm_meta(
+        &self,
+        id: &str,
+        vmm_meta: &clouisle_core::VmmMeta,
+    ) -> StoreResult<()> {
         let mut map = self.sandboxes.write().await;
         let sb = map
             .get_mut(id)
@@ -182,7 +186,10 @@ mod tests {
             }
             s.create_sandbox(&sb).await.unwrap();
         }
-        let running = s.list_sandboxes(Some(SandboxStatus::Running)).await.unwrap();
+        let running = s
+            .list_sandboxes(Some(SandboxStatus::Running))
+            .await
+            .unwrap();
         assert_eq!(running.len(), 3);
     }
 

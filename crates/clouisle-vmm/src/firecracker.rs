@@ -12,10 +12,7 @@ use tokio::sync::Mutex;
 
 use clouisle_core::{ClouisleError, ErrorKind, Result, SandboxSpec};
 
-use crate::error::VmmError;
-use crate::{
-    SnapshotKind, SnapshotPaths, StopMode, VmHandle, VmStats, Vmm, VmmCapabilities,
-};
+use crate::{SnapshotKind, SnapshotPaths, StopMode, VmHandle, VmStats, Vmm, VmmCapabilities};
 
 /// FirecrackerVmm 配置。
 #[derive(Debug, Clone)]
@@ -74,7 +71,10 @@ impl FirecrackerVmm {
         if !self.config.firecracker_bin.exists() {
             return Err(ClouisleError::new(
                 ErrorKind::Vmm,
-                format!("firecracker not found at {}", self.config.firecracker_bin.display()),
+                format!(
+                    "firecracker not found at {}",
+                    self.config.firecracker_bin.display()
+                ),
             ));
         }
         if self.config.use_jailer {
@@ -117,9 +117,9 @@ impl Vmm for FirecrackerVmm {
         // 创建新进程组，使 firecracker 及其子进程在同一组
         cmd.process_group(0);
 
-        let child = cmd.spawn().map_err(|e| {
-            ClouisleError::new(ErrorKind::Vmm, format!("spawn firecracker: {e}"))
-        })?;
+        let child = cmd
+            .spawn()
+            .map_err(|e| ClouisleError::new(ErrorKind::Vmm, format!("spawn firecracker: {e}")))?;
 
         let pid = child.id().map(|p| p as u64);
         let handle = VmHandle {
@@ -131,10 +131,13 @@ impl Vmm for FirecrackerVmm {
         };
 
         let mut vms = self.vms.lock().await;
-        vms.insert(id, FcProcess {
-            handle: handle.clone(),
-            child: Some(child),
-        });
+        vms.insert(
+            id,
+            FcProcess {
+                handle: handle.clone(),
+                child: Some(child),
+            },
+        );
 
         // 等待 API socket 就绪（指数退避）
         let spec2 = spec;
@@ -158,13 +161,20 @@ impl Vmm for FirecrackerVmm {
         Ok(())
     }
 
-    async fn snapshot(&self, h: &VmHandle, _kind: SnapshotKind, _out: &SnapshotPaths) -> Result<()> {
+    async fn snapshot(
+        &self,
+        h: &VmHandle,
+        _kind: SnapshotKind,
+        _out: &SnapshotPaths,
+    ) -> Result<()> {
         let _ = h;
         Ok(())
     }
 
     async fn restore(&self, _spec: &SandboxSpec, _from: &SnapshotPaths) -> Result<VmHandle> {
-        Err(ClouisleError::invalid_state("restore not fully implemented"))
+        Err(ClouisleError::invalid_state(
+            "restore not fully implemented",
+        ))
     }
 
     async fn stop(&self, h: &VmHandle, _mode: StopMode) -> Result<()> {

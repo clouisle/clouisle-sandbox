@@ -3,12 +3,12 @@
 //! Phase 1-2 用 SQLite（`rusqlite` bundled，WAL 模式，零外部依赖）。
 //! Phase 3 切 Postgres（`sqlx`）。
 
-pub mod store_trait;
-pub mod sqlite;
 pub mod memory;
 pub mod postgres;
+pub mod sqlite;
+pub mod store_trait;
 
-pub use store_trait::{Store, StoreError};
-pub use sqlite::SqliteStore;
 pub use memory::InMemoryStore;
 pub use postgres::PostgresStore;
+pub use sqlite::SqliteStore;
+pub use store_trait::{Store, StoreError};

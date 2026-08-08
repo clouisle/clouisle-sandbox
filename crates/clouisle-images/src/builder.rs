@@ -20,7 +20,11 @@ impl ImageManager {
     }
 
     pub async fn pull_and_build(&self, spec: &ImageSpec) -> Result<String, String> {
-        let key = spec.digest.as_deref().unwrap_or(&spec.reference).to_string();
+        let key = spec
+            .digest
+            .as_deref()
+            .unwrap_or(&spec.reference)
+            .to_string();
         let cache = self.cache.read().await;
         if let Some(path) = cache.get(&key) {
             return Ok(path.clone());
@@ -35,7 +39,11 @@ impl ImageManager {
     }
 
     pub async fn cache_hit(&self, spec: &ImageSpec) -> bool {
-        let key = spec.digest.as_deref().unwrap_or(&spec.reference).to_string();
+        let key = spec
+            .digest
+            .as_deref()
+            .unwrap_or(&spec.reference)
+            .to_string();
         self.cache.read().await.contains_key(&key)
     }
 }

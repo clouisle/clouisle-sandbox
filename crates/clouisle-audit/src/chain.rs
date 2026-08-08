@@ -28,13 +28,23 @@ pub struct ChainEntry {
     pub prev_hash: String,
 }
 
+impl Default for HashChain {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl HashChain {
     pub fn new() -> Self {
         Self { events: Vec::new() }
     }
 
     pub fn append(&mut self, event: AuditEvent) -> String {
-        let prev_hash = self.events.last().map(|e| e.hash.clone()).unwrap_or_default();
+        let prev_hash = self
+            .events
+            .last()
+            .map(|e| e.hash.clone())
+            .unwrap_or_default();
         let hash = compute_hash(&event, &prev_hash);
         self.events.push(ChainEntry {
             event,

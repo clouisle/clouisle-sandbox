@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use tokio::sync::{Mutex, Semaphore};
 
-use clouisle_core::error::{ClouisleError, ErrorKind, Result};
+use clouisle_core::error::{ClouisleError, Result};
 use clouisle_core::{Resources, SandboxSpec};
 
 /// 资源池：原子检查 + 基于 Semaphore 的 RAII 预留。
@@ -54,18 +54,18 @@ impl ResourcePool {
                     let m = self.mem_sem.clone().try_acquire_many_owned(r.memory_mb);
                     m.map(|m| (v, m))
                 });
-            if let Ok((v, m)) = acquired {
-                if let Ok(d) = self.disk_sem.clone().try_acquire_many_owned(r.disk_mb) {
-                    // 永久消耗（restore 的沙盒是已运行的，不能归还）
-                    v.forget();
-                    m.forget();
-                    d.forget();
-                    let mut t = self.tracking.lock().await;
-                    t.vcpu += r.vcpu;
-                    t.memory_mb += r.memory_mb;
-                    t.disk_mb += r.disk_mb;
-                    t.count += 1;
-                }
+            if let Ok((v, m)) = acquired
+                && let Ok(d) = self.disk_sem.clone().try_acquire_many_owned(r.disk_mb)
+            {
+                // 永久消耗（restore 的沙盒是已运行的，不能归还）
+                v.forget();
+                m.forget();
+                d.forget();
+                let mut t = self.tracking.lock().await;
+                t.vcpu += r.vcpu;
+                t.memory_mb += r.memory_mb;
+                t.disk_mb += r.disk_mb;
+                t.count += 1;
             }
         }
     }
@@ -79,13 +79,20 @@ impl ResourcePool {
         // 逐个 try_acquire；任一失败则释放已取得的 permit 并返回错误
         let sb_perm = match self.max_sandboxes.clone().try_acquire_owned() {
             Ok(p) => p,
-            Err(_) => return Err(ClouisleError::resource_exhausted("sandbox count limit reached")),
+            Err(_) => {
+                return Err(ClouisleError::resource_exhausted(
+                    "sandbox count limit reached",
+                ));
+            }
         };
         let vcpu_perm = match self.vcpu_sem.clone().try_acquire_many_owned(r.vcpu as u32) {
             Ok(p) => p,
             Err(_) => {
                 drop(sb_perm);
-                return Err(ClouisleError::resource_exhausted(format!("insufficient vcpu: need {}", r.vcpu)));
+                return Err(ClouisleError::resource_exhausted(format!(
+                    "insufficient vcpu: need {}",
+                    r.vcpu
+                )));
             }
         };
         let mem_perm = match self.mem_sem.clone().try_acquire_many_owned(r.memory_mb) {
@@ -166,7 +173,12 @@ impl ResourcePool {
         // 增加 semaphore 可用量（修复 permit 计数）
         // 注意：Semaphore 不提供 add_permits 接口；此方法为占位。
         // 实际方案：Reservation 持有 permit 直到沙盒真正删除时 drop。
-        tracing::debug!(vcpu = r.vcpu, mem = r.memory_mb, disk = r.disk_mb, "releasing resources (notification only)");
+        tracing::debug!(
+            vcpu = r.vcpu,
+            mem = r.memory_mb,
+            disk = r.disk_mb,
+            "releasing resources (notification only)"
+        );
     }
 }
 
@@ -177,6 +189,7 @@ pub struct Reservation {
     _vcpu: tokio::sync::OwnedSemaphorePermit,
     _mem: tokio::sync::OwnedSemaphorePermit,
     _disk: tokio::sync::OwnedSemaphorePermit,
+    #[allow(dead_code)]
     tracking: Arc<Mutex<Allocated>>,
     resources: Resources,
 }

@@ -1,16 +1,15 @@
 //! 沙盒生命周期 handler（FR-01）。
 
+use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use axum::Json;
 use serde::{Deserialize, Serialize};
 
 use clouisle_core::{ClouisleError, Sandbox, SandboxEvent, SandboxSpec, SandboxStatus};
-use tracing::{info, warn};
 use tracing;
 
-use crate::error::{validation_errors, ApiError};
+use crate::error::ApiError;
 use crate::state::AppState;
 
 /// `POST /api/v1/sandboxes` 请求体。
@@ -87,7 +86,11 @@ pub async fn create_sandbox(
         extra: Default::default(),
     };
     sandbox.vmm_meta = vmm_meta.clone();
-    state.store.update_sandbox_vmm_meta(&id, &vmm_meta).await.ok();
+    state
+        .store
+        .update_sandbox_vmm_meta(&id, &vmm_meta)
+        .await
+        .ok();
 
     if let Err(e) = state.vmm.start(&handle).await {
         state
@@ -103,14 +106,19 @@ pub async fn create_sandbox(
     {
         let veth_host_ip = format!("192.168.{}.1/30", (id.as_bytes()[0] as u16) % 255);
         let allow = req.spec.network.allow_egress.clone();
-        if let Err(e) = state.firewall.setup_sandbox_network(&id, &veth_host_ip, &allow).await {
+        if let Err(e) = state
+            .firewall
+            .setup_sandbox_network(&id, &veth_host_ip, &allow)
+            .await
+        {
             warn!(sandbox_id = %id, error = %e, "firewall setup failed (non-fatal)");
         }
     }
 
     // 6. 等 agent hello（Start → Running）
     let start_timeout = tokio::time::Duration::from_secs(req.spec.start_timeout_secs);
-    let hello = tokio::time::timeout(start_timeout, state.agent.connect_and_hello(&handle, &id)).await;
+    let hello =
+        tokio::time::timeout(start_timeout, state.agent.connect_and_hello(&handle, &id)).await;
 
     match hello {
         Ok(Ok(_conn)) => {

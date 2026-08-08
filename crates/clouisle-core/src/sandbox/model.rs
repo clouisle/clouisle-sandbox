@@ -3,9 +3,9 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::sandbox::state::{SandboxEvent, SandboxStatus};
-use crate::sandbox::SandboxSpec;
 use crate::Result;
+use crate::sandbox::SandboxSpec;
+use crate::sandbox::state::{SandboxEvent, SandboxStatus};
 
 /// VMM 运行时元数据（回填自 vmm.create）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -51,7 +51,9 @@ impl Sandbox {
     /// 构造一个处于 `Pending` 的新沙盒。
     pub fn new(id: String, spec: SandboxSpec) -> Self {
         let now = Utc::now();
-        let expires_at = spec.ttl_secs.map(|ttl| now + chrono::Duration::seconds(ttl as i64));
+        let expires_at = spec
+            .ttl_secs
+            .map(|ttl| now + chrono::Duration::seconds(ttl as i64));
         Self {
             id,
             spec,

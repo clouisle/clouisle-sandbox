@@ -40,7 +40,9 @@ impl AppState {
                 .ok()
                 .and_then(|s| {
                     s.lines().find(|l| l.starts_with("MemTotal")).and_then(|l| {
-                        l.split_whitespace().nth(1).and_then(|v| v.parse::<u64>().ok())
+                        l.split_whitespace()
+                            .nth(1)
+                            .and_then(|v| v.parse::<u64>().ok())
                     })
                 })
                 .unwrap_or(8 * 1024 * 1024);

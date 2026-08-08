@@ -4,12 +4,12 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use axum::{
+    Router,
     body::{Body, to_bytes},
     http::{Request, StatusCode},
-    Router,
 };
 
-use clouisle_api::{agent, auth, build_router, AppState};
+use clouisle_api::{AppState, agent, auth, build_router};
 use clouisle_core::Result;
 use clouisle_scheduler::ResourcePool;
 use clouisle_store::InMemoryStore;
@@ -26,29 +26,47 @@ impl Vmm for TestVmm {
     async fn create(&self, _: &clouisle_core::SandboxSpec) -> Result<VmHandle> {
         Ok(VmHandle {
             id: uuid::Uuid::now_v7().to_string(),
-            backend: "test".into(), pid: None, api_socket: None, vsock_socket: None,
+            backend: "test".into(),
+            pid: None,
+            api_socket: None,
+            vsock_socket: None,
         })
     }
     async fn start(&self, _: &VmHandle) -> Result<()> {
         self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Ok(())
     }
-    async fn pause(&self, _: &VmHandle) -> Result<()> { Ok(()) }
-    async fn resume(&self, _: &VmHandle) -> Result<()> { Ok(()) }
-    async fn snapshot(&self, _: &VmHandle, _k: SnapshotKind, _o: &SnapshotPaths) -> Result<()> { Ok(()) }
+    async fn pause(&self, _: &VmHandle) -> Result<()> {
+        Ok(())
+    }
+    async fn resume(&self, _: &VmHandle) -> Result<()> {
+        Ok(())
+    }
+    async fn snapshot(&self, _: &VmHandle, _k: SnapshotKind, _o: &SnapshotPaths) -> Result<()> {
+        Ok(())
+    }
     async fn restore(&self, _: &clouisle_core::SandboxSpec, _: &SnapshotPaths) -> Result<VmHandle> {
         Ok(VmHandle {
             id: uuid::Uuid::now_v7().to_string(),
-            backend: "test".into(), pid: None, api_socket: None, vsock_socket: None,
+            backend: "test".into(),
+            pid: None,
+            api_socket: None,
+            vsock_socket: None,
         })
     }
     async fn stop(&self, _: &VmHandle, _m: StopMode) -> Result<()> {
         self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
         Ok(())
     }
-    async fn stats(&self, _: &VmHandle) -> Result<VmStats> { Ok(VmStats::default()) }
+    async fn stats(&self, _: &VmHandle) -> Result<VmStats> {
+        Ok(VmStats::default())
+    }
     fn capabilities(&self) -> VmmCapabilities {
-        VmmCapabilities { snapshot: true, vsock: true, balloon: false }
+        VmmCapabilities {
+            snapshot: true,
+            vsock: true,
+            balloon: false,
+        }
     }
 }
 
@@ -109,7 +127,9 @@ async fn upload_download_roundtrip() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri(format!("/api/v1/sandboxes/{id}/files/upload?path=/work/a.txt"))
+                .uri(format!(
+                    "/api/v1/sandboxes/{id}/files/upload?path=/work/a.txt"
+                ))
                 .header("content-type", "application/octet-stream")
                 .body(Body::from("hello file content"))
                 .unwrap(),
@@ -124,7 +144,9 @@ async fn upload_download_roundtrip() {
         .oneshot(
             Request::builder()
                 .method("GET")
-                .uri(format!("/api/v1/sandboxes/{id}/files/download?path=/work/a.txt"))
+                .uri(format!(
+                    "/api/v1/sandboxes/{id}/files/download?path=/work/a.txt"
+                ))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -145,7 +167,9 @@ async fn list_files_after_upload() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri(format!("/api/v1/sandboxes/{id}/files/upload?path=/work/a.txt"))
+                .uri(format!(
+                    "/api/v1/sandboxes/{id}/files/upload?path=/work/a.txt"
+                ))
                 .body(Body::from("x"))
                 .unwrap(),
         )
@@ -184,7 +208,9 @@ async fn download_missing_file_404() {
         .oneshot(
             Request::builder()
                 .method("GET")
-                .uri(format!("/api/v1/sandboxes/{id}/files/download?path=/work/missing.txt"))
+                .uri(format!(
+                    "/api/v1/sandboxes/{id}/files/download?path=/work/missing.txt"
+                ))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -202,7 +228,9 @@ async fn path_traversal_rejected() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri(format!("/api/v1/sandboxes/{id}/files/upload?path=/work/../../etc/passwd"))
+                .uri(format!(
+                    "/api/v1/sandboxes/{id}/files/upload?path=/work/../../etc/passwd"
+                ))
                 .body(Body::from("evil"))
                 .unwrap(),
         )

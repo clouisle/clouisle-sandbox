@@ -1,7 +1,7 @@
 //! Axum 路由构建。
 
-use axum::routing::{delete, get, post};
 use axum::Router;
+use axum::routing::{delete, get, post};
 
 use crate::handlers;
 use crate::middleware;

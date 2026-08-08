@@ -8,7 +8,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let base = cli.api_url();
 
     match cli {
-        clouislectl::Cli::Create { image, vcpu, memory_mb, .. } => {
+        clouislectl::Cli::Create {
+            image,
+            vcpu,
+            memory_mb,
+            ..
+        } => {
             let body = serde_json::json!({
                 "image": { "reference": image },
                 "resources": { "vcpu": vcpu, "memory_mb": memory_mb, "disk_mb": 512 }

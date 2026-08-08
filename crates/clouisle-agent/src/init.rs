@@ -24,13 +24,16 @@ pub fn parse_cmdline(cmdline: &str) -> std::collections::HashMap<String, String>
 pub fn init_boot(cmdline: &str) -> Result<(), String> {
     let params = parse_cmdline(cmdline);
 
-    if let Some(fail) = params.get("fail_at") {
-        if fail == "overlay" {
-            return Err("clouisle-init: overlay mount failed (injected)".into());
-        }
+    if let Some(fail) = params.get("fail_at")
+        && fail == "overlay"
+    {
+        return Err("clouisle-init: overlay mount failed (injected)".into());
     }
 
-    let log_level = params.get("log_level").cloned().unwrap_or_else(|| "info".into());
+    let log_level = params
+        .get("log_level")
+        .cloned()
+        .unwrap_or_else(|| "info".into());
     let _ = log_level;
     Ok(())
 }

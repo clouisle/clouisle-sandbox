@@ -154,9 +154,7 @@ mod tests {
         use SandboxEvent::*;
         use SandboxStatus::*;
 
-        let all_statuses = [
-            Pending, Starting, Running, Stopping, Stopped, Error,
-        ];
+        let all_statuses = [Pending, Starting, Running, Stopping, Stopped, Error];
         let all_events = [Start, AgentHello, Stop, VmmExited, Failed, Restart];
 
         // 期望合法表（人工核对）
@@ -185,7 +183,11 @@ mod tests {
                 let result = from.transition(ev);
                 match legal.iter().find(|(f, e, _)| *f == from && *e == ev) {
                     Some((_, _, to)) => {
-                        assert_eq!(result.unwrap(), *to, "{from:?} --{ev:?}--> should be {to:?}");
+                        assert_eq!(
+                            result.unwrap(),
+                            *to,
+                            "{from:?} --{ev:?}--> should be {to:?}"
+                        );
                     }
                     None => {
                         assert!(

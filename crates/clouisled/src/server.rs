@@ -18,7 +18,7 @@ pub mod proto {
 
 use proto::node_service_server::{NodeService, NodeServiceServer};
 use proto::{
-    CreateSandboxRequest, DeleteResult, ExecRequest, ExecStream, ExecOutput, ExecExit,
+    CreateSandboxRequest, DeleteResult, ExecExit, ExecOutput, ExecRequest, ExecStream,
     HeartbeatCommand, HeartbeatReport, NodeId, NodeInfo, SandboxHandle, SandboxId,
 };
 
@@ -83,9 +83,12 @@ impl NodeService for NodeServiceImpl {
         let mut reports = Vec::new();
 
         // 读取所有上报（简化：等第一个）
-        while let Some(report) = stream.message().await.map_err(|e| Status::internal(e.to_string()))? {
+        if let Some(report) = stream
+            .message()
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?
+        {
             reports.push(report);
-            break; // 简化：只处理第一条，生产用双向流持续
         }
 
         if let Some(r) = reports.first() {
@@ -94,10 +97,10 @@ impl NodeService for NodeServiceImpl {
 
         // 返回空命令集（无排空指令）
         let (tx, rx) = tokio::sync::mpsc::channel(8);
-        let _ = tx.try_send(Ok(HeartbeatCommand {
-            cmd: None,
-        }));
-        Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(rx)))
+        let _ = tx.try_send(Ok(HeartbeatCommand { cmd: None }));
+        Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
+            rx,
+        )))
     }
 
     /// 创建沙盒。
@@ -109,7 +112,9 @@ impl NodeService for NodeServiceImpl {
         let spec: SandboxSpec = serde_json::from_str(&req.spec_json)
             .map_err(|e| Status::invalid_argument(format!("bad spec_json: {e}")))?;
 
-        let sandbox = self.agent.create_sandbox(spec, self.store.as_ref())
+        let sandbox = self
+            .agent
+            .create_sandbox(spec, self.store.as_ref())
             .await
             .map_err(to_status)?;
 
@@ -128,9 +133,19 @@ impl NodeService for NodeServiceImpl {
         request: Request<SandboxId>,
     ) -> Result<Response<DeleteResult>, Status> {
         let req = request.into_inner();
-        match self.agent.delete_sandbox(&req.sandbox_id, self.store.as_ref()).await {
-            Ok(_) => Ok(Response::new(DeleteResult { ok: true, error: String::new() })),
-            Err(e) => Ok(Response::new(DeleteResult { ok: false, error: e.message })),
+        match self
+            .agent
+            .delete_sandbox(&req.sandbox_id, self.store.as_ref())
+            .await
+        {
+            Ok(_) => Ok(Response::new(DeleteResult {
+                ok: true,
+                error: String::new(),
+            })),
+            Err(e) => Ok(Response::new(DeleteResult {
+                ok: false,
+                error: e.message,
+            })),
         }
     }
 
@@ -144,8 +159,15 @@ impl NodeService for NodeServiceImpl {
         let mut stream = request.into_inner();
         let mut exec_req: Option<ExecRequest> = None;
 
-        while let Some(msg) = stream.message().await.map_err(|e| Status::internal(e.to_string()))? {
-            if let Some(ExecStream { msg: Some(proto::exec_stream::Msg::ExecReq(req)) }) = Some(msg) {
+        while let Some(msg) = stream
+            .message()
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?
+        {
+            if let Some(ExecStream {
+                msg: Some(proto::exec_stream::Msg::ExecReq(req)),
+            }) = Some(msg)
+            {
                 exec_req = Some(req);
                 break;
             }
@@ -157,18 +179,28 @@ impl NodeService for NodeServiceImpl {
         };
 
         // 通过 agent 执行
-        let result = match self.agent.exec_command(
-            &req.sandbox_id,
-            req.argv,
-            req.env,
-            if req.cwd.is_empty() { None } else { Some(req.cwd) },
-            req.timeout_ms,
-        ).await {
+        let result = match self
+            .agent
+            .exec_command(
+                &req.sandbox_id,
+                req.argv,
+                req.env,
+                if req.cwd.is_empty() {
+                    None
+                } else {
+                    Some(req.cwd)
+                },
+                req.timeout_ms,
+            )
+            .await
+        {
             Ok(r) => r,
             Err(e) => {
                 let (tx, rx) = tokio::sync::mpsc::channel(8);
                 let _ = tx.try_send(Err(to_status(e)));
-                return Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(rx)));
+                return Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
+                    rx,
+                )));
             }
         };
 
@@ -196,6 +228,8 @@ impl NodeService for NodeServiceImpl {
             })),
         }));
 
-        Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(rx)))
+        Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
+            rx,
+        )))
     }
 }

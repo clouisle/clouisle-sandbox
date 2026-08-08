@@ -1,10 +1,10 @@
 //! 文件传输 handler（FR-07）。
 
+use axum::Json;
 use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use axum::Json;
 use serde::{Deserialize, Serialize};
 
 use clouisle_core::ClouisleError;
@@ -38,7 +38,7 @@ async fn get_conn(
         )));
     }
     let handle = meta_to_handle(&sb.vmm_meta, sandbox_id);
-    state.agent.connect_and_hello(&handle, &sandbox_id).await
+    state.agent.connect_and_hello(&handle, sandbox_id).await
 }
 
 fn validate_path(path: &str) -> Result<(), ClouisleError> {
@@ -61,7 +61,9 @@ pub async fn upload_file(
             "upload exceeds {MAX_UPLOAD_BYTES} bytes"
         ))));
     }
-    let conn = get_conn(&state, &sandbox_id).await.map_err(crate::error::ApiError)?;
+    let conn = get_conn(&state, &sandbox_id)
+        .await
+        .map_err(crate::error::ApiError)?;
     conn.write_file(&q.path, body, 0o644)
         .await
         .map_err(crate::error::ApiError)?;
@@ -75,12 +77,20 @@ pub async fn download_file(
     Query(q): Query<FsQuery>,
 ) -> Result<impl IntoResponse, crate::error::ApiError> {
     validate_path(&q.path).map_err(crate::error::ApiError)?;
-    let conn = get_conn(&state, &sandbox_id).await.map_err(crate::error::ApiError)?;
-    let data = conn.read_file(&q.path).await.map_err(crate::error::ApiError)?;
+    let conn = get_conn(&state, &sandbox_id)
+        .await
+        .map_err(crate::error::ApiError)?;
+    let data = conn
+        .read_file(&q.path)
+        .await
+        .map_err(crate::error::ApiError)?;
     let filename = q.path.rsplit('/').next().unwrap_or("file");
     Ok((
         [
-            (axum::http::header::CONTENT_TYPE, "application/octet-stream".to_string()),
+            (
+                axum::http::header::CONTENT_TYPE,
+                "application/octet-stream".to_string(),
+            ),
             (
                 axum::http::header::CONTENT_DISPOSITION,
                 format!("attachment; filename=\"{filename}\""),
@@ -97,7 +107,12 @@ pub async fn list_files(
     Query(q): Query<FsQuery>,
 ) -> Result<Json<LsResponse>, crate::error::ApiError> {
     validate_path(&q.path).map_err(crate::error::ApiError)?;
-    let conn = get_conn(&state, &sandbox_id).await.map_err(crate::error::ApiError)?;
-    let entries = conn.list_dir(&q.path).await.map_err(crate::error::ApiError)?;
+    let conn = get_conn(&state, &sandbox_id)
+        .await
+        .map_err(crate::error::ApiError)?;
+    let entries = conn
+        .list_dir(&q.path)
+        .await
+        .map_err(crate::error::ApiError)?;
     Ok(Json(LsResponse { items: entries }))
 }

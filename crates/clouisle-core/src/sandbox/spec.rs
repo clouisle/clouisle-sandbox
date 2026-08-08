@@ -59,7 +59,7 @@ impl Default for SandboxSpec {
 }
 
 impl SandboxSpec {
-/// 校验规格。返回字段级错误列表（API-003 / API-004）。
+    /// 校验规格。返回字段级错误列表（API-003 / API-004）。
     pub fn validate(&self) -> Result<(), Vec<ValidationError>> {
         let mut errors = Vec::new();
 

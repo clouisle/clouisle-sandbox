@@ -10,10 +10,7 @@ use axum::response::Response;
 use crate::metrics;
 
 /// 请求 ID 中间件：X-Request-Id 透传或生成 UUID v7。
-pub async fn request_id(
-    req: Request,
-    next: Next,
-) -> Response {
+pub async fn request_id(req: Request, next: Next) -> Response {
     let req_id = req
         .headers()
         .get("x-request-id")
@@ -30,11 +27,12 @@ pub async fn request_id(
     let mut resp = next.run(req).await;
 
     let status = resp.status();
-    let header = HeaderValue::from_str(&req_id).unwrap_or_else(|_| HeaderValue::from_static("unknown"));
+    let header =
+        HeaderValue::from_str(&req_id).unwrap_or_else(|_| HeaderValue::from_static("unknown"));
     resp.headers_mut().insert("x-request-id", header);
 
     let duration_ms = start.elapsed().as_millis() as f64;
-    metrics::record_api_request(&method.to_string(), &path, status.as_u16(), duration_ms);
+    metrics::record_api_request(method.as_ref(), &path, status.as_u16(), duration_ms);
     tracing::debug!(request_id = %req_id, method = %method, path = %path, status = status.as_u16(), duration_ms, "request completed");
 
     resp

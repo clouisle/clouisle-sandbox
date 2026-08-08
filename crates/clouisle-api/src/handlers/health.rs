@@ -1,9 +1,9 @@
 //! 健康检查与 metrics 端点。
 
+use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use axum::Json;
 use serde::Serialize;
 
 use crate::state::AppState;
@@ -21,7 +21,11 @@ pub async fn health(State(state): State<AppState>) -> impl IntoResponse {
         Ok(_) => "ok",
         Err(_) => "error",
     };
-    let status = if store_status == "ok" { "ok" } else { "degraded" };
+    let status = if store_status == "ok" {
+        "ok"
+    } else {
+        "degraded"
+    };
     let code = if store_status == "ok" {
         StatusCode::OK
     } else {
@@ -64,7 +68,10 @@ pub async fn readiness(State(state): State<AppState>) -> impl IntoResponse {
 pub async fn metrics() -> impl IntoResponse {
     let body = crate::metrics::render();
     (
-        [(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4")],
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4",
+        )],
         body,
     )
 }

@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use tokio::sync::RwLock;
 
-use clouisle_core::{Sandbox, SandboxStatus};
+use clouisle_core::SandboxStatus;
 use clouisle_store::Store;
 use clouisle_vmm::Vmm;
 
@@ -28,6 +28,8 @@ pub struct DriftReport {
 /// Reconciler。
 pub struct Reconciler {
     node_id: String,
+    /// 模拟的本机实际运行 ID 集合（真实实现从 /proc 扫描 firecracker 进程）
+    #[allow(dead_code)]
     vmm: Arc<dyn Vmm>,
     /// 模拟的本机实际运行 ID 集合（真实实现从 /proc 扫描 firecracker 进程）
     live_sandboxes: Arc<RwLock<std::collections::HashSet<String>>>,
@@ -93,8 +95,7 @@ impl Reconciler {
         }
 
         // 孤儿：本机有、DB 无 → 视为孤儿（真实实现按 firecracker 命名规则匹配）
-        let db_ids: std::collections::HashSet<String> =
-            all.iter().map(|s| s.id.clone()).collect();
+        let db_ids: std::collections::HashSet<String> = all.iter().map(|s| s.id.clone()).collect();
         for id in &live {
             if !db_ids.contains(id) {
                 // 杀掉该 VMM
@@ -117,11 +118,11 @@ impl Reconciler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
     use clouisle_store::InMemoryStore;
     use clouisle_vmm::{
         SnapshotKind, SnapshotPaths, StopMode, VmHandle, VmStats, Vmm, VmmCapabilities,
     };
-    use async_trait::async_trait;
 
     #[derive(Clone)]
     struct TestVmm;
@@ -131,23 +132,54 @@ mod tests {
         async fn create(&self, _: &clouisle_core::SandboxSpec) -> clouisle_core::Result<VmHandle> {
             Ok(VmHandle {
                 id: uuid::Uuid::now_v7().to_string(),
-                backend: "test".into(), pid: None, api_socket: None, vsock_socket: None,
+                backend: "test".into(),
+                pid: None,
+                api_socket: None,
+                vsock_socket: None,
             })
         }
-        async fn start(&self, _: &VmHandle) -> clouisle_core::Result<()> { Ok(()) }
-        async fn pause(&self, _: &VmHandle) -> clouisle_core::Result<()> { Ok(()) }
-        async fn resume(&self, _: &VmHandle) -> clouisle_core::Result<()> { Ok(()) }
-        async fn snapshot(&self, _: &VmHandle, _k: SnapshotKind, _o: &SnapshotPaths) -> clouisle_core::Result<()> { Ok(()) }
-        async fn restore(&self, _: &clouisle_core::SandboxSpec, _: &SnapshotPaths) -> clouisle_core::Result<VmHandle> {
+        async fn start(&self, _: &VmHandle) -> clouisle_core::Result<()> {
+            Ok(())
+        }
+        async fn pause(&self, _: &VmHandle) -> clouisle_core::Result<()> {
+            Ok(())
+        }
+        async fn resume(&self, _: &VmHandle) -> clouisle_core::Result<()> {
+            Ok(())
+        }
+        async fn snapshot(
+            &self,
+            _: &VmHandle,
+            _k: SnapshotKind,
+            _o: &SnapshotPaths,
+        ) -> clouisle_core::Result<()> {
+            Ok(())
+        }
+        async fn restore(
+            &self,
+            _: &clouisle_core::SandboxSpec,
+            _: &SnapshotPaths,
+        ) -> clouisle_core::Result<VmHandle> {
             Ok(VmHandle {
                 id: uuid::Uuid::now_v7().to_string(),
-                backend: "test".into(), pid: None, api_socket: None, vsock_socket: None,
+                backend: "test".into(),
+                pid: None,
+                api_socket: None,
+                vsock_socket: None,
             })
         }
-        async fn stop(&self, _: &VmHandle, _m: StopMode) -> clouisle_core::Result<()> { Ok(()) }
-        async fn stats(&self, _: &VmHandle) -> clouisle_core::Result<VmStats> { Ok(VmStats::default()) }
+        async fn stop(&self, _: &VmHandle, _m: StopMode) -> clouisle_core::Result<()> {
+            Ok(())
+        }
+        async fn stats(&self, _: &VmHandle) -> clouisle_core::Result<VmStats> {
+            Ok(VmStats::default())
+        }
         fn capabilities(&self) -> VmmCapabilities {
-            VmmCapabilities { snapshot: true, vsock: true, balloon: false }
+            VmmCapabilities {
+                snapshot: true,
+                vsock: true,
+                balloon: false,
+            }
         }
     }
     use clouisle_core::{Sandbox, SandboxSpec};

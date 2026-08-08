@@ -2,7 +2,7 @@
 
 use async_trait::async_trait;
 
-use clouisle_core::{ClouisleError, ErrorKind, ExecutionRecord, Sandbox, SandboxSpec, SandboxStatus};
+use clouisle_core::{ClouisleError, ErrorKind, ExecutionRecord, Sandbox, SandboxStatus};
 
 pub type StoreResult<T> = std::result::Result<T, StoreError>;
 
@@ -37,7 +37,11 @@ pub trait Store: Send + Sync {
     async fn get_sandbox(&self, id: &str) -> StoreResult<Sandbox>;
     async fn update_sandbox_status(&self, id: &str, status: &SandboxStatus) -> StoreResult<()>;
     /// 更新沙盒的 VMM 元数据（创建后回填）。
-    async fn update_sandbox_vmm_meta(&self, id: &str, vmm_meta: &clouisle_core::VmmMeta) -> StoreResult<()>;
+    async fn update_sandbox_vmm_meta(
+        &self,
+        id: &str,
+        vmm_meta: &clouisle_core::VmmMeta,
+    ) -> StoreResult<()>;
     async fn list_sandboxes(&self, status: Option<SandboxStatus>) -> StoreResult<Vec<Sandbox>>;
     async fn delete_sandbox(&self, id: &str) -> StoreResult<()>;
 

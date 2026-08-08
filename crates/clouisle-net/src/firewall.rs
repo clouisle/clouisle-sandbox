@@ -77,11 +77,14 @@ impl FirewallManager {
         });
 
         // 记录状态
-        self.nets.write().await.insert(sandbox_id.to_string(), SandboxNet {
-            veth_host,
-            veth_ns,
-            host_ip: veth_host_ip.to_string(),
-        });
+        self.nets.write().await.insert(
+            sandbox_id.to_string(),
+            SandboxNet {
+                veth_host,
+                veth_ns,
+                host_ip: veth_host_ip.to_string(),
+            },
+        );
 
         Ok(())
     }
@@ -102,7 +105,12 @@ impl FirewallManager {
     }
 
     /// 放行一个 IP（由 DNS 解析回调触发）。
-    pub async fn allow_ip(&self, sandbox_id: &str, ip: &str, ttl_secs: u64) -> Result<(), ClouisleError> {
+    pub async fn allow_ip(
+        &self,
+        sandbox_id: &str,
+        ip: &str,
+        ttl_secs: u64,
+    ) -> Result<(), ClouisleError> {
         nftables::allow_ip(sandbox_id, ip, ttl_secs)
     }
 

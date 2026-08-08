@@ -47,7 +47,11 @@ pub enum Frame {
         content: Bytes,
     },
     /// 文件传输：读文件。
-    ReadFile { path: String, offset: u64, length: u64 },
+    ReadFile {
+        path: String,
+        offset: u64,
+        length: u64,
+    },
     /// 文件传输：读文件响应。
     ReadFileResult { path: String, content: Bytes },
     /// 文件传输：列目录。
@@ -105,9 +109,7 @@ pub fn encode_frame(frame: &Frame) -> Result<Vec<u8>, CodecError> {
 /// 从缓冲区解码出第一个完整帧，返回 `(frame, consumed)`。
 ///
 /// 若字节不足一帧的头部或载荷，返回 `Ok(None)`（调用方继续缓冲）。
-pub fn decode_frame_once(
-    buf: &[u8],
-) -> Result<Option<(Frame, usize)>, CodecError> {
+pub fn decode_frame_once(buf: &[u8]) -> Result<Option<(Frame, usize)>, CodecError> {
     if buf.len() < FRAME_HEADER_LEN {
         return Ok(None);
     }
@@ -134,14 +136,9 @@ impl FrameDecoder {
     pub fn push(&mut self, data: &[u8]) -> Result<Vec<Frame>, CodecError> {
         self.buf.extend_from_slice(data);
         let mut frames = Vec::new();
-        loop {
-            match decode_frame_once(&self.buf)? {
-                Some((frame, consumed)) => {
-                    frames.push(frame);
-                    self.buf.drain(..consumed);
-                }
-                None => break,
-            }
+        while let Some((frame, consumed)) = decode_frame_once(&self.buf)? {
+            frames.push(frame);
+            self.buf.drain(..consumed);
         }
         Ok(frames)
     }

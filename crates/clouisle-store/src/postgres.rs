@@ -5,9 +5,7 @@
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use clouisle_core::{
-    ExecutionRecord, ExecutionSpec, Sandbox, SandboxStatus, VmmMeta,
-};
+use clouisle_core::{ExecutionRecord, ExecutionSpec, Sandbox, SandboxStatus, VmmMeta};
 use tokio_postgres::{Client, NoTls, Row};
 
 use super::store_trait::{Store, StoreError, StoreResult};
@@ -76,9 +74,15 @@ impl PostgresStore {
 }
 
 fn row_to_sandbox(row: &Row) -> StoreResult<Sandbox> {
-    let spec_json: String = row.try_get(1).map_err(|e| StoreError::Internal(e.to_string()))?;
-    let status_str: String = row.try_get(2).map_err(|e| StoreError::Internal(e.to_string()))?;
-    let vmm_json: String = row.try_get(3).map_err(|e| StoreError::Internal(e.to_string()))?;
+    let spec_json: String = row
+        .try_get(1)
+        .map_err(|e| StoreError::Internal(e.to_string()))?;
+    let status_str: String = row
+        .try_get(2)
+        .map_err(|e| StoreError::Internal(e.to_string()))?;
+    let vmm_json: String = row
+        .try_get(3)
+        .map_err(|e| StoreError::Internal(e.to_string()))?;
 
     let spec: clouisle_core::SandboxSpec = serde_json::from_str(&spec_json)
         .map_err(|e| StoreError::Internal(format!("bad spec: {e}")))?;
@@ -94,13 +98,25 @@ fn row_to_sandbox(row: &Row) -> StoreResult<Sandbox> {
         other => return Err(StoreError::Internal(format!("bad status: {other}"))),
     };
     Ok(Sandbox {
-        id: row.try_get(0).map_err(|e| StoreError::Internal(e.to_string()))?,
+        id: row
+            .try_get(0)
+            .map_err(|e| StoreError::Internal(e.to_string()))?,
         spec,
         status,
-        created_at: DateTime::from_timestamp_millis(row.try_get::<_, i64>(4).unwrap_or(0)).unwrap_or_else(Utc::now),
-        updated_at: DateTime::from_timestamp_millis(row.try_get::<_, i64>(5).unwrap_or(0)).unwrap_or_else(Utc::now),
-        ready_at: row.try_get::<_, Option<i64>>(6).ok().flatten().and_then(DateTime::from_timestamp_millis),
-        expires_at: row.try_get::<_, Option<i64>>(7).ok().flatten().and_then(DateTime::from_timestamp_millis),
+        created_at: DateTime::from_timestamp_millis(row.try_get::<_, i64>(4).unwrap_or(0))
+            .unwrap_or_else(Utc::now),
+        updated_at: DateTime::from_timestamp_millis(row.try_get::<_, i64>(5).unwrap_or(0))
+            .unwrap_or_else(Utc::now),
+        ready_at: row
+            .try_get::<_, Option<i64>>(6)
+            .ok()
+            .flatten()
+            .and_then(DateTime::from_timestamp_millis),
+        expires_at: row
+            .try_get::<_, Option<i64>>(7)
+            .ok()
+            .flatten()
+            .and_then(DateTime::from_timestamp_millis),
         vmm_meta,
         terminal_message: row.try_get(8).ok().flatten(),
         node_id: row.try_get(9).ok().flatten(),
@@ -108,18 +124,34 @@ fn row_to_sandbox(row: &Row) -> StoreResult<Sandbox> {
 }
 
 fn exec_from_row(row: &Row) -> StoreResult<ExecutionRecord> {
-    let spec_json: String = row.try_get(2).map_err(|e| StoreError::Internal(e.to_string()))?;
-    let spec: ExecutionSpec = serde_json::from_str(&spec_json)
+    let spec_json: String = row
+        .try_get(2)
         .map_err(|e| StoreError::Internal(e.to_string()))?;
+    let spec: ExecutionSpec =
+        serde_json::from_str(&spec_json).map_err(|e| StoreError::Internal(e.to_string()))?;
     Ok(ExecutionRecord {
-        id: row.try_get(0).map_err(|e| StoreError::Internal(e.to_string()))?,
-        sandbox_id: row.try_get(1).map_err(|e| StoreError::Internal(e.to_string()))?,
+        id: row
+            .try_get(0)
+            .map_err(|e| StoreError::Internal(e.to_string()))?,
+        sandbox_id: row
+            .try_get(1)
+            .map_err(|e| StoreError::Internal(e.to_string()))?,
         spec,
-        exit_code: row.try_get(3).map_err(|e| StoreError::Internal(e.to_string()))?,
-        stdout: bytes::Bytes::from(row.try_get::<_, Vec<u8>>(4).map_err(|e| StoreError::Internal(e.to_string()))?),
-        stderr: bytes::Bytes::from(row.try_get::<_, Vec<u8>>(5).map_err(|e| StoreError::Internal(e.to_string()))?),
-        started_at: DateTime::from_timestamp_millis(row.try_get::<_, i64>(6).unwrap_or(0)).unwrap_or_else(Utc::now),
-        finished_at: DateTime::from_timestamp_millis(row.try_get::<_, i64>(7).unwrap_or(0)).unwrap_or_else(Utc::now),
+        exit_code: row
+            .try_get(3)
+            .map_err(|e| StoreError::Internal(e.to_string()))?,
+        stdout: bytes::Bytes::from(
+            row.try_get::<_, Vec<u8>>(4)
+                .map_err(|e| StoreError::Internal(e.to_string()))?,
+        ),
+        stderr: bytes::Bytes::from(
+            row.try_get::<_, Vec<u8>>(5)
+                .map_err(|e| StoreError::Internal(e.to_string()))?,
+        ),
+        started_at: DateTime::from_timestamp_millis(row.try_get::<_, i64>(6).unwrap_or(0))
+            .unwrap_or_else(Utc::now),
+        finished_at: DateTime::from_timestamp_millis(row.try_get::<_, i64>(7).unwrap_or(0))
+            .unwrap_or_else(Utc::now),
         timed_out: row.try_get::<_, bool>(8).unwrap_or(false),
         stdout_truncated: row.try_get::<_, bool>(9).unwrap_or(false),
         stderr_truncated: row.try_get::<_, bool>(10).unwrap_or(false),
@@ -165,23 +197,37 @@ impl Store for PostgresStore {
 
     async fn update_sandbox_status(&self, id: &str, status: &SandboxStatus) -> StoreResult<()> {
         let client = self.client.lock().await;
-        let n = client.execute(
-            "UPDATE sandboxes SET status=$1, updated_at=$2 WHERE id=$3",
-            &[&status.as_str().to_string(), &Utc::now().timestamp_millis(), &id],
-        ).await.map_err(|e| StoreError::Internal(e.to_string()))?;
-        if n == 0 { return Err(StoreError::NotFound(format!("sandbox {id}"))); }
+        let n = client
+            .execute(
+                "UPDATE sandboxes SET status=$1, updated_at=$2 WHERE id=$3",
+                &[
+                    &status.as_str().to_string(),
+                    &Utc::now().timestamp_millis(),
+                    &id,
+                ],
+            )
+            .await
+            .map_err(|e| StoreError::Internal(e.to_string()))?;
+        if n == 0 {
+            return Err(StoreError::NotFound(format!("sandbox {id}")));
+        }
         Ok(())
     }
 
     async fn update_sandbox_vmm_meta(&self, id: &str, vmm_meta: &VmmMeta) -> StoreResult<()> {
         let client = self.client.lock().await;
-        let vmm_json = serde_json::to_string(vmm_meta)
+        let vmm_json =
+            serde_json::to_string(vmm_meta).map_err(|e| StoreError::Internal(e.to_string()))?;
+        let n = client
+            .execute(
+                "UPDATE sandboxes SET vmm_meta_json=$1, updated_at=$2 WHERE id=$3",
+                &[&vmm_json, &Utc::now().timestamp_millis(), &id],
+            )
+            .await
             .map_err(|e| StoreError::Internal(e.to_string()))?;
-        let n = client.execute(
-            "UPDATE sandboxes SET vmm_meta_json=$1, updated_at=$2 WHERE id=$3",
-            &[&vmm_json, &Utc::now().timestamp_millis(), &id],
-        ).await.map_err(|e| StoreError::Internal(e.to_string()))?;
-        if n == 0 { return Err(StoreError::NotFound(format!("sandbox {id}"))); }
+        if n == 0 {
+            return Err(StoreError::NotFound(format!("sandbox {id}")));
+        }
         Ok(())
     }
 
@@ -189,24 +235,36 @@ impl Store for PostgresStore {
         let client = self.client.lock().await;
         let query = "SELECT id,spec_json,status,vmm_meta_json,created_at,updated_at,ready_at,expires_at,terminal_message,node_id FROM sandboxes";
         let rows = match status {
-            Some(s) => client.query(&format!("{query} WHERE status=$1"), &[&s.as_str().to_string()]).await,
+            Some(s) => {
+                client
+                    .query(
+                        &format!("{query} WHERE status=$1"),
+                        &[&s.as_str().to_string()],
+                    )
+                    .await
+            }
             None => client.query(query, &[]).await,
-        }.map_err(|e| StoreError::Internal(e.to_string()))?;
+        }
+        .map_err(|e| StoreError::Internal(e.to_string()))?;
         rows.iter().map(row_to_sandbox).collect()
     }
 
     async fn delete_sandbox(&self, id: &str) -> StoreResult<()> {
         let client = self.client.lock().await;
-        let n = client.execute("DELETE FROM sandboxes WHERE id=$1", &[&id])
-            .await.map_err(|e| StoreError::Internal(e.to_string()))?;
-        if n == 0 { return Err(StoreError::NotFound(format!("sandbox {id}"))); }
+        let n = client
+            .execute("DELETE FROM sandboxes WHERE id=$1", &[&id])
+            .await
+            .map_err(|e| StoreError::Internal(e.to_string()))?;
+        if n == 0 {
+            return Err(StoreError::NotFound(format!("sandbox {id}")));
+        }
         Ok(())
     }
 
     async fn save_execution(&self, record: &ExecutionRecord) -> StoreResult<()> {
         let client = self.client.lock().await;
-        let spec_json = serde_json::to_string(&record.spec)
-            .map_err(|e| StoreError::Internal(e.to_string()))?;
+        let spec_json =
+            serde_json::to_string(&record.spec).map_err(|e| StoreError::Internal(e.to_string()))?;
         client.execute(
             "INSERT INTO executions (id,sandbox_id,spec_json,exit_code,stdout,stderr,started_at,finished_at,timed_out,stdout_truncated,stderr_truncated,node_id)
              VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)",
@@ -249,7 +307,8 @@ mod tests {
             return;
         }
         let store = PostgresStore::connect_from_env().await.unwrap();
-        let sb = clouisle_core::Sandbox::new("pg-sbx-1".into(), clouisle_core::SandboxSpec::default());
+        let sb =
+            clouisle_core::Sandbox::new("pg-sbx-1".into(), clouisle_core::SandboxSpec::default());
         store.create_sandbox(&sb).await.unwrap();
         let got = store.get_sandbox("pg-sbx-1").await.unwrap();
         assert_eq!(got.id, "pg-sbx-1");

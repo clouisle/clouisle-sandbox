@@ -22,7 +22,9 @@ pub struct ExecutionSpec {
 impl ExecutionSpec {
     pub fn validate(&self) -> Result<(), crate::error::ClouisleError> {
         if self.argv.is_empty() {
-            return Err(crate::error::ClouisleError::validation("argv must not be empty"));
+            return Err(crate::error::ClouisleError::validation(
+                "argv must not be empty",
+            ));
         }
         if self.timeout_ms == 0 {
             return Err(crate::error::ClouisleError::validation(
