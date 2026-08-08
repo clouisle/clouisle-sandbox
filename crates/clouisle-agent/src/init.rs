@@ -86,7 +86,10 @@ pub fn configure_network() -> Result<(), String> {
         .status();
 
     // 记录接口状态（排查用）
-    if let Ok(out) = std::process::Command::new("ip").args(["addr", "show"]).output() {
+    if let Ok(out) = std::process::Command::new("ip")
+        .args(["addr", "show"])
+        .output()
+    {
         tracing::info!(addrs = %String::from_utf8_lossy(&out.stdout), "guest addr state");
     }
 

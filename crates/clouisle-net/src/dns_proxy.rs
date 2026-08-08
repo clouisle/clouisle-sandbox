@@ -11,8 +11,8 @@ use tokio::sync::RwLock;
 
 use hickory_proto::op::{Message, MessageType, OpCode, ResponseCode};
 use hickory_proto::rr::{Name, RecordType};
-use hickory_resolver::config::{ResolverConfig, ResolverOpts};
 use hickory_resolver::TokioAsyncResolver;
+use hickory_resolver::config::{ResolverConfig, ResolverOpts};
 
 /// 错误类型。
 #[derive(Debug)]
@@ -94,8 +94,8 @@ impl DnsProxy {
         query: &[u8],
     ) -> Result<(), DnsError> {
         // 解析 DNS 查询
-        let request = Message::from_vec(query)
-            .map_err(|e| DnsError::Proto(format!("parse query: {e}")))?;
+        let request =
+            Message::from_vec(query).map_err(|e| DnsError::Proto(format!("parse query: {e}")))?;
 
         if request.op_code() != OpCode::Query || request.message_type() != MessageType::Query {
             return Ok(());
@@ -113,9 +113,7 @@ impl DnsProxy {
         if !self.is_allowed(&domain).await {
             tracing::debug!(domain = %domain, from = %src, "dns blocked");
             let nx = Self::make_response(&request, ResponseCode::NXDomain);
-            let resp = nx
-                .to_vec()
-                .map_err(|e| DnsError::Proto(e.to_string()))?;
+            let resp = nx.to_vec().map_err(|e| DnsError::Proto(e.to_string()))?;
             sock.send_to(&resp, src).await.map_err(DnsError::Io)?;
             return Ok(());
         }
@@ -140,9 +138,7 @@ impl DnsProxy {
                             response.add_answer(hickory_proto::rr::Record::from_rdata(
                                 Name::from_ascii(domain).unwrap(),
                                 60,
-                                hickory_proto::rr::RData::A(
-                                    hickory_proto::rr::rdata::A(ipv4),
-                                ),
+                                hickory_proto::rr::RData::A(hickory_proto::rr::rdata::A(ipv4)),
                             ));
                         }
                     }
@@ -157,9 +153,9 @@ impl DnsProxy {
                             response.add_answer(hickory_proto::rr::Record::from_rdata(
                                 Name::from_ascii(domain).unwrap(),
                                 60,
-                                hickory_proto::rr::RData::AAAA(
-                                    hickory_proto::rr::rdata::AAAA(ipv6),
-                                ),
+                                hickory_proto::rr::RData::AAAA(hickory_proto::rr::rdata::AAAA(
+                                    ipv6,
+                                )),
                             ));
                         }
                     }

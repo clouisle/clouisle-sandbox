@@ -14,7 +14,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
-use hyper::{body::Incoming, Request};
+use hyper::{Request, body::Incoming};
 use hyper_util::client::legacy::Client;
 use hyperlocal::{UnixClientExt, UnixConnector, Uri as UnixUri};
 use serde::Serialize;
@@ -175,11 +175,9 @@ impl FirecrackerVmm {
     /// 内核命令行参数，从 spec 的 env 中提取 `boot_args` 或使用默认值。
     /// 默认值包含 rootfs 挂载 + guest 静态 IP（与 clouisle-net netns 网段一致）。
     fn boot_args(&self, sandbox_id: &str, spec: &SandboxSpec) -> String {
-        let base = spec
-            .env
-            .get("boot_args")
-            .cloned()
-            .unwrap_or_else(|| "console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda rw".to_string());
+        let base = spec.env.get("boot_args").cloned().unwrap_or_else(|| {
+            "console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda rw".to_string()
+        });
         // 追加 guest IP 配置（10.{a}.{b}.2/30，网关 10.{a}.{b}.1）
         let (a, b) = Self::sandbox_subnet(sandbox_id);
         format!(
@@ -221,10 +219,9 @@ impl FirecrackerVmm {
             .header("Content-Type", "application/json")
             .body(Full::new(Bytes::from(json)))
             .map_err(|e| ClouisleError::new(ErrorKind::Vmm, format!("build request: {e}")))?;
-        let resp = client
-            .request(req)
-            .await
-            .map_err(|e| ClouisleError::new(ErrorKind::Vmm, format!("firecracker PUT {path}: {e}")))?;
+        let resp = client.request(req).await.map_err(|e| {
+            ClouisleError::new(ErrorKind::Vmm, format!("firecracker PUT {path}: {e}"))
+        })?;
         let status = resp.status();
         if !status.is_success() {
             let body = read_body(resp).await;
@@ -237,12 +234,7 @@ impl FirecrackerVmm {
     }
 
     /// POST JSON 请求到 Firecracker API。
-    async fn fc_post<T: Serialize>(
-        &self,
-        handle: &VmHandle,
-        path: &str,
-        body: &T,
-    ) -> Result<()> {
+    async fn fc_post<T: Serialize>(&self, handle: &VmHandle, path: &str, body: &T) -> Result<()> {
         let client = self.fc_client();
         let uri = self.api_uri(handle, path)?;
         let json = serde_json::to_vec(body)
@@ -257,10 +249,7 @@ impl FirecrackerVmm {
                 ClouisleError::new(ErrorKind::Vmm, format!("firecracker POST {path} timed out"))
             })?
             .map_err(|e| {
-                ClouisleError::new(
-                    ErrorKind::Vmm,
-                    format!("firecracker POST {path}: {e}"),
-                )
+                ClouisleError::new(ErrorKind::Vmm, format!("firecracker POST {path}: {e}"))
             })?;
         let status = resp.status();
         if !status.is_success() {
@@ -280,10 +269,9 @@ impl FirecrackerVmm {
         let req = Request::get(hyper::Uri::from(uri))
             .body(Full::new(Bytes::new()))
             .map_err(|e| ClouisleError::new(ErrorKind::Vmm, format!("build request: {e}")))?;
-        let resp = client
-            .request(req)
-            .await
-            .map_err(|e| ClouisleError::new(ErrorKind::Vmm, format!("firecracker GET {path}: {e}")))?;
+        let resp = client.request(req).await.map_err(|e| {
+            ClouisleError::new(ErrorKind::Vmm, format!("firecracker GET {path}: {e}"))
+        })?;
         let status = resp.status();
         if !status.is_success() {
             let body = read_body(resp).await;
@@ -333,9 +321,12 @@ impl Vmm for FirecrackerVmm {
         // 创建新进程组，使 firecracker 及其子进程在同一组
         cmd.process_group(0);
 
-        let child = cmd
-            .spawn()
-            .map_err(|e| ClouisleError::new(ErrorKind::Vmm, format!("spawn firecracker in ns {ns_name}: {e}")))?;
+        let child = cmd.spawn().map_err(|e| {
+            ClouisleError::new(
+                ErrorKind::Vmm,
+                format!("spawn firecracker in ns {ns_name}: {e}"),
+            )
+        })?;
 
         let pid = child.id().map(|p| p as u64);
         let cid = self.next_cid();
@@ -475,8 +466,14 @@ impl Vmm for FirecrackerVmm {
         struct Action<'a> {
             action_type: &'a str,
         }
-        self.fc_put(h, "/actions", &Action { action_type: "InstanceStart" })
-            .await?;
+        self.fc_put(
+            h,
+            "/actions",
+            &Action {
+                action_type: "InstanceStart",
+            },
+        )
+        .await?;
         info!(id = %h.id, "firecracker VM started");
         Ok(())
     }
@@ -486,8 +483,14 @@ impl Vmm for FirecrackerVmm {
         struct Action<'a> {
             action_type: &'a str,
         }
-        self.fc_post(h, "/actions", &Action { action_type: "Pause" })
-            .await?;
+        self.fc_post(
+            h,
+            "/actions",
+            &Action {
+                action_type: "Pause",
+            },
+        )
+        .await?;
         info!(id = %h.id, "firecracker VM paused");
         Ok(())
     }
@@ -497,18 +500,19 @@ impl Vmm for FirecrackerVmm {
         struct Action<'a> {
             action_type: &'a str,
         }
-        self.fc_post(h, "/actions", &Action { action_type: "Resume" })
-            .await?;
+        self.fc_post(
+            h,
+            "/actions",
+            &Action {
+                action_type: "Resume",
+            },
+        )
+        .await?;
         info!(id = %h.id, "firecracker VM resumed");
         Ok(())
     }
 
-    async fn snapshot(
-        &self,
-        h: &VmHandle,
-        kind: SnapshotKind,
-        out: &SnapshotPaths,
-    ) -> Result<()> {
+    async fn snapshot(&self, h: &VmHandle, kind: SnapshotKind, out: &SnapshotPaths) -> Result<()> {
         let snapshot_type = match kind {
             SnapshotKind::Full => "Full",
             SnapshotKind::Diff => "Diff",
@@ -548,7 +552,13 @@ impl Vmm for FirecrackerVmm {
                     action_type: &'a str,
                 }
                 let result = self
-                    .fc_post(h, "/actions", &Action { action_type: "SendCtrlAltDel" })
+                    .fc_post(
+                        h,
+                        "/actions",
+                        &Action {
+                            action_type: "SendCtrlAltDel",
+                        },
+                    )
                     .await;
                 if let Err(e) = result {
                     warn!(
@@ -584,9 +594,7 @@ impl Vmm for FirecrackerVmm {
 
     async fn stats(&self, h: &VmHandle) -> Result<VmStats> {
         let config = self.fc_get(h, "/vm/config").await?;
-        let mem_used_mb = config
-            .get("mem_size_mib")
-            .and_then(|v| v.as_u64());
+        let mem_used_mb = config.get("mem_size_mib").and_then(|v| v.as_u64());
 
         Ok(VmStats {
             boot_time_us: None,
@@ -664,8 +672,7 @@ mod tests {
     fn boot_args_from_env() {
         let vmm = FirecrackerVmm::new(FirecrackerConfig::default());
         let mut spec = SandboxSpec::default();
-        spec.env
-            .insert("boot_args".into(), "custom=1".into());
+        spec.env.insert("boot_args".into(), "custom=1".into());
         let args = vmm.boot_args(&spec);
         assert_eq!(args, "custom=1");
     }

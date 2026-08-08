@@ -53,9 +53,16 @@ impl FirewallManager {
 
     /// 创建沙盒 netns 拓扑（VMM 启动前调用）。
     /// 返回 `(ns_name, veth_ns, guest_ip)`。
-    pub async fn create_network(&self, sandbox_id: &str) -> Result<(String, String, String), ClouisleError> {
+    pub async fn create_network(
+        &self,
+        sandbox_id: &str,
+    ) -> Result<(String, String, String), ClouisleError> {
         let info = netns::create_netns(sandbox_id)?;
-        Ok((info.ns_name.clone(), info.veth_ns.clone(), info.guest_ip.clone()))
+        Ok((
+            info.ns_name.clone(),
+            info.veth_ns.clone(),
+            info.guest_ip.clone(),
+        ))
     }
 
     /// 为沙盒配置网络隔离（netns 内 nftables + DNS 代理）。

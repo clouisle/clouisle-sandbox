@@ -71,7 +71,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
 
         #[cfg(target_os = "linux")]
-        let agent_conn: Arc<dyn agent::AgentConnector> = Arc::new(agent::VsockAgentConnector::default());
+        let agent_conn: Arc<dyn agent::AgentConnector> =
+            Arc::new(agent::VsockAgentConnector::default());
         #[cfg(not(target_os = "linux"))]
         let agent_conn: Arc<dyn agent::AgentConnector> = {
             panic!("clouisle-apiserver requires Linux + KVM");

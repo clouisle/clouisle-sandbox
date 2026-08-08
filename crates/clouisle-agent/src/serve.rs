@@ -8,9 +8,9 @@ use std::collections::HashMap;
 use bytes::Bytes;
 use clouisle_proto::{Frame, FrameDecoder};
 
-use crate::errors::AgentResult;
 #[cfg(target_os = "linux")]
 use crate::errors::AgentError;
+use crate::errors::AgentResult;
 
 /// 在内存解码缓冲上处理一字节块中的完整帧，返回响应帧。
 pub fn process_frames(decoder: &mut FrameDecoder, data: &[u8]) -> AgentResult<Vec<Frame>> {
@@ -116,13 +116,15 @@ where
             // Echo 简单帧
             match frame {
                 Frame::Ping => clouisle_proto::codec::write_frame(writer, &Frame::Pong).await?,
-                Frame::Hello { .. } => clouisle_proto::codec::write_frame(
-                    writer,
-                    &Frame::Hello {
-                        agent_version: env!("CARGO_PKG_VERSION").to_string(),
-                    },
-                )
-                .await?,
+                Frame::Hello { .. } => {
+                    clouisle_proto::codec::write_frame(
+                        writer,
+                        &Frame::Hello {
+                            agent_version: env!("CARGO_PKG_VERSION").to_string(),
+                        },
+                    )
+                    .await?
+                }
                 _ => {
                     clouisle_proto::codec::write_frame(
                         writer,

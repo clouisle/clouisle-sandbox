@@ -2,7 +2,9 @@
 
 use async_trait::async_trait;
 
-use clouisle_core::{ClouisleError, Result};
+#[cfg(any(test, feature = "test-utils", target_os = "linux"))]
+use clouisle_core::ClouisleError;
+use clouisle_core::Result;
 use clouisle_vmm::VmHandle;
 
 /// 连接器 trait：给定 VMM handle 和 sandbox_id，连接 vsock 并完成 Hello 握手。
@@ -372,8 +374,8 @@ impl AgentConnector for VsockAgentConnector {
         handle: &VmHandle,
         sandbox_id: &str,
     ) -> Result<Box<dyn AgentConnection>> {
-        use clouisle_proto::codec::{read_frame, write_frame};
         use clouisle_proto::Frame;
+        use clouisle_proto::codec::{read_frame, write_frame};
 
         // 通过 guest 的 TAP 网络 IP (每沙盒独立网段 10.{a}.{b}.2) 进行 TCP 通信。
         // 不使用 vsock（需要 guest 内核驱动），TCP 隧道经 veth pair 跨 netns。
@@ -403,9 +405,7 @@ impl AgentConnector for VsockAgentConnector {
                         },
                     )
                     .await
-                    .map_err(|e| {
-                        ClouisleError::io(format!("write Hello to guest: {e}"))
-                    })?;
+                    .map_err(|e| ClouisleError::io(format!("write Hello to guest: {e}")))?;
 
                     let resp = read_frame(&mut *conn.stream.lock().await)
                         .await
@@ -459,8 +459,8 @@ impl AgentConnection for VsockFrameConnection {
         cwd: Option<String>,
         timeout_ms: u64,
     ) -> Result<clouisle_core::execution::ExecutionResult> {
-        use clouisle_proto::codec::{read_frame, write_frame};
         use clouisle_proto::Frame;
+        use clouisle_proto::codec::{read_frame, write_frame};
 
         let id = uuid::Uuid::now_v7().to_string();
         write_frame(
@@ -484,23 +484,23 @@ impl AgentConnection for VsockFrameConnection {
                 .await
                 .map_err(|e| ClouisleError::io(format!("read exec response: {e}")))?;
             match frame {
-                Frame::Stdout {
-                    id: fid, chunk, ..
-                } if fid == id => stdout.extend_from_slice(&chunk),
-                Frame::Stderr {
-                    id: fid, chunk, ..
-                } if fid == id => stderr.extend_from_slice(&chunk),
+                Frame::Stdout { id: fid, chunk, .. } if fid == id => {
+                    stdout.extend_from_slice(&chunk)
+                }
+                Frame::Stderr { id: fid, chunk, .. } if fid == id => {
+                    stderr.extend_from_slice(&chunk)
+                }
                 Frame::Exited { id: fid, code } if fid == id => break code,
                 Frame::Error { message, .. } => {
                     return Err(ClouisleError::new(
                         clouisle_core::ErrorKind::Vmm,
                         format!("guest exec error: {message}"),
-                    ))
+                    ));
                 }
                 other => {
                     return Err(ClouisleError::invalid_state(format!(
                         "unexpected frame during exec: {other:?}"
-                    )))
+                    )));
                 }
             }
         };
@@ -514,8 +514,8 @@ impl AgentConnection for VsockFrameConnection {
     }
 
     async fn write_file(&self, path: &str, content: bytes::Bytes, mode: u32) -> Result<()> {
-        use clouisle_proto::codec::write_frame;
         use clouisle_proto::Frame;
+        use clouisle_proto::codec::write_frame;
 
         write_frame(
             &mut *self.stream.lock().await,
@@ -533,8 +533,8 @@ impl AgentConnection for VsockFrameConnection {
     }
 
     async fn read_file(&self, path: &str) -> Result<bytes::Bytes> {
-        use clouisle_proto::codec::{read_frame, write_frame};
         use clouisle_proto::Frame;
+        use clouisle_proto::codec::{read_frame, write_frame};
 
         write_frame(
             &mut *self.stream.lock().await,
@@ -563,8 +563,8 @@ impl AgentConnection for VsockFrameConnection {
     }
 
     async fn list_dir(&self, path: &str) -> Result<Vec<clouisle_core::DirEntry>> {
-        use clouisle_proto::codec::{read_frame, write_frame};
         use clouisle_proto::Frame;
+        use clouisle_proto::codec::{read_frame, write_frame};
 
         write_frame(
             &mut *self.stream.lock().await,
@@ -600,8 +600,8 @@ impl AgentConnection for VsockFrameConnection {
     }
 
     async fn ping(&self) -> Result<()> {
-        use clouisle_proto::codec::{read_frame, write_frame};
         use clouisle_proto::Frame;
+        use clouisle_proto::codec::{read_frame, write_frame};
 
         write_frame(&mut *self.stream.lock().await, &Frame::Ping)
             .await

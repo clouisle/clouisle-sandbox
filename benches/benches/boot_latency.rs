@@ -4,10 +4,10 @@
 //! - POOL_ALLOC: 从 warm pool 取就绪沙盒
 //! - COLD_START: 完整冷启动
 
+#[cfg(target_os = "linux")]
 use std::time::Instant;
 
 use clouisle_core::timing::{BootTrace, SloKind};
-use clouisle_vmm::Vmm;
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
 
 fn bench_slo_kind_str(c: &mut Criterion) {
@@ -33,7 +33,7 @@ fn bench_boot_trace(c: &mut Criterion) {
         })
     });
 }
-
+#[cfg(target_os = "linux")]
 fn bench_mock_create(c: &mut Criterion) {
     // FirecrackerVmm 下模拟 100 次冷启动的平均时延
     c.bench_function("mock_cold_start_approx", |b| {
@@ -44,7 +44,7 @@ fn bench_mock_create(c: &mut Criterion) {
             let start = Instant::now();
             rt.block_on(async {
                 for _ in 0..iters {
-                    let h = vmm.create(&spec).await.unwrap();
+                    let h = vmm.create("sbx-bench", &spec).await.unwrap();
                     vmm.start(&h).await.unwrap();
                 }
             });
@@ -53,10 +53,15 @@ fn bench_mock_create(c: &mut Criterion) {
     });
 }
 
+#[cfg(target_os = "linux")]
 criterion_group!(
     benches,
     bench_slo_kind_str,
     bench_boot_trace,
     bench_mock_create
 );
+
+#[cfg(not(target_os = "linux"))]
+criterion_group!(benches, bench_slo_kind_str, bench_boot_trace);
+
 criterion_main!(benches);
