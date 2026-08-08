@@ -416,11 +416,11 @@ impl AgentConnector for VsockAgentConnector {
         )
         .await
         .map_err(|e| {
-            ClouisleError::io(format!("write Hello to cid {cid}:{AGENT_PORT}: {e}"))
+            ClouisleError::io(format!("write Hello to {vsock_path}: {e}"))
         })?;
 
         let resp = read_frame(&mut *conn.stream.lock().await).await.map_err(|e| {
-            ClouisleError::io(format!("read Hello response from cid {cid}:{AGENT_PORT}: {e}"))
+            ClouisleError::io(format!("read Hello response from {vsock_path}: {e}"))
         })?;
         if !matches!(resp, Frame::Hello { .. }) {
             return Err(ClouisleError::invalid_state(format!(
