@@ -5,6 +5,8 @@
 //! - COLD_START: 完整冷启动
 
 #[cfg(target_os = "linux")]
+use clouisle_vmm::Vmm;
+#[cfg(target_os = "linux")]
 use std::time::Instant;
 
 use clouisle_core::timing::{BootTrace, SloKind};
