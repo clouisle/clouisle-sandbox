@@ -77,7 +77,9 @@ impl FirecrackerVmm {
                 ),
             ));
         }
-        if self.config.use_jailer && let Some(j) = &self.config.jailer_bin {
+        if self.config.use_jailer
+            && let Some(j) = &self.config.jailer_bin
+        {
             if !j.exists() {
                 return Err(ClouisleError::new(
                     ErrorKind::Vmm,
