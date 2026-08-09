@@ -729,3 +729,79 @@ async fn e2b_platform_sandbox_lifecycle_contract() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NO_CONTENT);
 }
+
+#[tokio::test]
+async fn e2b_envd_files_and_process_contract() {
+    let app = app();
+    let (_, created) = post_json(
+        &app,
+        "/sandboxes",
+        serde_json::json!({ "templateID": "alpine:latest", "timeout": 60 }),
+    )
+    .await;
+    let id = created["sandboxID"].as_str().unwrap().to_string();
+
+    let upload = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/files?path=/work/hello.txt")
+                .header("e2b-sandbox-id", &id)
+                .body(Body::from("hello"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(upload.status(), StatusCode::OK);
+
+    let download = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/files?path=/work/hello.txt")
+                .header("e2b-sandbox-id", &id)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(download.status(), StatusCode::OK);
+    assert_eq!(to_bytes(download.into_body(), 1024).await.unwrap(), "hello");
+
+    let list = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/filesystem.Filesystem/ListDir")
+                .header("e2b-sandbox-id", &id)
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"path":"/work"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(list.status(), StatusCode::OK);
+
+    let process = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/process.Process/Start")
+                .header("e2b-sandbox-id", &id)
+                .header("content-type", "application/connect+json")
+                .body(Body::from(
+                    r#"{"process":{"cmd":"echo","args":["hello"]}}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(process.status(), StatusCode::OK);
+    assert_eq!(
+        process.headers().get("content-type").unwrap(),
+        "application/connect+json"
+    );
+}

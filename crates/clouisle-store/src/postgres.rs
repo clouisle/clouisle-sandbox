@@ -99,6 +99,7 @@ fn row_to_sandbox(row: &Row) -> StoreResult<Sandbox> {
         "pending" => SandboxStatus::Pending,
         "starting" => SandboxStatus::Starting,
         "running" => SandboxStatus::Running,
+        "paused" => SandboxStatus::Paused,
         "stopping" => SandboxStatus::Stopping,
         "stopped" => SandboxStatus::Stopped,
         "error" => SandboxStatus::Error,

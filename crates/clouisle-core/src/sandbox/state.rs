@@ -21,6 +21,8 @@ pub enum SandboxStatus {
     Starting,
     /// 运行中（agent 已就绪，可接受 exec）
     Running,
+    /// 暂停中，运行时已保存且不可执行命令。
+    Paused,
     /// 停止中（VMM 进程退出等待中）
     Stopping,
     /// 已停止（VMM 进程已退出）
@@ -34,6 +36,8 @@ pub enum SandboxStatus {
 pub enum SandboxEvent {
     Start,
     AgentHello,
+    Pause,
+    Resume,
     Stop,
     VmmExited,
     Failed,
@@ -53,8 +57,12 @@ impl SandboxStatus {
             (Starting, Failed) => Error,
             (Starting, Stop) => Stopping,
             (Running, Stop) => Stopping,
+            (Running, Pause) => Paused,
             (Running, Failed) => Error,
             (Running, Restart) => Starting,
+            (Paused, Resume) => Starting,
+            (Paused, Stop) => Stopping,
+            (Paused, Failed) => Error,
             (Stopping, VmmExited) => Stopped,
             (Stopping, Failed) => Error,
             (Stopped, Start) => Starting,
@@ -65,6 +73,7 @@ impl SandboxStatus {
             (Starting, Start) => Starting,
             (Stopping, Stop) => Stopping,
             (Running, AgentHello) => Running,
+            (Paused, Pause) => Paused,
             // 非法转换
             (from, ev) => {
                 return Err(ClouisleError::invalid_state(format!(
@@ -84,13 +93,19 @@ impl SandboxStatus {
     pub fn is_active(&self) -> bool {
         matches!(
             self,
-            SandboxStatus::Starting | SandboxStatus::Running | SandboxStatus::Stopping
+            SandboxStatus::Starting
+                | SandboxStatus::Running
+                | SandboxStatus::Paused
+                | SandboxStatus::Stopping
         )
     }
 
     /// 可接受删除的状态。
     pub fn can_delete(&self) -> bool {
-        matches!(self, SandboxStatus::Stopped | SandboxStatus::Error)
+        matches!(
+            self,
+            SandboxStatus::Paused | SandboxStatus::Stopped | SandboxStatus::Error
+        )
     }
 
     /// 终止态。
@@ -103,6 +118,7 @@ impl SandboxStatus {
             SandboxStatus::Pending => "pending",
             SandboxStatus::Starting => "starting",
             SandboxStatus::Running => "running",
+            SandboxStatus::Paused => "paused",
             SandboxStatus::Stopping => "stopping",
             SandboxStatus::Stopped => "stopped",
             SandboxStatus::Error => "error",

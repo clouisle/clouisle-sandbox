@@ -33,6 +33,15 @@ pub struct SandboxSpec {
     /// Maximum time allowed for the initialization command.
     #[serde(default = "default_init_timeout_ms")]
     pub init_timeout_ms: u64,
+    /// E2B-compatible user metadata persisted with the sandbox.
+    #[serde(default)]
+    pub metadata: std::collections::HashMap<String, String>,
+    /// Pause instead of destroy when the TTL expires.
+    #[serde(default)]
+    pub auto_pause: bool,
+    /// Resume a paused sandbox when an execution/file request arrives.
+    #[serde(default)]
+    pub auto_resume: bool,
     /// 节点选择标签（Phase 3 多节点调度）。
     #[serde(default)]
     pub node_selector: std::collections::HashMap<String, String>,
@@ -63,6 +72,9 @@ impl Default for SandboxSpec {
             env: std::collections::HashMap::new(),
             init_command: Vec::new(),
             init_timeout_ms: default_init_timeout_ms(),
+            metadata: std::collections::HashMap::new(),
+            auto_pause: false,
+            auto_resume: false,
             node_selector: std::collections::HashMap::new(),
             restart_policy: RestartPolicy::default(),
             tenant_id: None,
@@ -106,6 +118,13 @@ impl SandboxSpec {
             errors.push(ValidationError::new(
                 "init_timeout_ms",
                 "init_timeout_ms must be in [1, 300000]",
+            ));
+        }
+
+        if self.auto_resume && !self.auto_pause {
+            errors.push(ValidationError::new(
+                "auto_resume",
+                "auto_resume requires auto_pause",
             ));
         }
 

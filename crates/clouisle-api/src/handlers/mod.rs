@@ -5,4 +5,5 @@ pub mod files;
 pub mod images;
 pub mod health;
 pub mod nodes;
+pub mod e2b;
 pub mod sandbox;

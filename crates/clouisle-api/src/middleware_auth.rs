@@ -34,12 +34,25 @@ pub async fn auth_middleware(
         return next.run(req).await;
     }
 
-    let header = req
+    let auth_header = req
         .headers()
         .get("authorization")
-        .and_then(|v| v.to_str().ok());
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned)
+        .or_else(|| {
+            req.headers()
+                .get("x-api-key")
+                .and_then(|value| value.to_str().ok())
+                .map(|value| format!("Bearer {value}"))
+        })
+        .or_else(|| {
+            req.headers()
+                .get("x-access-token")
+                .and_then(|value| value.to_str().ok())
+                .map(|value| format!("Bearer {value}"))
+        });
 
-    match state.auth.authenticate(header).await {
+    match state.auth.authenticate(auth_header.as_deref()).await {
         Ok(principal) => {
             if matches!(
                 req.method(),

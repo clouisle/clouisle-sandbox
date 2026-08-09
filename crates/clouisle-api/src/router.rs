@@ -64,6 +64,44 @@ pub fn build_router(state: AppState) -> Router {
         // Authenticated node registry and heartbeat lease updates.
         .route("/api/v1/nodes", post(handlers::nodes::upsert_node))
         .route("/api/v1/nodes", get(handlers::nodes::list_ready_nodes))
+        // E2B public sandbox platform compatibility.
+        .route("/sandboxes", post(handlers::e2b::create))
+        .route("/sandboxes", get(handlers::e2b::list))
+        .route("/v2/sandboxes", get(handlers::e2b::v2_list))
+        .route(
+            "/sandboxes/{sandbox_id}",
+            get(handlers::e2b::get).delete(handlers::sandbox::delete_sandbox),
+        )
+        .route(
+            "/sandboxes/{sandbox_id}/connect",
+            post(handlers::e2b::connect),
+        )
+        .route(
+            "/sandboxes/{sandbox_id}/pause",
+            post(handlers::e2b::pause),
+        )
+        .route(
+            "/sandboxes/{sandbox_id}/resume",
+            post(handlers::e2b::resume),
+        )
+        .route(
+            "/sandboxes/{sandbox_id}/timeout",
+            post(handlers::e2b::set_timeout),
+        )
+        .route(
+            "/sandboxes/{sandbox_id}/refresh",
+            post(handlers::e2b::refresh),
+        )
+        // E2B envd-compatible filesystem/process Connect endpoints.
+        .route(
+            "/files",
+            post(handlers::e2b::upload_file).get(handlers::e2b::download_file),
+        )
+        .route(
+            "/filesystem.Filesystem/ListDir",
+            post(handlers::e2b::list_dir),
+        )
+        .route("/process.Process/Start", post(handlers::e2b::process_start))
         // 可观测性
         .route("/health", get(handlers::health::health))
         .route("/health/live", get(handlers::health::liveness))

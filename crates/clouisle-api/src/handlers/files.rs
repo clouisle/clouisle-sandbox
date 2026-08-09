@@ -27,7 +27,7 @@ pub struct LsResponse {
 pub const MAX_UPLOAD_BYTES: usize = 50 * 1024 * 1024;
 
 /// 检查沙盒可执行且拿到连接。
-async fn get_conn(
+pub(crate) async fn get_conn(
     state: &AppState,
     sandbox_id: &str,
     principal: &Principal,
@@ -44,7 +44,7 @@ async fn get_conn(
     state.agent.connect_and_hello(&handle, sandbox_id).await
 }
 
-fn validate_path(path: &str) -> Result<(), ClouisleError> {
+pub(crate) fn validate_path(path: &str) -> Result<(), ClouisleError> {
     use std::path::Component;
 
     if path.is_empty() {

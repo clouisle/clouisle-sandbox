@@ -300,6 +300,7 @@ pub async fn list_sandboxes(
         Some("pending") => Some(SandboxStatus::Pending),
         Some("starting") => Some(SandboxStatus::Starting),
         Some("running") => Some(SandboxStatus::Running),
+        Some("paused") => Some(SandboxStatus::Paused),
         Some("stopping") => Some(SandboxStatus::Stopping),
         Some("stopped") => Some(SandboxStatus::Stopped),
         Some("error") => Some(SandboxStatus::Error),
