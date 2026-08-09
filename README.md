@@ -2,7 +2,7 @@
 
 A micro-VM sandbox scheduling system based on Firecracker — high-density, fast-boot, and fully isolated compute environments.
 
-Each sandbox is a real microVM (Firecracker + KVM) with its own kernel and root filesystem, communicating with the host via vsock. It supports command execution, file transfer, multi-tenancy, auditing, and network isolation.
+Each sandbox is a real microVM (Firecracker + KVM) with its own kernel and root filesystem. The host communicates with its guest agent over the sandbox's dedicated TCP network channel. It supports command execution, file transfer, multi-tenancy, auditing, and network isolation.
 
 > [中文文档 (Chinese README)](README.zh-CN.md)
 
@@ -25,14 +25,14 @@ Each sandbox is a real microVM (Firecracker + KVM) with its own kernel and root 
                     │    ├─ Reconciler drift convergence (10s) │
                     │    └─ Firewall: netns + nftables + DNS   │
                     └──────────────────┬───────────────────────┘
-                                       │ gRPC (mTLS)
+                                       │ gRPC
                     ┌──────────────────▼───────────────────────┐
                     │            Data Plane                    │
                     │                                          │
                     │  FirecrackerVmm (Firecracker + KVM)      │
                     │    ├─ Process group mgmt (killpg)        │
                     │    ├─ seccomp / jailer / cgroup v2       │
-                    │    └─ vsock channel (host ↔ guest)       │
+                    │    └─ guest-agent TCP (host ↔ guest:5201) │
                     │                                          │
                     │  Per-sandbox isolation:                  │
                     │    ├─ netns (clo-<hash>)                 │
@@ -75,7 +75,7 @@ docker compose down
 **Image structure** (`Dockerfile` multi-stage build):
 
 ```
-Stage 1: rust:1.85-slim → compile Rust binaries
+Stage 1: rust:1-slim-bookworm → compile Rust binaries
 Stage 2: debian:bookworm-slim → install Firecracker + copy binaries
 ```
 
@@ -87,6 +87,7 @@ Stage 2: debian:bookworm-slim → install Firecracker + copy binaries
 | `network_mode: host` | `netns`/`nftables` need the host network stack |
 | `/dev/kvm` mount | Required, or firecracker cannot start |
 | `vmlinux` / `rootfs` | Must be pre-placed in host `/opt/clouisle/` |
+| `CLOUISLE_API_KEYS` | Required by `clouisle-apiserver`; comma-separated `key:tenant:read\|full` entries. Store in a secret, never commit a production key. |
 
 **Storage mode switch**:
 
@@ -211,29 +212,40 @@ cargo run -p clouislectl -- delete <sandbox-id>
 ### Direct HTTP API
 
 ```bash
+# All /api/v1/* endpoints require a Bearer API key. The checked-in Compose
+# development value is local-development-key; replace it before deployment.
+export CLOUISLE_API_KEY=local-development-key
+
 # Create sandbox
 curl -X POST localhost:8080/api/v1/sandboxes \
+  -H "Authorization: Bearer $CLOUISLE_API_KEY" \
   -H 'Content-Type: application/json' \
   -d '{"image":{"reference":"alpine"},"resources":{"vcpu":1,"memory_mb":256,"disk_mb":512}}'
 
 # Exec in microVM
 curl -X POST localhost:8080/api/v1/sandboxes/<id>/exec \
+  -H "Authorization: Bearer $CLOUISLE_API_KEY" \
   -H 'Content-Type: application/json' \
   -d '{"argv":["uname","-a"],"timeout_ms":10000}'
 
 # Delete sandbox
-curl -X DELETE localhost:8080/api/v1/sandboxes/<id>
+curl -X DELETE localhost:8080/api/v1/sandboxes/<id> \
+  -H "Authorization: Bearer $CLOUISLE_API_KEY"
 
-# Health checks
+# These operational endpoints are intentionally unauthenticated for probes
+# and Prometheus scraping.
 curl localhost:8080/health
 curl localhost:8080/health/live
 curl localhost:8080/health/ready
-
-# Prometheus metrics
 curl localhost:8080/metrics
 ```
 
+
 ## API Endpoints
+
+### Authentication and tenant isolation
+
+`CLOUISLE_API_KEYS` is required by the production server. Its format is a comma-separated list of `key:tenant:read|full` entries. Every `/api/v1/*` request needs `Authorization: Bearer <key>`; `read` keys may only read, while `full` keys may create, execute, upload, delete, and update node leases. The authenticated key determines the sandbox tenant, and a different tenant receives `404` for sandbox, execution, and file resources. `/health`, `/health/live`, `/health/ready`, and `/metrics` are deliberately public.
 
 ### Sandbox Lifecycle
 
@@ -253,6 +265,13 @@ curl localhost:8080/metrics
 | GET | `/api/v1/sandboxes/{id}/exec` | Execution history |
 | GET | `/api/v1/sandboxes/{id}/exec/{exec_id}` | Single execution record |
 
+### Node Registry
+
+| Method | Path | Description |
+|--------|------|-------------|
+| POST | `/api/v1/nodes` | Register or refresh a node heartbeat lease (`full` scope) |
+| GET | `/api/v1/nodes` | List nodes with a valid heartbeat lease |
+
 ### File Transfer
 
 | Method | Path | Description |
@@ -265,10 +284,10 @@ curl localhost:8080/metrics
 
 | Method | Path | Description |
 |--------|------|-------------|
-| GET | `/health` | Health check |
-| GET | `/health/live` | Liveness probe (K8s livenessProbe) |
-| GET | `/health/ready` | Readiness probe (K8s readinessProbe) |
-| GET | `/metrics` | Prometheus metrics |
+| GET | `/health` | Public aggregate health check |
+| GET | `/health/live` | Public liveness probe (K8s `livenessProbe`) |
+| GET | `/health/ready` | Public readiness probe (K8s `readinessProbe`) |
+| GET | `/metrics` | Public Prometheus metrics |
 
 ### Request Bodies
 
@@ -286,7 +305,7 @@ curl localhost:8080/metrics
 | `network.allow_egress` | `[string]` | `[]` | Egress domain allowlist, empty = deny all egress |
 | `mounts` | `[{source,target,readonly}]` | `[]` | Volume mounts |
 | `secrets` | `[{name,value}]` | `[]` | Secret injection (`/run/secrets/<name>`) |
-| `ttl_secs` | `u64?` | `null` | Sandbox TTL (seconds), force destroy on expiry |
+| `ttl_secs` | `u64?` | `null` | Running lifetime in seconds; starts when the sandbox reaches `Running`, then force-destroys it on expiry |
 | `start_timeout_secs` | `u64` | `10` | Start timeout (seconds) |
 | `env` | `{string:string}` | `{}` | Environment variables |
 | `restart_policy` | `"never"` / `"on_failure"` / `"always"` | `"never"` | Restart policy |
@@ -359,12 +378,14 @@ Sandbox create                      Sandbox delete
   │    │  ├─ udp dport 53 accept       │
   │    │  └─ ct state established accept
   │    ├─ forward: default drop        │
-  │    │  ├─ @allowed_v4 accept        │
-  │    │  ├─ 10.0.0.0/8 accept        │
+  │    │  ├─ private/agent/DNS accept  │
+  │    │  ├─ resolved allowlist IPs    │
   │    │  └─ counter drop              │
   │    └─ postrouting: masquerade      │
-  └─ 5. DNS proxy (10.0.0.1:53)        │
+  └─ 5. host-veth egress guard + DNS proxy (gateway:53) │
 ```
+
+The host-veth guard blocks direct public-IP egress. The DNS proxy returns answers only for `network.allow_egress` domains and dynamically allows the resolved IPv4 destinations; an empty allowlist denies all public egress.
 
 ## Security Design
 

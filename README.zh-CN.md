@@ -2,8 +2,7 @@
 
 微VM 沙盒调度系统 —— 基于 Firecracker 的高密度、快速启动的隔离计算环境。
 
-每个沙盒是一个真正的 microVM（Firecracker + KVM），拥有独立内核与根文件系统，
-通过 vsock 与宿主机通信，支持命令执行、文件传输、多租户、审计与网络隔离。
+每个沙盒是一个真正的 microVM（Firecracker + KVM），拥有独立内核与根文件系统，通过沙盒专用 TCP 网络通道与 guest agent 通信，支持命令执行、文件传输、多租户、审计与网络隔离。
 
 ## 架构
 
@@ -24,14 +23,14 @@
                     │    ├─ Reconciler 漂移收敛 (10s)           │
                     │    └─ 防火墙：netns + nftables + DNS      │
                     └──────────────────┬───────────────────────┘
-                                       │ gRPC (mTLS)
+                                       │ gRPC
                     ┌──────────────────▼───────────────────────┐
                     │           数据平面 (data plane)           │
                     │                                          │
                     │  FirecrackerVmm (Firecracker + KVM)      │
                     │    ├─ 进程组管理 (killpg, 无孤儿残留)     │
                     │    ├─ seccomp / jailer / cgroup v2       │
-                    │    └─ vsock 通道 (host ↔ guest)          │
+                    │    └─ guest-agent TCP（host ↔ guest:5201） │
                     │                                          │
                     │  每沙盒独立：                             │
                     │    ├─ netns (clo-<hash>)                 │
@@ -74,7 +73,7 @@ docker compose down
 **镜像架构**（`Dockerfile` 多阶段构建）：
 
 ```
-Stage 1: rust:1.85-slim → 编译 Rust 二进制
+Stage 1: rust:1-slim-bookworm → 编译 Rust 二进制
 Stage 2: debian:bookworm-slim → 装 Firecracker + 复制二进制
 ```
 
@@ -86,6 +85,7 @@ Stage 2: debian:bookworm-slim → 装 Firecracker + 复制二进制
 | `network_mode: host` | `netns`/`nftables` 需要宿主网络栈 |
 | `/dev/kvm` 挂载 | 必须，否则 firecracker 无法启动 |
 | `vmlinux` / `rootfs` | 需预先放置到宿主机 `/opt/clouisle/` |
+| `CLOUISLE_API_KEYS` | `clouisle-apiserver` 必填；格式为逗号分隔的 `key:tenant:read\|full`。应存入 Secret，严禁提交生产 key。 |
 
 **存储模式切换**：
 
@@ -204,29 +204,38 @@ cargo run -p clouislectl -- delete <sandbox-id>
 ### 直接使用 HTTP API
 
 ```bash
+# 全部 /api/v1/* 端点需要 Bearer API key。Compose 中的开发值为
+# local-development-key；部署前必须替换。
+export CLOUISLE_API_KEY=local-development-key
+
 # 创建沙盒
 curl -X POST localhost:8080/api/v1/sandboxes \
+  -H "Authorization: Bearer $CLOUISLE_API_KEY" \
   -H 'Content-Type: application/json' \
   -d '{"image":{"reference":"alpine"},"resources":{"vcpu":1,"memory_mb":256,"disk_mb":512}}'
 
 # 在 microVM 中执行命令
 curl -X POST localhost:8080/api/v1/sandboxes/<id>/exec \
+  -H "Authorization: Bearer $CLOUISLE_API_KEY" \
   -H 'Content-Type: application/json' \
   -d '{"argv":["uname","-a"],"timeout_ms":10000}'
 
 # 删除沙盒
-curl -X DELETE localhost:8080/api/v1/sandboxes/<id>
+curl -X DELETE localhost:8080/api/v1/sandboxes/<id> \
+  -H "Authorization: Bearer $CLOUISLE_API_KEY"
 
-# 健康检查
+# 以下运维端点刻意不鉴权，供探针与 Prometheus 抓取。
 curl localhost:8080/health
 curl localhost:8080/health/live
 curl localhost:8080/health/ready
-
-# Prometheus 指标
 curl localhost:8080/metrics
 ```
 
 ## API 端点
+
+### 认证与租户隔离
+
+生产服务必须配置 `CLOUISLE_API_KEYS`，格式为逗号分隔的 `key:tenant:read|full`。所有 `/api/v1/*` 请求需要 `Authorization: Bearer <key>`；`read` key 只能读取，`full` key 才能创建、执行、上传、删除和更新节点租约。认证 key 决定沙盒所属租户；其他租户访问沙盒、执行记录和文件资源一律返回 `404`。`/health`、`/health/live`、`/health/ready` 与 `/metrics` 刻意保持公开。
 
 ### 沙盒生命周期
 
@@ -246,6 +255,13 @@ curl localhost:8080/metrics
 | GET | `/api/v1/sandboxes/{id}/exec` | 执行历史记录 |
 | GET | `/api/v1/sandboxes/{id}/exec/{exec_id}` | 单条执行记录 |
 
+### 节点注册表
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| POST | `/api/v1/nodes` | 注册或刷新节点心跳租约（`full` scope） |
+| GET | `/api/v1/nodes` | 列出仍在有效心跳租约内的节点 |
+
 ### 文件传输
 
 | 方法 | 路径 | 说明 |
@@ -258,10 +274,10 @@ curl localhost:8080/metrics
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
-| GET | `/health` | 健康检查 |
-| GET | `/health/live` | 存活探针（K8s livenessProbe） |
-| GET | `/health/ready` | 就绪探针（K8s readinessProbe） |
-| GET | `/metrics` | Prometheus 指标 |
+| GET | `/health` | 公开的综合健康检查 |
+| GET | `/health/live` | 公开的存活探针（K8s `livenessProbe`） |
+| GET | `/health/ready` | 公开的就绪探针（K8s `readinessProbe`） |
+| GET | `/metrics` | 公开的 Prometheus 指标 |
 
 ### 请求体结构
 
@@ -279,7 +295,7 @@ curl localhost:8080/metrics
 | `network.allow_egress` | `[string]` | `[]` | 出站域名白名单，空=禁止全部出站 |
 | `mounts` | `[{source,target,readonly}]` | `[]` | 卷挂载 |
 | `secrets` | `[{name,value}]` | `[]` | 密钥注入（`/run/secrets/<name>`） |
-| `ttl_secs` | `u64?` | `null` | 沙盒租期（秒），到期强制销毁 |
+| `ttl_secs` | `u64?` | `null` | 运行期秒数；沙盒到达 `Running` 后开始计时，到期强制销毁 |
 | `start_timeout_secs` | `u64` | `10` | 启动超时（秒） |
 | `env` | `{string:string}` | `{}` | 环境变量 |
 | `restart_policy` | `"never"` / `"on_failure"` / `"always"` | `"never"` | 重启策略 |
@@ -352,12 +368,14 @@ curl localhost:8080/metrics
   │    │  ├─ udp dport 53 accept      │
   │    │  └─ ct state established accept
   │    ├─ forward: default drop       │
-  │    │  ├─ @allowed_v4 accept       │
-  │    │  ├─ 10.0.0.0/8 accept       │
+  │    │  ├─ private/agent/DNS accept │
+  │    │  ├─ 已解析白名单 IP 放行       │
   │    │  └─ counter drop             │
   │    └─ postrouting: masquerade     │
-  └─ 5. DNS proxy (10.0.0.1:53)      │
+  └─ 5. host-veth 出站 guard + DNS proxy（gateway:53） │
 ```
+
+host-veth guard 会阻断直接访问公网 IP。DNS 代理只为 `network.allow_egress` 中的域名返回记录，并动态放行其解析出的 IPv4 地址；空白名单会拒绝全部公网出站。
 
 ## 安全设计
 
