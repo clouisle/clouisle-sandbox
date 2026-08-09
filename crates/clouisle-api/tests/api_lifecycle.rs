@@ -574,6 +574,25 @@ async fn production_authentication_enforces_scope_and_tenant_ownership() {
         .unwrap()
         .to_string();
 
+    for path in ["/health", "/health/live", "/health/ready", "/metrics"] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(path)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "{path} must remain public"
+        );
+    }
+
     let cross_tenant = app
         .oneshot(
             Request::builder()

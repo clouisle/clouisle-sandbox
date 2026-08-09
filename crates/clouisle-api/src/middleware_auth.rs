@@ -19,8 +19,11 @@ pub async fn auth_middleware(
     next: Next,
 ) -> Response {
     let path = req.uri().path();
-    // 开放端点
-    if path == "/health" || path == "/metrics" {
+    // Kubernetes probes and Prometheus scraping must remain unauthenticated.
+    if matches!(
+        path,
+        "/health" | "/health/live" | "/health/ready" | "/metrics"
+    ) {
         return next.run(req).await;
     }
 
