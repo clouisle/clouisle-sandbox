@@ -440,6 +440,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reference_cache_alias_survives_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let digest_path = dir.path().join("sha256_abc.ext4");
+        std::fs::write(&digest_path, b"rootfs").unwrap();
+        std::fs::write(
+            reference_alias_path(dir.path(), "python:3.11"),
+            r#"{"digest":"sha256:abc"}"#,
+        )
+        .unwrap();
+        let mgr = ImageManager::new().with_cache_dir(dir.path());
+        let spec = ImageSpec {
+            reference: "python:3.11".into(),
+            digest: None,
+        };
+        assert!(mgr.cache_hit(&spec).await);
+    }
+
+    #[tokio::test]
     async fn digest_cache_key_hits_across_references() {
         let dir = tempfile::tempdir().unwrap();
         let mgr = ImageManager::new().with_cache_dir(dir.path());
