@@ -23,7 +23,7 @@ spec:
       hostPID: true
       containers:
         - name: clouisled
-          image: registry.cn-shanghai.aliyuncs.com/clouisle/clouisle-sandbox:0.1.0
+          image: registry.cn-shanghai.aliyuncs.com/clouisle/clouisle-sandbox:v0.1.5
           command: ["clouisled"]
           args:
             - --addr=0.0.0.0:9090

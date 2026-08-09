@@ -20,7 +20,7 @@ spec:
       automountServiceAccountToken: false
       containers:
         - name: apiserver
-          image: registry.example.com/clouisle-apiserver:0.1.0
+          image: registry.cn-shanghai.aliyuncs.com/clouisle/clouisle-sandbox:v0.1.5
           args:
             - --addr=0.0.0.0:8080
             - --db=$(POSTGRES_DSN)
