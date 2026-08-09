@@ -44,7 +44,10 @@ impl Default for TestVmm {
 
 #[async_trait]
 impl Vmm for TestVmm {
-    async fn create(&self, _: &str, _spec: &SandboxSpec) -> Result<VmHandle> {
+    async fn create(&self, _: &str, spec: &SandboxSpec) -> Result<VmHandle> {
+        if spec.image.reference == "missing:latest" {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
         Ok(VmHandle {
             id: uuid::Uuid::now_v7().to_string(),
             backend: "test".into(),
@@ -605,4 +608,41 @@ async fn production_authentication_enforces_scope_and_tenant_ownership() {
         .await
         .unwrap();
     assert_eq!(cross_tenant.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn cache_miss_create_returns_before_image_work_finishes() {
+    let app = app();
+    let result = tokio::time::timeout(
+        std::time::Duration::from_millis(80),
+        post_json(
+            &app,
+            "/api/v1/sandboxes",
+            serde_json::json!({
+                "image": { "reference": "missing:latest" },
+                "resources": { "vcpu": 1, "memory_mb": 64, "disk_mb": 512 }
+            }),
+        ),
+    )
+    .await
+    .expect("cache misses must not block the HTTP request");
+    assert_eq!(result.0, StatusCode::ACCEPTED);
+    assert_eq!(result.1["status"], "starting");
+}
+
+#[tokio::test]
+async fn initialization_command_failure_does_not_report_running() {
+    let app = app();
+    let (status, body) = post_json(
+        &app,
+        "/api/v1/sandboxes",
+        serde_json::json!({
+            "image": { "reference": "alpine:latest" },
+            "init_command": ["sh", "-c", "exit 7"],
+            "resources": { "vcpu": 1, "memory_mb": 64, "disk_mb": 512 }
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(body["error"]["code"], "VMM");
 }

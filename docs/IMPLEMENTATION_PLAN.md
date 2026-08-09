@@ -63,4 +63,17 @@ See `docs/plan/cross-platform-docker-dev-vmm.md` for the requirements, traceabil
 5. [x] Reuse Cargo work across Linux CI checks
 6. [x] Verify optimized Docker build and release workflows
 
+
+## E2B 兼容与运行可靠性
+
+1. [ ] 修复缺失镜像导致的创建超时
+2. [ ] 实现异步镜像预拉取与持久缓存
+3. [ ] 收敛 API 与 Node 的默认部署
+4. [ ] 支持创建时初始化命令
+5. [ ] 实现 E2B sandbox/envd 协议兼容
+6. [ ] 实现沙盒故障恢复与重启策略
+7. [ ] 自动同步节点/服务重启后的历史状态
+8. [ ] 补齐关键路径测试并完成端到端验收
+
+See `docs/plan/e2b-compatible-reliability.md` for the detailed design, contracts, validation matrix, risks, and rollback plan.
 See `docs/plan/hosted-multiarch-build-optimization.md` for the baseline, hosted-runner topology, cache design, validation, and rollback plan.
