@@ -40,3 +40,16 @@ See `docs/plan/server-comprehensive-test-plan.md` for the complete test matrix a
 3. [x] Run Docker-only Python-and-Node KVM acceptance
 
 See `docs/plan/container-only-runtime.md` for the runtime boundary, implementation stages, validation, and rollback plan.
+
+## Cross-platform Docker Development Backend
+
+Planning complete; implementation not started.
+
+1. [ ] Establish explicit Firecracker and DockerDevVmm backend selection
+2. [ ] Reuse injected guest agent for Docker development sandboxes
+3. [ ] Implement DockerDevVmm lifecycle, networking, limits, and cleanup
+4. [ ] Ship standalone Docker Desktop and WSL2 development Compose topology
+5. [ ] Validate Docker development and Firecracker KVM regression matrices
+6. [ ] Document capability boundaries, security, rollout, and rollback
+
+See `docs/plan/cross-platform-docker-dev-vmm.md` for the requirements, traceability matrix, contracts, staged plan, acceptance cases, and risks.
