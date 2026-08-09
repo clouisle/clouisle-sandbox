@@ -18,3 +18,5 @@
 - Docker 部署（docker-compose + Dockerfile）
 - K8s 部署（DaemonSet + RBAC + NetworkPolicy）
 - CI/CD（GitHub Actions：lint / test / build / release）
+- Runtime delivery is container-only: releases publish OCI images, and operator CLI commands execute through Docker Compose.
+- The static guest agent configures its management NIC through netlink, so OCI application images do not need `ip` or `ifconfig` binaries.

@@ -1,10 +1,9 @@
-version: "3.9"
 
-x-firecracker-volumes: &fc-volumes
-  - /dev/kvm:/dev/kvm                     # KVM 透传（必须）
-  - /opt/clouisle/vmlinux:/opt/clouisle/vmlinux:ro  # guest 内核
-  - /opt/clouisle/rootfs:/opt/clouisle/rootfs:ro    # 基础 rootfs
-  - /opt/clouisle/images:/opt/clouisle/images       # OCI-built rootfs cache
+x-firecracker-volumes:
+  kvm: &fc-kvm /dev/kvm:/dev/kvm
+  kernel: &fc-kernel /opt/clouisle/vmlinux:/opt/clouisle/vmlinux:ro
+  rootfs: &fc-rootfs /opt/clouisle/rootfs:/opt/clouisle/rootfs:ro
+  image-cache: &fc-image-cache /opt/clouisle/images:/opt/clouisle/images
 
 services:
   # ============ 控制平面：apiserver ============
@@ -20,15 +19,16 @@ services:
     # 用 postgres 连接串（HA 就绪）
     command:
       - --addr=0.0.0.0:8080
-      - --db=postgres://clouisle:changeme@postgres:5432/clouisle
+      - --db=postgres://clouisle:changeme@127.0.0.1:5432/clouisle
     volumes:
-      - *fc-volumes
+      - *fc-kvm
+      - *fc-kernel
+      - *fc-rootfs
+      - *fc-image-cache
       - clouisle-data:/data
     depends_on:
       postgres:
         condition: service_healthy
-    ports:
-      - "8080:8080"
     restart: unless-stopped
 
   # ============ 数据平面：clouisled ==========
@@ -46,8 +46,10 @@ services:
     environment:
       - RUST_LOG=info
     volumes:
-      - *fc-volumes
-      - /opt/clouisle/images:/opt/clouisle/images
+      - *fc-kvm
+      - *fc-kernel
+      - *fc-rootfs
+      - *fc-image-cache
       - clouisled-data:/data
     restart: unless-stopped
 
@@ -56,6 +58,7 @@ services:
   postgres:
     image: postgres:16-alpine
     container_name: clouisle-postgres
+    network_mode: host
     environment:
       - POSTGRES_USER=clouisle
       - POSTGRES_PASSWORD=changeme

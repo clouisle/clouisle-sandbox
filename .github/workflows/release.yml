@@ -1,9 +1,8 @@
-# Release 发布工作流
+# Release workflow
 #
-# 触发：git tag v* 时自动构建并发布
-# 产出：GitHub Release（二进制 tarball）+ 多平台 Docker image
-#
-# 注意：GitHub Actions runner 无 /dev/kvm，不运行测试
+# Triggered by v* tags. The versioned OCI image is the only runtime artifact.
+# GitHub-hosted runners have no KVM, so this workflow does not run KVM tests.
+
 
 name: Release
 
@@ -23,24 +22,6 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v5
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
-      - name: Install dependencies
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq protobuf-compiler pkg-config libssl-dev
-      - name: Build release
-        run: cargo build --release -p clouisle-api -p clouislectl
-
-      # ============ 打包二进制 ============
-      - name: Package binaries
-        run: |
-          mkdir -p dist
-          cp target/release/clouisle-api dist/
-          cp target/release/clouislectl dist/
-          cp Dockerfile docker-compose.yml dist/
-          cp deploy/*.yaml dist/
-          cp README.md CHANGELOG.md dist/
-          tar czf clouisle-sandbox-${{ github.ref_name }}-linux-x86_64.tar.gz -C dist .
 
       # ============ Docker 多平台镜像 ============
       - name: Set up Docker Buildx
@@ -70,11 +51,8 @@ jobs:
           body: |
             ## Clouisle Sandbox ${{ github.ref_name }}
 
-            Release 包含：
-            - `clouisle-api` / `clouislectl` 二进制（linux-x86_64）
-            - Docker 多平台镜像（linux/amd64, linux/arm64）
-            - Docker Compose + K8s 部署清单
+            Runtime is delivered only as a multi-architecture OCI image:
+            `registry.cn-shanghai.aliyuncs.com/${{ secrets.ACR_NAMESPACE }}/clouisle-sandbox:${{ github.ref_name }}`.
 
-            端到端测试需在具有 `/dev/kvm` 的宿主机上执行（GitHub Actions 无 KVM）。
-          files: |
-            clouisle-sandbox-${{ github.ref_name }}-linux-x86_64.tar.gz
+            Deploy with Docker Compose or Kubernetes on a Linux host with `/dev/kvm`.
+            Native runtime binaries and archives are intentionally not published.

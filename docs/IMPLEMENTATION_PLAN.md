@@ -32,3 +32,11 @@ See `docs/plan/production-completeness.md` for the detailed design, contract, va
 5. [ ] 输出测试报告、缺陷清单和最终 PASS/FAIL 结论
 
 See `docs/plan/server-comprehensive-test-plan.md` for the complete test matrix and evidence requirements.
+
+## Container-only Runtime
+
+1. [x] Remove native runtime release artifacts
+2. [x] Replace native operator commands with Docker commands
+3. [x] Run Docker-only Python-and-Node KVM acceptance
+
+See `docs/plan/container-only-runtime.md` for the runtime boundary, implementation stages, validation, and rollback plan.

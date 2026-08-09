@@ -170,35 +170,38 @@ kubectl apply -f deploy/04-networkpolicy.yaml
 
 ## 快速开始
 
+### 运行时边界
+
+Clouisle 是**仅容器运行时**。不得在宿主机直接启动 `clouisle-api`、`clouisled`、`clouislectl`、Firecracker 或 guest agent。宿主机只提供 Docker、Linux KVM 和挂载的 guest 资源；所有 Clouisle 进程都在 Docker 容器或 Kubernetes Pod 内运行。
+
 ### 环境要求
 
 | 组件 | 要求 |
 |------|------|
-| 操作系统 | **Linux**（唯一支持的运行平台） |
+| 宿主机操作系统 | **Linux**（唯一支持的运行平台） |
+| 容器运行时 | Docker Engine + Docker Compose v2 |
 | 虚拟化 | `/dev/kvm` 可用（裸金属或嵌套虚拟化） |
-| Firecracker | v1.10.1（`/usr/local/bin/firecracker`） |
-| Rust | ≥ 1.85（edition 2024） |
+| Guest 资源 | 内核及 rootfs/cache 挂载在 `/opt/clouisle/` 下 |
 
-> macOS / Windows 仅可编译控制平面相关 crate（`clouisle-core`、`clouisle-store` 等），
-> `FirecrackerVmm` 通过 `#[cfg(target_os = "linux")]` 门控，非 Linux 平台不可用。
+Firecracker 与静态链接的 guest agent 都构建在 OCI 镜像中。Rust 只用于修改源码或 CI 检查，绝不用于运行时运维。
 
-### 使用 CLI（clouislectl）
+### 使用 CLI（在 Compose 容器内）
 
 ```bash
 # 健康检查
-cargo run -p clouislectl -- health
+docker compose exec apiserver clouislectl health
 
 # 创建沙盒 (1 vCPU / 256 MB)
-cargo run -p clouislectl -- create --image alpine:latest --vcpu 1 --memory-mb 256
+docker compose exec apiserver clouislectl create --image alpine:latest --vcpu 1 --memory-mb 256
 
 # 列出沙盒
-cargo run -p clouislectl -- list
+docker compose exec apiserver clouislectl list
 
 # 在 microVM 内执行命令
-cargo run -p clouislectl -- exec <sandbox-id> echo hello
+docker compose exec apiserver clouislectl exec <sandbox-id> echo hello
 
 # 删除沙盒
-cargo run -p clouislectl -- delete <sandbox-id>
+docker compose exec apiserver clouislectl delete <sandbox-id>
 ```
 
 ### 直接使用 HTTP API

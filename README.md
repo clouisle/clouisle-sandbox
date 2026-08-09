@@ -172,41 +172,38 @@ kubectl apply -f deploy/04-networkpolicy.yaml
 
 ## Quick Start
 
+### Runtime boundary
+
+Clouisle is a **container-only runtime**. Do not start `clouisle-api`, `clouisled`, `clouislectl`, Firecracker, or the guest agent as host processes. The host supplies Docker, Linux KVM, and mounted guest assets; all Clouisle processes run inside Docker containers or Kubernetes Pods.
+
 ### Requirements
 
 | Component | Requirement |
 |-----------|-------------|
-| OS | **Linux** (only supported runtime platform) |
+| Host OS | **Linux** (only supported runtime platform) |
+| Container runtime | Docker Engine with Docker Compose v2 |
 | Virtualization | `/dev/kvm` available (bare metal or nested virt) |
-| Firecracker | v1.10.1 (`/usr/local/bin/firecracker`) |
-| Rust | ≥ 1.85 (edition 2024) |
+| Guest assets | Kernel and rootfs/cache mounted beneath `/opt/clouisle/` |
 
-> macOS / Windows can only compile control-plane crates (`clouisle-core`, `clouisle-store`, etc.).
-> `FirecrackerVmm` is gated by `#[cfg(target_os = "linux")]`, unavailable on non-Linux.
+Firecracker and the statically linked guest agent are built into the OCI image. Rust is needed only to modify source or run CI checks, never to operate the runtime.
 
-### Build
-
-```bash
-cargo build --workspace
-```
-
-### CLI (clouislectl)
+### CLI (inside Compose)
 
 ```bash
 # Health check
-cargo run -p clouislectl -- health
+docker compose exec apiserver clouislectl health
 
 # Create sandbox (1 vCPU / 256 MB)
-cargo run -p clouislectl -- create --image alpine:latest --vcpu 1 --memory-mb 256
+docker compose exec apiserver clouislectl create --image alpine:latest --vcpu 1 --memory-mb 256
 
 # List sandboxes
-cargo run -p clouislectl -- list
+docker compose exec apiserver clouislectl list
 
 # Exec command in microVM
-cargo run -p clouislectl -- exec <sandbox-id> echo hello
+docker compose exec apiserver clouislectl exec <sandbox-id> echo hello
 
 # Delete sandbox
-cargo run -p clouislectl -- delete <sandbox-id>
+docker compose exec apiserver clouislectl delete <sandbox-id>
 ```
 
 ### Direct HTTP API
