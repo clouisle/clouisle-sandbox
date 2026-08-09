@@ -127,6 +127,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             store,
             vmm,
             pool,
+            image_jobs: Arc::new(clouisle_api::ImageJobRegistry::new()),
             reservations,
             manage_resources,
             agent: agent_conn,

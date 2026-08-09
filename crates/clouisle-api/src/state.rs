@@ -3,16 +3,50 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use clouisle_core::Resources;
+use serde::Serialize;
+use clouisle_core::{ImageRef, Resources};
 use clouisle_scheduler::ResourcePool;
 use clouisle_store::Store;
 use clouisle_vmm::Vmm;
-
 use crate::agent::AgentConnector;
 use crate::auth::Authenticator;
 
 #[cfg(target_os = "linux")]
 use clouisle_net::FirewallManager;
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ImagePrefetchJob {
+    pub job_id: String,
+    pub image: ImageRef,
+    pub status: String,
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Default)]
+pub struct ImageJobRegistry {
+    jobs: Arc<tokio::sync::RwLock<HashMap<String, ImagePrefetchJob>>>,
+}
+
+impl ImageJobRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub async fn insert(&self, job: ImagePrefetchJob) {
+        self.jobs.write().await.insert(job.job_id.clone(), job);
+    }
+
+    pub async fn update(&self, id: &str, status: &str, error: Option<String>) {
+        if let Some(job) = self.jobs.write().await.get_mut(id) {
+            job.status = status.to_string();
+            job.error = error;
+        }
+    }
+
+    pub async fn get(&self, id: &str) -> Option<ImagePrefetchJob> {
+        self.jobs.read().await.get(id).cloned()
+    }
+}
 
 /// 应用状态（所有 handler 共享）。
 #[derive(Clone)]
@@ -29,6 +63,8 @@ pub struct AppState {
     #[cfg(target_os = "linux")]
     pub firewall: Arc<FirewallManager>,
     /// Production owns netns/TAP lifecycle; HTTP test fixtures disable it.
+    /// Asynchronous image pulls share one observable in-memory job registry.
+    pub image_jobs: Arc<ImageJobRegistry>,
     #[cfg(target_os = "linux")]
     pub manage_network: bool,
     /// 服务版本

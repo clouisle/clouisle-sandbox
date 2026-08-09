@@ -22,6 +22,15 @@ pub fn build_router(state: AppState) -> Router {
             "/api/v1/sandboxes/{id}",
             delete(handlers::sandbox::delete_sandbox),
         )
+        // Asynchronous OCI image preparation.
+        .route(
+            "/api/v1/images/prefetch",
+            post(handlers::images::prefetch_images),
+        )
+        .route(
+            "/api/v1/images/prefetch/{job_id}",
+            get(handlers::images::get_prefetch_job),
+        )
         // 命令执行
         .route(
             "/api/v1/sandboxes/{id}/exec",

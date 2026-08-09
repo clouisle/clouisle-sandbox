@@ -111,6 +111,7 @@ fn test_state() -> AppState {
         vmm,
         pool,
         reservations: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+        image_jobs: Arc::new(clouisle_api::ImageJobRegistry::new()),
         manage_resources: true,
         agent: agent_conn,
         auth: Arc::new(auth::Authenticator::new()),
