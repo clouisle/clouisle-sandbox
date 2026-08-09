@@ -52,6 +52,9 @@ pub fn build_router(state: AppState) -> Router {
             "/api/v1/sandboxes/{id}/files/ls",
             get(handlers::files::list_files),
         )
+        // Authenticated node registry and heartbeat lease updates.
+        .route("/api/v1/nodes", post(handlers::nodes::upsert_node))
+        .route("/api/v1/nodes", get(handlers::nodes::list_ready_nodes))
         // 可观测性
         .route("/health", get(handlers::health::health))
         .route("/health/live", get(handlers::health::liveness))

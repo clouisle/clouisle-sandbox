@@ -4,12 +4,11 @@
 //! 每个资源维度独立 Semaphore，admit 时 acquire 所有维度，
 //! Reservation 持有 permits，drop 时自动归还。
 
-use std::sync::Arc;
-
-use tokio::sync::{Mutex, Semaphore};
+use std::sync::{Arc, Mutex};
 
 use clouisle_core::error::{ClouisleError, Result};
 use clouisle_core::{Resources, SandboxSpec};
+use tokio::sync::Semaphore;
 
 /// 资源池：原子检查 + 基于 Semaphore 的 RAII 预留。
 #[derive(Debug, Clone)]
@@ -39,34 +38,6 @@ impl ResourcePool {
             max_sandboxes: Arc::new(Semaphore::new(max_sandboxes)),
             tracking: Arc::new(Mutex::new(Allocated::default())),
             capacity,
-        }
-    }
-
-    /// 从 store 恢复：把已运行沙盒的预留加回去（重启恢复）。
-    pub async fn restore(&self, running: &[SandboxSpec]) {
-        for spec in running {
-            let r = &spec.resources;
-            let acquired = self
-                .vcpu_sem
-                .clone()
-                .try_acquire_many_owned(r.vcpu as u32)
-                .and_then(|v| {
-                    let m = self.mem_sem.clone().try_acquire_many_owned(r.memory_mb);
-                    m.map(|m| (v, m))
-                });
-            if let Ok((v, m)) = acquired
-                && let Ok(d) = self.disk_sem.clone().try_acquire_many_owned(r.disk_mb)
-            {
-                // 永久消耗（restore 的沙盒是已运行的，不能归还）
-                v.forget();
-                m.forget();
-                d.forget();
-                let mut t = self.tracking.lock().await;
-                t.vcpu += r.vcpu;
-                t.memory_mb += r.memory_mb;
-                t.disk_mb += r.disk_mb;
-                t.count += 1;
-            }
         }
     }
 
@@ -119,12 +90,14 @@ impl ResourcePool {
             }
         };
 
-        let mut t = self.tracking.lock().await;
+        let mut t = self
+            .tracking
+            .lock()
+            .expect("resource tracking lock poisoned");
         t.vcpu += r.vcpu;
         t.memory_mb += r.memory_mb;
         t.disk_mb += r.disk_mb;
         t.count += 1;
-        drop(t);
 
         Ok(Reservation {
             _sandbox: sb_perm,
@@ -150,7 +123,10 @@ impl ResourcePool {
 
     /// 当前已预留资源。
     pub async fn reserved(&self) -> Resources {
-        let t = self.tracking.lock().await;
+        let t = self
+            .tracking
+            .lock()
+            .expect("resource tracking lock poisoned");
         Resources {
             vcpu: t.vcpu,
             memory_mb: t.memory_mb,
@@ -165,21 +141,6 @@ impl ResourcePool {
     pub fn capacity(&self) -> Resources {
         self.capacity.clone()
     }
-
-    /// 显式释放 resources 的预留（用于 delete 路径）。
-    /// 注意：正常情况下 Reservation RAII 自动释放；此方法供 vector 场景。
-    pub async fn release(&self, spec: &SandboxSpec) {
-        let r = &spec.resources;
-        // 增加 semaphore 可用量（修复 permit 计数）
-        // 注意：Semaphore 不提供 add_permits 接口；此方法为占位。
-        // 实际方案：Reservation 持有 permit 直到沙盒真正删除时 drop。
-        tracing::debug!(
-            vcpu = r.vcpu,
-            mem = r.memory_mb,
-            disk = r.disk_mb,
-            "releasing resources (notification only)"
-        );
-    }
 }
 
 /// RAII 预留：持有 Semaphore permit，drop 时自动归还并更新 tracking。
@@ -189,15 +150,20 @@ pub struct Reservation {
     _vcpu: tokio::sync::OwnedSemaphorePermit,
     _mem: tokio::sync::OwnedSemaphorePermit,
     _disk: tokio::sync::OwnedSemaphorePermit,
-    #[allow(dead_code)]
     tracking: Arc<Mutex<Allocated>>,
     resources: Resources,
 }
 
 impl Drop for Reservation {
     fn drop(&mut self) {
-        // Semaphore permit 自动归还（成员 drop 时）。
-        // tracking 仅为查询用途，一致性由 semaphore 保证。
+        let mut tracking = self
+            .tracking
+            .lock()
+            .expect("resource tracking lock poisoned");
+        tracking.vcpu = tracking.vcpu.saturating_sub(self.resources.vcpu);
+        tracking.memory_mb = tracking.memory_mb.saturating_sub(self.resources.memory_mb);
+        tracking.disk_mb = tracking.disk_mb.saturating_sub(self.resources.disk_mb);
+        tracking.count = tracking.count.saturating_sub(1);
     }
 }
 
@@ -311,12 +277,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn restore_reclaims() {
+    async fn restored_reservations_remain_held() {
         let pool = ResourcePool::new(capacity(), 200);
-        let running = vec![spec(4, 1024, 2048), spec(2, 512, 1024)];
-        pool.restore(&running).await;
+        let running = [spec(4, 1024, 2048), spec(2, 512, 1024)];
+        let _reservations = [
+            pool.admit(&running[0]).await.unwrap(),
+            pool.admit(&running[1]).await.unwrap(),
+        ];
         let avail = pool.available().await;
-        assert_eq!(avail.vcpu, 44, "restore should consume 6 vcpu");
+        assert_eq!(avail.vcpu, 44, "held reservations should consume 6 vcpu");
+    }
+
+    #[tokio::test]
+    async fn drop_releases_permits_and_tracking() {
+        let pool = ResourcePool::new(capacity(), 200);
+        let reservation = pool.admit(&spec(4, 1024, 2048)).await.unwrap();
+        assert_eq!(pool.reserved().await.vcpu, 4);
+        drop(reservation);
+        assert_eq!(pool.available().await.vcpu, 50);
+        assert_eq!(pool.reserved().await.vcpu, 0);
     }
 
     #[tokio::test]

@@ -54,17 +54,40 @@ impl Principal {
 }
 
 /// 认证器：API key → Principal。
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct Authenticator {
     keys: Arc<RwLock<HashMap<String, Principal>>>,
+    allow_anonymous_dev: bool,
+}
+
+impl Default for Authenticator {
+    fn default() -> Self {
+        Self {
+            keys: Arc::new(RwLock::new(HashMap::new())),
+            allow_anonymous_dev: true,
+        }
+    }
 }
 
 impl Authenticator {
+    /// Test/development authenticator; production must use `new_production`.
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// 是否为空（无注册 key → dev 模式）。
+    /// Fail-closed authenticator for deployed control planes.
+    pub fn new_production() -> Self {
+        Self {
+            keys: Arc::new(RwLock::new(HashMap::new())),
+            allow_anonymous_dev: false,
+        }
+    }
+
+    pub fn allows_anonymous_dev(&self) -> bool {
+        self.allow_anonymous_dev
+    }
+
+    /// 是否为空（无注册 key）。
     pub async fn is_empty(&self) -> bool {
         self.keys.read().await.is_empty()
     }
@@ -79,6 +102,22 @@ impl Authenticator {
                 scope,
             },
         );
+    }
+
+    /// Verify that the authenticated principal owns the sandbox.
+    pub fn require_tenant(
+        &self,
+        principal: &Principal,
+        sandbox: &clouisle_core::Sandbox,
+    ) -> Result<(), ClouisleError> {
+        if sandbox.spec.tenant_id.as_deref() == Some(principal.tenant_id.as_str()) {
+            Ok(())
+        } else {
+            Err(ClouisleError::new(
+                ErrorKind::NotFound,
+                format!("sandbox {} not found", sandbox.id),
+            ))
+        }
     }
 
     /// 校验 Authorization header。

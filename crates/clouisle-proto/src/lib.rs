@@ -46,6 +46,8 @@ pub enum Frame {
         mode: u32,
         content: Bytes,
     },
+    /// guest -> host: 写文件结果。
+    WriteFileResult { path: String },
     /// 文件传输：读文件。
     ReadFile {
         path: String,
@@ -244,6 +246,9 @@ mod tests {
         roundtrip(&Frame::Error {
             message: "not found".into(),
             code: 404,
+        });
+        roundtrip(&Frame::WriteFileResult {
+            path: "/work/a.txt".into(),
         });
         roundtrip(&Frame::SetSecret {
             name: "key".into(),

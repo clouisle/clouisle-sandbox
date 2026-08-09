@@ -22,6 +22,8 @@ export interface Resources {
   bandwidth_mbps?: number;
   /** Disk IOPS cap */
   iops?: number;
+  /** Maximum guest process count. */
+  pids_max?: number;
 }
 
 /** Network configuration. */
@@ -32,6 +34,22 @@ export interface NetworkConfig {
   allow_egress: string[];
 }
 
+/** Host mount requested for a sandbox. */
+export interface MountSpec {
+  source: string;
+  target: string;
+  readonly: boolean;
+}
+
+/** Secret materialized as /run/secrets/<name>. */
+export interface SecretSpec {
+  name: string;
+  value: string;
+}
+
+/** Restart behavior after an unexpected sandbox failure. */
+export type RestartPolicy = "never" | "on_failure" | "always";
+
 /** Spec for creating a sandbox. */
 export interface SandboxSpec {
   /** Image reference */
@@ -40,14 +58,22 @@ export interface SandboxSpec {
   resources?: Resources;
   /** Network config */
   network?: NetworkConfig;
-  /** Environment variables */
-  env?: Record<string, string>;
+  /** Initial host mounts. */
+  mounts?: MountSpec[];
+  /** Initial guest secrets. Values are redacted in responses. */
+  secrets?: SecretSpec[];
   /** Sandbox TTL in seconds (force destroy on expiry) */
   ttl_secs?: number;
   /** Start timeout in seconds */
   start_timeout_secs?: number;
-  /** Restart policy: "never" | "on_failure" | "always" */
-  restart_policy?: string;
+  /** Environment variables */
+  env?: Record<string, string>;
+  /** Required node labels. */
+  node_selector?: Record<string, string>;
+  /** Restart policy. */
+  restart_policy?: RestartPolicy;
+  /** Tenant is overwritten by authenticated server identity. */
+  tenant_id?: string;
 }
 
 /** VMM runtime metadata. */
@@ -129,29 +155,32 @@ export interface ExecResult {
   stderr_truncated: boolean;
 }
 
+/** One ordered server-sent execution event. */
+export interface ExecStreamEvent {
+  event: "stdout" | "stderr" | "exit" | "error";
+  data: string;
+}
+
 /** Persisted execution record. */
 export interface ExecutionRecord {
-  /** Execution record ID */
+  /** Execution record ID. */
   id: string;
-  /** Owning sandbox ID */
+  /** Owning sandbox ID. */
   sandbox_id: string;
-  /** Process exit code */
+  /** Process exit code. */
   exit_code: number;
-  /** Standard output */
-  stdout: string;
-  /** Standard error */
-  stderr: string;
-  /** ISO8601 start timestamp */
+  /** Raw stdout bytes as emitted by the API. */
+  stdout: number[];
+  /** Raw stderr bytes as emitted by the API. */
+  stderr: number[];
+  /** ISO8601 start timestamp. */
   started_at: string;
-  /** ISO8601 finish timestamp */
+  /** ISO8601 finish timestamp. */
   finished_at: string;
-  /** Whether timed out */
   timed_out: boolean;
-  /** Whether stdout was truncated */
   stdout_truncated: boolean;
-  /** Whether stderr was truncated */
   stderr_truncated: boolean;
-  /** Executing node ID */
+  /** Executing node ID. */
   node_id?: string;
 }
 
@@ -185,6 +214,16 @@ export interface HealthResponse {
   status: string;
   store: string;
   version: string;
+}
+
+/** Liveness or readiness response. */
+export interface StatusResponse {
+  status: string;
+}
+
+/** Successful file upload response. */
+export interface UploadResponse {
+  ok: boolean;
 }
 
 /** API error payload. */

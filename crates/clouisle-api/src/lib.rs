@@ -7,6 +7,7 @@ pub mod handlers;
 pub mod metrics;
 pub mod middleware;
 pub mod middleware_auth;
+pub mod node_client;
 pub mod router;
 pub mod state;
 

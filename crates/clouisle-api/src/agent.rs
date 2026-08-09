@@ -4,6 +4,8 @@ use async_trait::async_trait;
 
 #[cfg(any(test, feature = "test-utils", target_os = "linux"))]
 use clouisle_core::ClouisleError;
+#[cfg(target_os = "linux")]
+use clouisle_core::ErrorKind;
 use clouisle_core::Result;
 use clouisle_vmm::VmHandle;
 
@@ -18,6 +20,14 @@ pub trait AgentConnector: Send + Sync {
     ) -> Result<Box<dyn AgentConnection>>;
 }
 
+/// Incremental command output forwarded to HTTP SSE or node gRPC clients.
+#[derive(Debug)]
+pub enum ExecStreamEvent {
+    Stdout(bytes::Bytes),
+    Stderr(bytes::Bytes),
+    Exit(i32),
+    Error(String),
+}
 /// 一次已建立的 agent 连接（用于 exec / ping / 文件传输）。
 #[async_trait]
 pub trait AgentConnection: Send + Sync {
@@ -31,6 +41,26 @@ pub trait AgentConnection: Send + Sync {
         cwd: Option<String>,
         timeout_ms: u64,
     ) -> Result<clouisle_core::execution::ExecutionResult>;
+
+    /// Execute while yielding guest output chunks in arrival order.
+    async fn exec_stream(
+        &self,
+        argv: Vec<String>,
+        env: std::collections::HashMap<String, String>,
+        cwd: Option<String>,
+        timeout_ms: u64,
+        events: tokio::sync::mpsc::Sender<ExecStreamEvent>,
+    ) -> Result<()> {
+        let result = self.exec(argv, env, cwd, timeout_ms).await?;
+        if !result.stdout.is_empty() {
+            let _ = events.send(ExecStreamEvent::Stdout(result.stdout)).await;
+        }
+        if !result.stderr.is_empty() {
+            let _ = events.send(ExecStreamEvent::Stderr(result.stderr)).await;
+        }
+        let _ = events.send(ExecStreamEvent::Exit(result.exit_code)).await;
+        Ok(())
+    }
 
     /// 写文件（FR-07）。
     async fn write_file(&self, path: &str, content: bytes::Bytes, mode: u32) -> Result<()>;
@@ -412,9 +442,9 @@ impl AgentConnector for VsockAgentConnector {
                             ClouisleError::io(format!("read Hello response from guest: {e}"))
                         })?;
                     if !matches!(resp, Frame::Hello { .. }) {
-                        return Err(ClouisleError::invalid_state(format!(
-                            "expected Hello from guest, got unexpected frame"
-                        )));
+                        return Err(ClouisleError::invalid_state(
+                            "expected Hello from guest, got unexpected frame",
+                        ));
                     }
                     return Ok(Box::new(conn));
                 }
@@ -454,9 +484,40 @@ impl AgentConnection for VsockFrameConnection {
         cwd: Option<String>,
         timeout_ms: u64,
     ) -> Result<clouisle_core::execution::ExecutionResult> {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4_096);
+        let started = std::time::Instant::now();
+        self.exec_stream(argv, env, cwd, timeout_ms, tx).await?;
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut exit_code = -1;
+        while let Some(event) = rx.recv().await {
+            match event {
+                ExecStreamEvent::Stdout(chunk) => stdout.extend_from_slice(&chunk),
+                ExecStreamEvent::Stderr(chunk) => stderr.extend_from_slice(&chunk),
+                ExecStreamEvent::Exit(code) => exit_code = code,
+                ExecStreamEvent::Error(message) => {
+                    return Err(ClouisleError::new(ErrorKind::Vmm, message));
+                }
+            }
+        }
+        Ok(clouisle_core::execution::ExecutionResult {
+            exit_code,
+            stdout: bytes::Bytes::from(stdout),
+            stderr: bytes::Bytes::from(stderr),
+            duration_ms: started.elapsed().as_millis() as u64,
+        })
+    }
+
+    async fn exec_stream(
+        &self,
+        argv: Vec<String>,
+        env: std::collections::HashMap<String, String>,
+        cwd: Option<String>,
+        timeout_ms: u64,
+        events: tokio::sync::mpsc::Sender<ExecStreamEvent>,
+    ) -> Result<()> {
         use clouisle_proto::Frame;
         use clouisle_proto::codec::{read_frame, write_frame};
-
         let id = uuid::Uuid::now_v7().to_string();
         write_frame(
             &mut *self.stream.lock().await,
@@ -469,48 +530,44 @@ impl AgentConnection for VsockFrameConnection {
             },
         )
         .await
-        .map_err(|e| ClouisleError::io(format!("send ExecReq: {e}")))?;
-
-        let start = std::time::Instant::now();
-        let mut stdout = Vec::new();
-        let mut stderr = Vec::new();
-        let exit_code = loop {
+        .map_err(|error| ClouisleError::io(format!("send streamed ExecReq: {error}")))?;
+        loop {
             let frame = read_frame(&mut *self.stream.lock().await)
                 .await
-                .map_err(|e| ClouisleError::io(format!("read exec response: {e}")))?;
-            match frame {
-                Frame::Stdout { id: fid, chunk, .. } if fid == id => {
-                    stdout.extend_from_slice(&chunk)
+                .map_err(|error| {
+                    ClouisleError::io(format!("read streamed exec response: {error}"))
+                })?;
+            let event = match frame {
+                Frame::Stdout {
+                    id: frame_id,
+                    chunk,
+                } if frame_id == id => ExecStreamEvent::Stdout(chunk),
+                Frame::Stderr {
+                    id: frame_id,
+                    chunk,
+                } if frame_id == id => ExecStreamEvent::Stderr(chunk),
+                Frame::Exited { id: frame_id, code } if frame_id == id => {
+                    let _ = events.send(ExecStreamEvent::Exit(code)).await;
+                    return Ok(());
                 }
-                Frame::Stderr { id: fid, chunk, .. } if fid == id => {
-                    stderr.extend_from_slice(&chunk)
-                }
-                Frame::Exited { id: fid, code } if fid == id => break code,
                 Frame::Error { message, .. } => {
-                    return Err(ClouisleError::new(
-                        clouisle_core::ErrorKind::Vmm,
-                        format!("guest exec error: {message}"),
+                    return Err(ClouisleError::new(ErrorKind::Vmm, message));
+                }
+                _ => {
+                    return Err(ClouisleError::invalid_state(
+                        "unexpected streamed guest frame",
                     ));
                 }
-                other => {
-                    return Err(ClouisleError::invalid_state(format!(
-                        "unexpected frame during exec: {other:?}"
-                    )));
-                }
+            };
+            if events.send(event).await.is_err() {
+                return Ok(());
             }
-        };
-
-        Ok(clouisle_core::execution::ExecutionResult {
-            exit_code,
-            stdout: bytes::Bytes::from(stdout),
-            stderr: bytes::Bytes::from(stderr),
-            duration_ms: start.elapsed().as_millis() as u64,
-        })
+        }
     }
 
     async fn write_file(&self, path: &str, content: bytes::Bytes, mode: u32) -> Result<()> {
         use clouisle_proto::Frame;
-        use clouisle_proto::codec::write_frame;
+        use clouisle_proto::codec::{read_frame, write_frame};
 
         write_frame(
             &mut *self.stream.lock().await,
@@ -523,8 +580,18 @@ impl AgentConnection for VsockFrameConnection {
         .await
         .map_err(|e| ClouisleError::io(format!("send WriteFile {path}: {e}")))?;
 
-        // WriteFile 为 fire-and-forget：guest 不返回响应帧。
-        Ok(())
+        match read_frame(&mut *self.stream.lock().await)
+            .await
+            .map_err(|e| ClouisleError::io(format!("read WriteFile response {path}: {e}")))?
+        {
+            Frame::WriteFileResult { .. } => Ok(()),
+            Frame::Error { message, .. } => Err(ClouisleError::io(format!(
+                "guest write_file {path}: {message}"
+            ))),
+            other => Err(ClouisleError::invalid_state(format!(
+                "unexpected frame for WriteFile: {other:?}"
+            ))),
+        }
     }
 
     async fn read_file(&self, path: &str) -> Result<bytes::Bytes> {

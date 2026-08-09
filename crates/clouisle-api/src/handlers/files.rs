@@ -2,13 +2,14 @@
 
 use axum::Json;
 use axum::body::Bytes;
-use axum::extract::{Path, Query, State};
+use axum::extract::{Extension, Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use serde::{Deserialize, Serialize};
 
 use clouisle_core::ClouisleError;
 
+use crate::auth::Principal;
 use crate::handlers::exec::meta_to_handle;
 use crate::state::AppState;
 
@@ -29,8 +30,10 @@ pub const MAX_UPLOAD_BYTES: usize = 50 * 1024 * 1024;
 async fn get_conn(
     state: &AppState,
     sandbox_id: &str,
+    principal: &Principal,
 ) -> Result<Box<dyn crate::agent::AgentConnection>, ClouisleError> {
     let sb = state.store.get_sandbox(sandbox_id).await?;
+    state.auth.require_tenant(principal, &sb)?;
     if !sb.is_executable() {
         return Err(ClouisleError::invalid_state(format!(
             "sandbox {sandbox_id} is not running (status={})",
@@ -42,8 +45,16 @@ async fn get_conn(
 }
 
 fn validate_path(path: &str) -> Result<(), ClouisleError> {
+    use std::path::Component;
+
     if path.is_empty() {
         return Err(ClouisleError::validation("path is required"));
+    }
+    if std::path::Path::new(path)
+        .components()
+        .any(|component| matches!(component, Component::ParentDir | Component::Prefix(_)))
+    {
+        return Err(ClouisleError::validation("path traversal is not allowed"));
     }
     Ok(())
 }
@@ -51,6 +62,7 @@ fn validate_path(path: &str) -> Result<(), ClouisleError> {
 /// `POST .../files/upload?path=/work/file.txt` — body 为原始字节。
 pub async fn upload_file(
     State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
     Path(sandbox_id): Path<String>,
     Query(q): Query<FsQuery>,
     body: Bytes,
@@ -61,7 +73,7 @@ pub async fn upload_file(
             "upload exceeds {MAX_UPLOAD_BYTES} bytes"
         ))));
     }
-    let conn = get_conn(&state, &sandbox_id)
+    let conn = get_conn(&state, &sandbox_id, &principal)
         .await
         .map_err(crate::error::ApiError)?;
     conn.write_file(&q.path, body, 0o644)
@@ -73,11 +85,12 @@ pub async fn upload_file(
 /// `GET .../files/download?path=/work/output.txt`
 pub async fn download_file(
     State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
     Path(sandbox_id): Path<String>,
     Query(q): Query<FsQuery>,
 ) -> Result<impl IntoResponse, crate::error::ApiError> {
     validate_path(&q.path).map_err(crate::error::ApiError)?;
-    let conn = get_conn(&state, &sandbox_id)
+    let conn = get_conn(&state, &sandbox_id, &principal)
         .await
         .map_err(crate::error::ApiError)?;
     let data = conn
@@ -103,11 +116,12 @@ pub async fn download_file(
 /// `GET .../files/ls?path=/work`
 pub async fn list_files(
     State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
     Path(sandbox_id): Path<String>,
     Query(q): Query<FsQuery>,
 ) -> Result<Json<LsResponse>, crate::error::ApiError> {
     validate_path(&q.path).map_err(crate::error::ApiError)?;
-    let conn = get_conn(&state, &sandbox_id)
+    let conn = get_conn(&state, &sandbox_id, &principal)
         .await
         .map_err(crate::error::ApiError)?;
     let entries = conn

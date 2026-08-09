@@ -10,6 +10,19 @@
 
 See `docs/plan/production-ready.md` for details.
 
+## Production Completeness
+
+1. [ ] Create executable production topology
+2. [ ] Enforce authentication and tenant authorization
+3. [ ] Connect OCI image build pipeline
+4. [ ] Complete snapshot restore lifecycle
+5. [ ] Implement real gRPC scheduling path
+6. [ ] Replace mock streaming behavior
+7. [ ] Validate deployment manifests
+8. [ ] Run production acceptance suite
+
+See `docs/plan/production-completeness.md` for the detailed design, contract, validation matrix, risks, and rollback plan.
+
 ## 服务器全量验收测试
 
 1. [x] 盘点当前 HTTP、CLI、SDK、gRPC、VMM、网络和存储功能

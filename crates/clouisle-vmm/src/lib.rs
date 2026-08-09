@@ -96,8 +96,13 @@ pub trait Vmm: Send + Sync {
     /// 创建快照。
     async fn snapshot(&self, h: &VmHandle, kind: SnapshotKind, out: &SnapshotPaths) -> Result<()>;
 
-    /// 从快照恢复。
-    async fn restore(&self, spec: &SandboxSpec, from: &SnapshotPaths) -> Result<VmHandle>;
+    /// 从快照恢复到由调用方预先创建网络隔离的 sandbox ID。
+    async fn restore(
+        &self,
+        sandbox_id: &str,
+        spec: &SandboxSpec,
+        from: &SnapshotPaths,
+    ) -> Result<VmHandle>;
 
     /// 停止。
     async fn stop(&self, h: &VmHandle, mode: StopMode) -> Result<()>;

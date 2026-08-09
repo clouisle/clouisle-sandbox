@@ -30,6 +30,8 @@ pub struct NodeAgentConfig {
     pub kernel_version: String,
     pub firecracker_version: String,
     pub labels: HashMap<String, String>,
+    /// Whether this node owns netns/TAP/firewall lifecycle for its sandboxes.
+    pub manage_network: bool,
     /// 心跳周期（秒）
     pub heartbeat_secs: u64,
 }
@@ -50,16 +52,25 @@ impl NodeAgentConfig {
     }
 }
 
+/// Guest command output emitted in arrival order for gRPC forwarding.
+#[cfg(target_os = "linux")]
+pub enum NodeExecEvent {
+    Stdout(bytes::Bytes),
+    Stderr(bytes::Bytes),
+    Exit(i32),
+}
+
 /// 节点代理。持有本机所有沙盒 handle 与资源池。
 #[derive(Clone)]
 pub struct NodeAgent {
     pub config: NodeAgentConfig,
     pub vmm: Arc<dyn Vmm>,
     pub pool: Arc<ResourcePool>,
-    /// 本机沙盒（id → sandbox）
+    /// 本机沙盒（id → sandbox）。
     pub sandboxes: Arc<RwLock<HashMap<String, Sandbox>>>,
-    /// 活跃沙盒的 reservation（防止 RAII 释放）
     reservations: Arc<tokio::sync::Mutex<HashMap<String, clouisle_scheduler::Reservation>>>,
+    #[cfg(target_os = "linux")]
+    firewall: Option<Arc<clouisle_net::FirewallManager>>,
 }
 
 impl NodeAgent {
@@ -72,11 +83,15 @@ impl NodeAgent {
         };
         let pool = Arc::new(ResourcePool::new(capacity, 200));
         Self {
-            config,
+            config: config.clone(),
             vmm,
             pool,
             sandboxes: Arc::new(RwLock::new(HashMap::new())),
             reservations: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            #[cfg(target_os = "linux")]
+            firewall: config
+                .manage_network
+                .then(|| Arc::new(clouisle_net::FirewallManager::new())),
         }
     }
 
@@ -105,31 +120,57 @@ impl NodeAgent {
         }
     }
 
-    /// 在本机创建沙盒（admit → vmm.create → start → 等 ready）。
+    /// Create a sandbox using a control-plane assigned ID.
     pub async fn create_sandbox(
         &self,
         spec: SandboxSpec,
         store: &dyn Store,
     ) -> Result<Sandbox, ClouisleError> {
-        // 准入
-        let reservation = self.pool.admit(&spec).await?;
+        self.create_sandbox_with_id(uuid::Uuid::now_v7().to_string(), spec, store)
+            .await
+    }
 
-        let id = uuid::Uuid::now_v7().to_string();
+    /// In cluster mode the API supplies this ID before forwarding the create
+    /// request, keeping API metadata, node state, and VMM handles aligned.
+    pub async fn create_sandbox_with_id(
+        &self,
+        id: String,
+        spec: SandboxSpec,
+        store: &dyn Store,
+    ) -> Result<Sandbox, ClouisleError> {
+        if id.is_empty() {
+            return Err(ClouisleError::validation("sandbox id is required"));
+        }
+        let reservation = self.pool.admit(&spec).await?;
         let mut sandbox = Sandbox::new(id.clone(), spec);
         sandbox.node_id = Some(self.config.node_id.clone());
         sandbox.transition(SandboxEvent::Start)?;
-        store.create_sandbox(&sandbox).await?;
 
-        // VMM
+        store.create_sandbox(&sandbox).await?;
+        #[cfg(target_os = "linux")]
+        if let Some(firewall) = &self.firewall
+            && let Err(error) = firewall.create_network(&id).await
+        {
+            store
+                .update_sandbox_status(&id, &SandboxStatus::Error)
+                .await
+                .ok();
+            return Err(error);
+        }
+
         let handle = match self.vmm.create(&id, &sandbox.spec).await {
-            Ok(h) => h,
-            Err(e) => {
+            Ok(handle) => handle,
+            Err(error) => {
                 sandbox.transition(SandboxEvent::Failed).ok();
                 store
                     .update_sandbox_status(&id, &SandboxStatus::Error)
                     .await
                     .ok();
-                return Err(e);
+                #[cfg(target_os = "linux")]
+                if let Some(firewall) = &self.firewall {
+                    let _ = firewall.teardown_sandbox_network(&id).await;
+                }
+                return Err(error);
             }
         };
         sandbox.vmm_meta = clouisle_core::VmmMeta {
@@ -142,27 +183,50 @@ impl NodeAgent {
             extra: Default::default(),
         };
 
-        if let Err(e) = self.vmm.start(&handle).await {
+        if let Err(error) = self.vmm.start(&handle).await {
             sandbox.transition(SandboxEvent::Failed).ok();
             store
                 .update_sandbox_status(&id, &SandboxStatus::Error)
                 .await
                 .ok();
-            return Err(e);
+            let _ = self.vmm.stop(&handle, StopMode::Force).await;
+            #[cfg(target_os = "linux")]
+            if let Some(firewall) = &self.firewall {
+                let _ = firewall.teardown_sandbox_network(&id).await;
+            }
+            return Err(error);
+        }
+
+        #[cfg(target_os = "linux")]
+        if let Some(firewall) = &self.firewall {
+            let gateway = format!("{}/30", clouisle_net::netns::gateway_ip(&id));
+            let allow = if sandbox.spec.network.enabled {
+                sandbox.spec.network.allow_egress.clone()
+            } else {
+                Vec::new()
+            };
+            if let Err(error) = firewall.setup_sandbox_network(&id, &gateway, &allow).await {
+                sandbox.transition(SandboxEvent::Failed).ok();
+                store
+                    .update_sandbox_status(&id, &SandboxStatus::Error)
+                    .await
+                    .ok();
+                let _ = self.vmm.stop(&handle, StopMode::Force).await;
+                let _ = firewall.teardown_sandbox_network(&id).await;
+                return Err(error);
+            }
         }
         sandbox.transition(SandboxEvent::AgentHello)?;
         store
             .update_sandbox_status(&id, &SandboxStatus::Running)
             .await?;
+        store.update_sandbox_expiry(&id, sandbox.expires_at).await?;
 
         self.sandboxes
             .write()
             .await
             .insert(id.clone(), sandbox.clone());
-        self.reservations
-            .lock()
-            .await
-            .insert(id.clone(), reservation);
+        self.reservations.lock().await.insert(id, reservation);
         Ok(sandbox)
     }
 
@@ -196,10 +260,81 @@ impl NodeAgent {
         store.delete_sandbox(id).await?;
         self.sandboxes.write().await.remove(id);
         self.reservations.lock().await.remove(id);
+        #[cfg(target_os = "linux")]
+        if let Some(firewall) = &self.firewall
+            && let Err(error) = firewall.teardown_sandbox_network(id).await
+        {
+            tracing::warn!(sandbox_id = id, error = %error, "network teardown failed");
+        }
         Ok(())
     }
 
-    /// 通过 agent 执行命令（gRPC 转发用）。
+    #[cfg(target_os = "linux")]
+    pub async fn file_op(
+        &self,
+        sandbox_id: &str,
+        request: clouisle_proto::Frame,
+    ) -> Result<clouisle_proto::Frame, ClouisleError> {
+        use clouisle_proto::codec::{read_frame, write_frame};
+        let sandbox = self
+            .sandboxes
+            .read()
+            .await
+            .get(sandbox_id)
+            .cloned()
+            .ok_or_else(|| {
+                ClouisleError::not_found(format!("sandbox {sandbox_id} not on this node"))
+            })?;
+        if !sandbox.is_executable() {
+            return Err(ClouisleError::invalid_state(format!(
+                "sandbox {sandbox_id} is not running (status={})",
+                sandbox.status
+            )));
+        }
+        let address = format!("{}:5201", clouisle_net::netns::guest_ip(sandbox_id))
+            .parse::<std::net::SocketAddr>()
+            .map_err(|error| ClouisleError::io(format!("invalid guest address: {error}")))?;
+        let stream = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            tokio::net::TcpStream::connect(address),
+        )
+        .await
+        .map_err(|_| ClouisleError::timeout("guest agent connect timed out"))?
+        .map_err(|error| ClouisleError::io(format!("connect guest agent: {error}")))?;
+        let mut stream = tokio::io::BufStream::new(stream);
+        write_frame(
+            &mut stream,
+            &clouisle_proto::Frame::Hello {
+                agent_version: env!("CARGO_PKG_VERSION").to_string(),
+            },
+        )
+        .await
+        .map_err(|error| ClouisleError::io(format!("send guest hello: {error}")))?;
+        if !matches!(
+            read_frame(&mut stream)
+                .await
+                .map_err(|error| ClouisleError::io(format!("read guest hello: {error}")))?,
+            clouisle_proto::Frame::Hello { .. }
+        ) {
+            return Err(ClouisleError::invalid_state("guest did not return Hello"));
+        }
+        write_frame(&mut stream, &request)
+            .await
+            .map_err(|error| ClouisleError::io(format!("send guest file request: {error}")))?;
+        let response = read_frame(&mut stream)
+            .await
+            .map_err(|error| ClouisleError::io(format!("read guest file response: {error}")))?;
+        if let clouisle_proto::Frame::Error { message, .. } = &response {
+            return Err(ClouisleError::new(
+                ErrorKind::Vmm,
+                format!("guest file operation: {message}"),
+            ));
+        }
+        Ok(response)
+    }
+
+    #[cfg(target_os = "linux")]
+    /// Execute through the sandbox guest agent, never on the node host.
     pub async fn exec_command(
         &self,
         sandbox_id: &str,
@@ -208,53 +343,219 @@ impl NodeAgent {
         cwd: Option<String>,
         timeout_ms: u64,
     ) -> Result<clouisle_core::execution::ExecutionResult, ClouisleError> {
-        // 简化：本地执行（真实实现走 vsock 到 guest agent）
+        use clouisle_proto::Frame;
+        use clouisle_proto::codec::{read_frame, write_frame};
+
         if argv.is_empty() {
             return Err(ClouisleError::validation("argv empty"));
         }
-        let start = std::time::Instant::now();
-        let mut cmd = tokio::process::Command::new(&argv[0]);
-        cmd.args(&argv[1..])
-            .envs(env)
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
-        if let Some(c) = cwd {
-            cmd.current_dir(c);
+        let sandbox = self
+            .sandboxes
+            .read()
+            .await
+            .get(sandbox_id)
+            .cloned()
+            .ok_or_else(|| {
+                ClouisleError::not_found(format!("sandbox {sandbox_id} not on this node"))
+            })?;
+        if !sandbox.is_executable() {
+            return Err(ClouisleError::invalid_state(format!(
+                "sandbox {sandbox_id} is not running (status={})",
+                sandbox.status
+            )));
         }
-        let mut child = cmd
-            .spawn()
-            .map_err(|e| ClouisleError::new(ErrorKind::Vmm, format!("spawn {argv:?}: {e}")))?;
 
-        let stdout = child.stdout.take().expect("stdout piped");
-        let stderr = child.stderr.take().expect("stderr piped");
-        let mut out_buf = Vec::new();
-        let mut err_buf = Vec::new();
-        let (out_bytes, err_bytes, status, timed_out) = tokio::select! {
-            status = child.wait() => {
-                use tokio::io::AsyncReadExt;
-                let mut o = tokio::io::BufReader::new(stdout);
-                let mut e = tokio::io::BufReader::new(stderr);
-                let _ = tokio::join!(o.read_to_end(&mut out_buf), e.read_to_end(&mut err_buf));
-                (out_buf.clone(), err_buf.clone(), status.ok(), false)
-            }
-            _ = tokio::time::sleep(std::time::Duration::from_millis(timeout_ms)) => {
-                let _ = child.kill().await;
-                let _ = child.wait().await;
-                (out_buf, err_buf, None, true)
+        let guest_ip = clouisle_net::netns::guest_ip(sandbox_id);
+        let address = format!("{guest_ip}:5201")
+            .parse::<std::net::SocketAddr>()
+            .map_err(|error| ClouisleError::io(format!("invalid guest address: {error}")))?;
+        let stream = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            tokio::net::TcpStream::connect(address),
+        )
+        .await
+        .map_err(|_| ClouisleError::timeout("guest agent connect timed out"))?
+        .map_err(|error| ClouisleError::io(format!("connect guest agent: {error}")))?;
+        let mut stream = tokio::io::BufStream::new(stream);
+        write_frame(
+            &mut stream,
+            &Frame::Hello {
+                agent_version: env!("CARGO_PKG_VERSION").to_string(),
+            },
+        )
+        .await
+        .map_err(|error| ClouisleError::io(format!("send guest hello: {error}")))?;
+        if !matches!(
+            read_frame(&mut stream)
+                .await
+                .map_err(|error| ClouisleError::io(format!("read guest hello: {error}")))?,
+            Frame::Hello { .. }
+        ) {
+            return Err(ClouisleError::invalid_state("guest did not return Hello"));
+        }
+
+        let execution_id = uuid::Uuid::now_v7().to_string();
+        write_frame(
+            &mut stream,
+            &Frame::ExecReq {
+                id: execution_id.clone(),
+                argv,
+                env,
+                cwd,
+                timeout_ms,
+            },
+        )
+        .await
+        .map_err(|error| ClouisleError::io(format!("send guest ExecReq: {error}")))?;
+
+        let started = std::time::Instant::now();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let exit_code = loop {
+            let frame = read_frame(&mut stream)
+                .await
+                .map_err(|error| ClouisleError::io(format!("read guest exec output: {error}")))?;
+            match frame {
+                Frame::Stdout { id, chunk } if id == execution_id => {
+                    stdout.extend_from_slice(&chunk)
+                }
+                Frame::Stderr { id, chunk } if id == execution_id => {
+                    stderr.extend_from_slice(&chunk)
+                }
+                Frame::Exited { id, code } if id == execution_id => break code,
+                Frame::Error { message, .. } => {
+                    return Err(ClouisleError::new(
+                        ErrorKind::Vmm,
+                        format!("guest exec: {message}"),
+                    ));
+                }
+                _ => return Err(ClouisleError::invalid_state("unexpected guest exec frame")),
             }
         };
-        let duration_ms = start.elapsed().as_millis() as u64;
-        let _ = sandbox_id;
         Ok(clouisle_core::execution::ExecutionResult {
-            exit_code: if timed_out {
-                -1
-            } else {
-                status.unwrap_or_default().code().unwrap_or(-1)
-            },
-            stdout: bytes::Bytes::from(out_bytes),
-            stderr: bytes::Bytes::from(err_bytes),
-            duration_ms,
+            exit_code,
+            stdout: bytes::Bytes::from(stdout),
+            stderr: bytes::Bytes::from(stderr),
+            duration_ms: started.elapsed().as_millis() as u64,
         })
+    }
+    #[cfg(target_os = "linux")]
+    pub async fn exec_command_stream(
+        &self,
+        sandbox_id: &str,
+        argv: Vec<String>,
+        env: std::collections::HashMap<String, String>,
+        cwd: Option<String>,
+        timeout_ms: u64,
+        events: tokio::sync::mpsc::Sender<std::result::Result<NodeExecEvent, tonic::Status>>,
+    ) -> Result<(), ClouisleError> {
+        use clouisle_proto::Frame;
+        use clouisle_proto::codec::{read_frame, write_frame};
+        if argv.is_empty() {
+            return Err(ClouisleError::validation("argv empty"));
+        }
+        let sandbox = self
+            .sandboxes
+            .read()
+            .await
+            .get(sandbox_id)
+            .cloned()
+            .ok_or_else(|| {
+                ClouisleError::not_found(format!("sandbox {sandbox_id} not on this node"))
+            })?;
+        if !sandbox.is_executable() {
+            return Err(ClouisleError::invalid_state(format!(
+                "sandbox {sandbox_id} is not running"
+            )));
+        }
+        let address = format!("{}:5201", clouisle_net::netns::guest_ip(sandbox_id))
+            .parse::<std::net::SocketAddr>()
+            .map_err(|error| ClouisleError::io(format!("invalid guest address: {error}")))?;
+        let stream = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            tokio::net::TcpStream::connect(address),
+        )
+        .await
+        .map_err(|_| ClouisleError::timeout("guest agent connect timed out"))?
+        .map_err(|error| ClouisleError::io(format!("connect guest agent: {error}")))?;
+        let mut stream = tokio::io::BufStream::new(stream);
+        write_frame(
+            &mut stream,
+            &Frame::Hello {
+                agent_version: env!("CARGO_PKG_VERSION").to_string(),
+            },
+        )
+        .await
+        .map_err(|error| ClouisleError::io(format!("send guest hello: {error}")))?;
+        if !matches!(
+            read_frame(&mut stream)
+                .await
+                .map_err(|error| ClouisleError::io(format!("read guest hello: {error}")))?,
+            Frame::Hello { .. }
+        ) {
+            return Err(ClouisleError::invalid_state("guest did not return Hello"));
+        }
+        let id = uuid::Uuid::now_v7().to_string();
+        write_frame(
+            &mut stream,
+            &Frame::ExecReq {
+                id: id.clone(),
+                argv,
+                env,
+                cwd,
+                timeout_ms,
+            },
+        )
+        .await
+        .map_err(|error| ClouisleError::io(format!("send guest ExecReq: {error}")))?;
+        loop {
+            match read_frame(&mut stream)
+                .await
+                .map_err(|error| ClouisleError::io(format!("read guest exec output: {error}")))?
+            {
+                Frame::Stdout {
+                    id: frame_id,
+                    chunk,
+                } if frame_id == id => {
+                    if events.send(Ok(NodeExecEvent::Stdout(chunk))).await.is_err() {
+                        return Ok(());
+                    }
+                }
+                Frame::Stderr {
+                    id: frame_id,
+                    chunk,
+                } if frame_id == id => {
+                    if events.send(Ok(NodeExecEvent::Stderr(chunk))).await.is_err() {
+                        return Ok(());
+                    }
+                }
+                Frame::Exited { id: frame_id, code } if frame_id == id => {
+                    let _ = events.send(Ok(NodeExecEvent::Exit(code))).await;
+                    return Ok(());
+                }
+                Frame::Error { message, .. } => {
+                    return Err(ClouisleError::new(
+                        ErrorKind::Vmm,
+                        format!("guest exec: {message}"),
+                    ));
+                }
+                _ => return Err(ClouisleError::invalid_state("unexpected guest exec frame")),
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub async fn exec_command(
+        &self,
+        _sandbox_id: &str,
+        _argv: Vec<String>,
+        _env: std::collections::HashMap<String, String>,
+        _cwd: Option<String>,
+        _timeout_ms: u64,
+    ) -> Result<clouisle_core::execution::ExecutionResult, ClouisleError> {
+        Err(ClouisleError::invalid_state(
+            "guest execution requires Linux network namespaces",
+        ))
     }
 
     /// 恢复：从 store 加载本节点沙盒（重启后接管）。
@@ -266,11 +567,18 @@ impl NodeAgent {
             .filter(|s| s.status.is_active())
             .collect();
         let count = mine.len();
-        let specs: Vec<SandboxSpec> = mine.iter().map(|s| s.spec.clone()).collect();
-        self.pool.restore(&specs).await;
-        let mut sb = self.sandboxes.write().await;
-        for s in mine {
-            sb.insert(s.id.clone(), s);
+        let mut reservations = self.reservations.lock().await;
+        let mut sandboxes = self.sandboxes.write().await;
+        for sandbox in mine {
+            match self.pool.admit(&sandbox.spec).await {
+                Ok(reservation) => {
+                    reservations.insert(sandbox.id.clone(), reservation);
+                    sandboxes.insert(sandbox.id.clone(), sandbox);
+                }
+                Err(error) => {
+                    tracing::error!(sandbox_id = %sandbox.id, %error, "cannot restore sandbox reservation")
+                }
+            }
         }
         count
     }
@@ -323,6 +631,7 @@ mod tests {
         }
         async fn restore(
             &self,
+            _: &str,
             _: &clouisle_core::SandboxSpec,
             _: &SnapshotPaths,
         ) -> clouisle_core::Result<VmHandle> {
@@ -361,6 +670,7 @@ mod tests {
             kernel_version: "6.1".into(),
             firecracker_version: "1.4".into(),
             labels: HashMap::new(),
+            manage_network: false,
             heartbeat_secs: 3,
         }
     }

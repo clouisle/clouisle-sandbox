@@ -32,6 +32,8 @@ pub struct Resources {
     pub bandwidth_mbps: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub iops: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pids_max: Option<u32>,
 }
 
 const fn default_vcpu() -> u16 {
@@ -52,6 +54,7 @@ impl Default for Resources {
             disk_mb: 512,
             bandwidth_mbps: None,
             iops: None,
+            pids_max: Some(512),
         }
     }
 }
@@ -79,6 +82,31 @@ impl Default for NetworkConfig {
     }
 }
 
+/// A host path mounted into the sandbox.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MountSpec {
+    pub source: String,
+    pub target: String,
+    pub readonly: bool,
+}
+
+/// A secret materialized at `/run/secrets/<name>`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SecretSpec {
+    pub name: String,
+    pub value: String,
+}
+
+/// Restart behavior after an unexpected sandbox failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RestartPolicy {
+    #[default]
+    Never,
+    OnFailure,
+    Always,
+}
+
 /// Spec for creating a sandbox.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -89,13 +117,21 @@ pub struct SandboxSpec {
     #[serde(default)]
     pub network: NetworkConfig,
     #[serde(default)]
-    pub env: HashMap<String, String>,
+    pub mounts: Vec<MountSpec>,
+    #[serde(default)]
+    pub secrets: Vec<SecretSpec>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ttl_secs: Option<u64>,
     #[serde(default = "default_start_timeout")]
     pub start_timeout_secs: u64,
     #[serde(default)]
-    pub restart_policy: String,
+    pub env: HashMap<String, String>,
+    #[serde(default)]
+    pub node_selector: HashMap<String, String>,
+    #[serde(default)]
+    pub restart_policy: RestartPolicy,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tenant_id: Option<String>,
 }
 
 const fn default_start_timeout() -> u64 {
@@ -111,10 +147,14 @@ impl Default for SandboxSpec {
             },
             resources: Resources::default(),
             network: NetworkConfig::default(),
-            env: HashMap::new(),
+            mounts: Vec::new(),
+            secrets: Vec::new(),
             ttl_secs: None,
             start_timeout_secs: 10,
-            restart_policy: "never".into(),
+            env: HashMap::new(),
+            node_selector: HashMap::new(),
+            restart_policy: RestartPolicy::Never,
+            tenant_id: None,
         }
     }
 }
@@ -214,6 +254,15 @@ pub struct ExecResult {
     pub stderr_truncated: bool,
 }
 
+/// An ordered server-sent execution event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExecStreamEvent {
+    Stdout(String),
+    Stderr(String),
+    Exit(i32),
+    Error(String),
+}
+
 /// Execution record (persisted).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -221,8 +270,8 @@ pub struct ExecutionRecord {
     pub id: String,
     pub sandbox_id: String,
     pub exit_code: i32,
-    pub stdout: String,
-    pub stderr: String,
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
     pub started_at: String,
     pub finished_at: String,
     #[serde(default)]
@@ -263,11 +312,22 @@ pub struct SandboxListResponse {
 
 /// Health check response.
 #[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "snake_case")]
 pub struct HealthResponse {
     pub status: String,
     pub store: String,
     pub version: String,
+}
+
+/// Liveness/readiness response.
+#[derive(Debug, Clone, Deserialize)]
+pub struct StatusResponse {
+    pub status: String,
+}
+
+/// Successful file upload response.
+#[derive(Debug, Clone, Deserialize)]
+pub struct UploadResponse {
+    pub ok: bool,
 }
 
 // ──────────────────────────────────────────────
@@ -302,8 +362,9 @@ pub struct Client {
 impl Client {
     /// Create a new client.
     pub fn new(base_url: &str, api_key: &str) -> Self {
-        let base_url = Url::parse(base_url).unwrap_or_else(|_| {
-            Url::parse(&format!("http://{base_url}")).expect("invalid base_url")
+        let normalized_url = base_url.trim_end_matches('/');
+        let base_url = Url::parse(normalized_url).unwrap_or_else(|_| {
+            Url::parse(&format!("http://{normalized_url}")).expect("invalid base_url")
         });
         Self {
             http: HttpClient::new(),
@@ -379,6 +440,51 @@ impl Client {
         .await
     }
 
+    /// Execute and collect ordered server-sent output events.
+    pub async fn stream_exec(
+        &self,
+        sandbox_id: &str,
+        request: &ExecRequest,
+    ) -> Result<Vec<ExecStreamEvent>> {
+        let response = self
+            .http
+            .post(self.url(&format!("/api/v1/sandboxes/{sandbox_id}/exec/stream")))
+            .headers(self.headers())
+            .json(request)
+            .send()
+            .await?;
+        let status = response.status();
+        let body = response.text().await?;
+        if !status.is_success() {
+            return Err(SdkError::Http {
+                status: status.as_u16(),
+                body,
+            });
+        }
+        let mut current_event = None;
+        let mut events = Vec::new();
+        for line in body.lines() {
+            if let Some(event) = line.strip_prefix("event: ") {
+                current_event = Some(event);
+            } else if let Some(data) = line.strip_prefix("data: ") {
+                let event = match current_event.take() {
+                    Some("stdout") => ExecStreamEvent::Stdout(data.to_string()),
+                    Some("stderr") => ExecStreamEvent::Stderr(data.to_string()),
+                    Some("exit") => {
+                        ExecStreamEvent::Exit(data.parse().map_err(|error| SdkError::Api {
+                            code: "SSE_PARSE".to_string(),
+                            message: format!("invalid exit event: {error}"),
+                        })?)
+                    }
+                    Some("error") => ExecStreamEvent::Error(data.to_string()),
+                    Some(_) | None => continue,
+                };
+                events.push(event);
+            }
+        }
+        Ok(events)
+    }
+
     /// Get a single execution record.
     pub async fn get_execution(&self, sandbox_id: &str, exec_id: &str) -> Result<ExecutionRecord> {
         self.get(&format!("/api/v1/sandboxes/{sandbox_id}/exec/{exec_id}"))
@@ -409,9 +515,10 @@ impl Client {
         sandbox_id: &str,
         path: &str,
         data: &[u8],
-    ) -> Result<serde_json::Value> {
+    ) -> Result<UploadResponse> {
         self.post_raw(
-            &format!("/api/v1/sandboxes/{sandbox_id}/files/upload?path={path}"),
+            &format!("/api/v1/sandboxes/{sandbox_id}/files/upload"),
+            path,
             data,
         )
         .await
@@ -421,10 +528,9 @@ impl Client {
     pub async fn download_file(&self, sandbox_id: &str, path: &str) -> Result<Vec<u8>> {
         let resp = self
             .http
-            .get(self.url(&format!(
-                "/api/v1/sandboxes/{sandbox_id}/files/download?path={path}"
-            )))
-            .header("Authorization", format!("Bearer {}", self.api_key))
+            .get(self.url(&format!("/api/v1/sandboxes/{sandbox_id}/files/download")))
+            .headers(self.headers())
+            .query(&[("path", path)])
             .send()
             .await?;
         let status = resp.status();
@@ -439,9 +545,10 @@ impl Client {
 
     /// List files in a directory.
     pub async fn list_files(&self, sandbox_id: &str, path: &str) -> Result<ListFilesResponse> {
-        self.get(&format!(
-            "/api/v1/sandboxes/{sandbox_id}/files/ls?path={path}"
-        ))
+        self.get_with_query(
+            &format!("/api/v1/sandboxes/{sandbox_id}/files/ls"),
+            vec![("path".into(), path.into())],
+        )
         .await
     }
 
@@ -452,11 +559,11 @@ impl Client {
     pub async fn health(&self) -> Result<HealthResponse> {
         self.get_no_auth("/health").await
     }
-    pub async fn liveness(&self) -> Result<serde_json::Value> {
-        self.get_no_auth("/health/live").await
+    pub async fn liveness(&self) -> Result<StatusResponse> {
+        self.get("/health/live").await
     }
-    pub async fn readiness(&self) -> Result<serde_json::Value> {
-        self.get_no_auth("/health/ready").await
+    pub async fn readiness(&self) -> Result<StatusResponse> {
+        self.get("/health/ready").await
     }
     pub async fn metrics(&self) -> Result<String> {
         Ok(self
@@ -473,7 +580,10 @@ impl Client {
     // ──────────────────────────────────────────
 
     fn url(&self, path: &str) -> String {
-        format!("{}{}", self.base_url, path)
+        self.base_url
+            .join(path)
+            .expect("invalid API path")
+            .to_string()
     }
 
     fn headers(&self) -> reqwest::header::HeaderMap {
@@ -531,11 +641,17 @@ impl Client {
         )
         .await
     }
-    async fn post_raw(&self, path: &str, data: &[u8]) -> Result<serde_json::Value> {
+    async fn post_raw<T: for<'de> Deserialize<'de>>(
+        &self,
+        path: &str,
+        file_path: &str,
+        data: &[u8],
+    ) -> Result<T> {
         self.check_response(
             self.http
                 .post(self.url(path))
                 .headers(self.headers())
+                .query(&[("path", file_path)])
                 .body(data.to_vec())
                 .send()
                 .await?,

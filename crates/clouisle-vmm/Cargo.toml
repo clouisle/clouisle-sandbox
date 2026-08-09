@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 clouisle-core = { path = "../clouisle-core" }
 clouisle-proto = { path = "../clouisle-proto" }
+clouisle-images = { path = "../clouisle-images" }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

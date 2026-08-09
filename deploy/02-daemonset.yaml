@@ -23,9 +23,11 @@ spec:
       hostPID: true
       containers:
         - name: clouisled
-          image: registry.example.com/clouisle-node:0.1.0
+          image: registry.cn-shanghai.aliyuncs.com/clouisle/clouisle-sandbox:0.1.0
+          command: ["clouisled"]
           args:
-            - --apiserver=apiserver.clouisle.svc:9090
+            - --addr=0.0.0.0:9090
+            - --db=/data/clouisled.db
             - --node-id=$(NODE_NAME)
           env:
             - name: NODE_NAME
@@ -46,33 +48,25 @@ spec:
               readOnly: true
             - name: cgroup
               mountPath: /sys/fs/cgroup
-        - name: firecracker
-          image: firecracker-microvm/firecracker:v1.10.1
-          command: ["tail", "-f", "/dev/null"]
-          securityContext:
-            privileged: true
-          volumeMounts:
-            - name: kvm
-              mountPath: /dev/kvm
-            - name: vmlinux
-              mountPath: /opt/clouisle/vmlinux
-              readOnly: true
-            - name: rootfs
-              mountPath: /opt/clouisle/rootfs
-              readOnly: true
+            - name: data
+              mountPath: /data
       volumes:
         - name: kvm
           hostPath: { path: /dev/kvm }
         - name: vmlinux
           hostPath:
-            path: /opt/clouisle/vmlinux   # 宿主机内核镜像
+            path: /opt/clouisle/vmlinux
             type: File
         - name: rootfs
           hostPath:
-            path: /opt/clouisle/rootfs     # 宿主机基础 rootfs
+            path: /opt/clouisle/rootfs
             type: Directory
         - name: cgroup
           hostPath: { path: /sys/fs/cgroup }
+        - name: data
+          hostPath:
+            path: /var/lib/clouisle
+            type: DirectoryOrCreate
 
 # 说明：
 # - /dev/kvm 必须存在于所有 K8s 节点（裸金属或嵌套虚拟化）

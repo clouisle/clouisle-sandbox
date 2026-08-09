@@ -3,16 +3,21 @@
 // ============================================================
 
 import axios, { AxiosInstance, AxiosRequestConfig } from "axios";
+import { Readable } from "stream";
 import {
   ApiErrorResponse,
   ExecRequest,
   ExecResult,
+  ExecStreamEvent,
+  ExecutionRecord,
   HealthResponse,
   ListFilesResponse,
   Sandbox,
   SandboxError,
   SandboxListResponse,
   SandboxSpec,
+  StatusResponse,
+  UploadResponse,
 } from "./types";
 
 /**
@@ -123,6 +128,48 @@ export class Client {
     return this.exec(sandboxId, { argv, timeout_ms: timeoutMs });
   }
 
+  /** Get one persisted execution record. */
+  async getExecution(sandboxId: string, executionId: string): Promise<ExecutionRecord> {
+    return this.get(`/api/v1/sandboxes/${sandboxId}/exec/${executionId}`);
+  }
+
+  /** List persisted execution records, optionally limited. */
+  async listExecutions(sandboxId: string, limit?: number): Promise<ExecutionRecord[]> {
+    return this.get(`/api/v1/sandboxes/${sandboxId}/exec`, {
+      params: limit === undefined ? undefined : { limit },
+    });
+  }
+
+  /** Execute and yield ordered SSE events. Node.js runtime only. */
+  async *streamExec(sandboxId: string, req: ExecRequest): AsyncGenerator<ExecStreamEvent> {
+    try {
+      const response = await this.http.post<Readable>(
+        `/api/v1/sandboxes/${sandboxId}/exec/stream`,
+        { ...req, stream: true },
+        { responseType: "stream" },
+      );
+      let event: ExecStreamEvent["event"] | undefined;
+      let data: string | undefined;
+      for await (const chunk of response.data) {
+        for (const line of String(chunk).split("\n")) {
+          if (line.startsWith("event: ")) {
+            const candidate = line.slice(7);
+            if (candidate === "stdout" || candidate === "stderr" || candidate === "exit" || candidate === "error") {
+              event = candidate;
+            }
+          } else if (line.startsWith("data: ") && event !== undefined) {
+            data = line.slice(6);
+            yield { event, data };
+            event = undefined;
+            data = undefined;
+          }
+        }
+      }
+    } catch (err: unknown) {
+      throw this.wrapError(err);
+    }
+  }
+
   // ──────────────────────────────────────────
   //  File Transfer
   // ──────────────────────────────────────────
@@ -138,8 +185,8 @@ export class Client {
     sandboxId: string,
     path: string,
     data: Buffer | Uint8Array,
-  ): Promise<Record<string, unknown>> {
-    return this.postRaw(
+  ): Promise<UploadResponse> {
+    return this.postRaw<UploadResponse>(
       `/api/v1/sandboxes/${sandboxId}/files/upload`,
       path,
       data,
@@ -195,15 +242,12 @@ export class Client {
    * Liveness probe.
    * @returns { status: "alive" }
    */
-  async liveness(): Promise<Record<string, string>> {
+  async liveness(): Promise<StatusResponse> {
     return this.get("/health/live");
   }
 
-  /**
-   * Readiness probe.
-   * @returns { status: "ready" | "not_ready" }
-   */
-  async readiness(): Promise<Record<string, string>> {
+  /** Readiness probe. */
+  async readiness(): Promise<StatusResponse> {
     return this.get("/health/ready");
   }
 
@@ -248,18 +292,18 @@ export class Client {
     }
   }
 
-  private async postRaw(
+  private async postRaw<T>(
     url: string,
     path: string,
     data: Buffer | Uint8Array,
-  ): Promise<Record<string, unknown>> {
+  ): Promise<T> {
     try {
-      const resp = await this.http.post(
+      const resp = await this.http.post<T>(
         `${url}?path=${encodeURIComponent(path)}`,
         data,
         { headers: { "Content-Type": "application/octet-stream" } },
       );
-      return resp.data as Record<string, unknown>;
+      return resp.data;
     } catch (err: unknown) {
       throw this.wrapError(err);
     }

@@ -7,8 +7,14 @@ All types are fully annotated with Python type hints.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Literal, Optional, TypeAlias
 
+
+RestartPolicy = Literal["never", "on_failure", "always"]
+
+# JSON values carried by HTTP API requests and responses.
+JsonValue: TypeAlias = str | int | float | bool | None | list["JsonValue"] | dict[str, "JsonValue"]
+JsonObject: TypeAlias = dict[str, JsonValue]
 
 @dataclass
 class ImageRef:
@@ -25,7 +31,22 @@ class Resources:
     disk_mb: int = 512
     bandwidth_mbps: Optional[int] = None
     iops: Optional[int] = None
+    pids_max: Optional[int] = 512
 
+
+@dataclass
+class MountSpec:
+    """Host mount requested for a sandbox."""
+    source: str
+    target: str
+    readonly: bool = False
+
+
+@dataclass
+class SecretSpec:
+    """Secret materialized as /run/secrets/<name>."""
+    name: str
+    value: str
 
 @dataclass
 class NetworkConfig:
@@ -40,10 +61,14 @@ class SandboxSpec:
     image: ImageRef
     resources: Resources = field(default_factory=Resources)
     network: NetworkConfig = field(default_factory=NetworkConfig)
-    env: dict[str, str] = field(default_factory=dict)
+    mounts: list[MountSpec] = field(default_factory=list)
+    secrets: list[SecretSpec] = field(default_factory=list)
     ttl_secs: Optional[int] = None
     start_timeout_secs: int = 10
-    restart_policy: str = "never"
+    env: dict[str, str] = field(default_factory=dict)
+    node_selector: dict[str, str] = field(default_factory=dict)
+    restart_policy: RestartPolicy = "never"
+    tenant_id: Optional[str] = None
 
 
 @dataclass
@@ -92,6 +117,12 @@ class ExecResult:
     stdout_truncated: bool = False
     stderr_truncated: bool = False
 
+@dataclass
+class ExecStreamEvent:
+    """One server-sent execution event."""
+    event: Literal["stdout", "stderr", "exit", "error"]
+    data: str
+
 
 @dataclass
 class ExecutionRecord:
@@ -99,8 +130,8 @@ class ExecutionRecord:
     id: str
     sandbox_id: str
     exit_code: int
-    stdout: str
-    stderr: str
+    stdout: bytes
+    stderr: bytes
     started_at: str
     finished_at: str
     timed_out: bool = False
@@ -138,6 +169,11 @@ class HealthResponse:
     status: str
     store: str
     version: str
+
+@dataclass
+class StatusResponse:
+    """Liveness or readiness response."""
+    status: str
 
 
 @dataclass

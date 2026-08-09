@@ -50,6 +50,13 @@ CREATE TABLE IF NOT EXISTS executions (
     node_id TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_exec_sandbox ON executions(sandbox_id);
+CREATE TABLE IF NOT EXISTS nodes (
+    node_id TEXT PRIMARY KEY,
+    node_json TEXT NOT NULL,
+    status TEXT NOT NULL,
+    last_heartbeat_ms INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_nodes_ready ON nodes(status, last_heartbeat_ms);
 ";
 
 struct RowData {
@@ -217,6 +224,28 @@ impl Store for SqliteStore {
         Ok(())
     }
 
+    async fn update_sandbox_expiry(
+        &self,
+        id: &str,
+        expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> StoreResult<()> {
+        let conn = self.conn.lock().await;
+        let updated = conn
+            .execute(
+                "UPDATE sandboxes SET expires_at=?1, updated_at=?2 WHERE id=?3",
+                rusqlite::params![
+                    expires_at.map(|value| value.timestamp_millis()),
+                    Utc::now().timestamp_millis(),
+                    id
+                ],
+            )
+            .map_err(|error| StoreError::Sqlite(error.to_string()))?;
+        if updated == 0 {
+            return Err(StoreError::NotFound(format!("sandbox {id}")));
+        }
+        Ok(())
+    }
+
     async fn list_sandboxes(&self, status: Option<SandboxStatus>) -> StoreResult<Vec<Sandbox>> {
         let conn = self.conn.lock().await;
         let mut stmt = conn
@@ -246,6 +275,36 @@ impl Store for SqliteStore {
             return Err(StoreError::NotFound(format!("sandbox {id}")));
         }
         Ok(())
+    }
+
+    async fn upsert_node(&self, node: &clouisle_core::RegisteredNode) -> StoreResult<()> {
+        let json = serde_json::to_string(node).map_err(|e| StoreError::Internal(e.to_string()))?;
+        self.conn.lock().await.execute(
+            "INSERT INTO nodes(node_id,node_json,status,last_heartbeat_ms) VALUES (?1,?2,?3,?4) ON CONFLICT(node_id) DO UPDATE SET node_json=excluded.node_json,status=excluded.status,last_heartbeat_ms=excluded.last_heartbeat_ms",
+            rusqlite::params![node.info.node_id, json, serde_json::to_string(&node.status).unwrap_or_default(), node.last_heartbeat_ms],
+        ).map_err(|e| StoreError::Sqlite(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn list_ready_nodes(
+        &self,
+        now_ms: i64,
+    ) -> StoreResult<Vec<clouisle_core::RegisteredNode>> {
+        let conn = self.conn.lock().await;
+        let mut stmt = conn
+            .prepare(
+                "SELECT node_json FROM nodes WHERE status='\"ready\"' AND last_heartbeat_ms >= ?1",
+            )
+            .map_err(|e| StoreError::Sqlite(e.to_string()))?;
+        stmt.query_map([now_ms], |row| row.get::<_, String>(0))
+            .map_err(|e| StoreError::Sqlite(e.to_string()))?
+            .map(|row| {
+                row.map_err(|e| StoreError::Sqlite(e.to_string()))
+                    .and_then(|json| {
+                        serde_json::from_str(&json).map_err(|e| StoreError::Internal(e.to_string()))
+                    })
+            })
+            .collect()
     }
 
     async fn save_execution(&self, record: &ExecutionRecord) -> StoreResult<()> {
@@ -397,6 +456,22 @@ mod tests {
             .unwrap();
         let got = s.get_sandbox("sbx-1").await.unwrap();
         assert_eq!(got.status, SandboxStatus::Stopping);
+    }
+
+    #[tokio::test]
+    async fn expiry_update_persists() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        store.create_sandbox(&make_sandbox("sbx-1")).await.unwrap();
+        let expires_at =
+            DateTime::from_timestamp_millis(Utc::now().timestamp_millis() + 60_000).unwrap();
+        store
+            .update_sandbox_expiry("sbx-1", Some(expires_at))
+            .await
+            .unwrap();
+        assert_eq!(
+            store.get_sandbox("sbx-1").await.unwrap().expires_at,
+            Some(expires_at)
+        );
     }
 
     #[tokio::test]

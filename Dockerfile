@@ -1,13 +1,13 @@
 # ============================================================
 # Stage 1: 编译 Rust 二进制（多平台）
 # ============================================================
-FROM --platform=$BUILDPLATFORM rust:1-slim-bookworm AS builder
+FROM --platform=$TARGETPLATFORM rust:1-slim-bookworm AS builder
 
 ARG TARGETPLATFORM
 ARG BUILDPLATFORM
 ARG TARGETARCH
 
-RUN apt-get update -qq && apt-get install -y -qq protobuf-compiler pkg-config libssl-dev && rm -rf /var/lib/apt/lists/*
+RUN apt-get update -qq && apt-get install -y -qq protobuf-compiler pkg-config libssl-dev musl-tools && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
@@ -15,11 +15,19 @@ COPY crates/ ./crates/
 COPY benches/ ./benches/
 COPY sdk/rust/ ./sdk/rust/
 
-# 交叉编译目标（跨平台构建时添加目标架构）
-RUN if [ "$TARGETARCH" = "arm64" ]; then rustup target add aarch64-unknown-linux-gnu; fi
-
-# 全量编译（BUILDPLATFORM 上编译，产物对应 TARGETARCH）
-RUN cargo build --release -p clouisle-api -p clouislectl -p clouisle-agent
+# API/CLI 在运行镜像中执行；guest agent 必须静态链接，兼容 Ubuntu 18.04 rootfs。
+# Builder 与运行目标同架构，使 musl-gcc 可为 amd64 和 arm64 生成本机静态二进制。
+RUN cargo build --release -p clouisle-api -p clouislectl -p clouisled \
+    && case "$TARGETARCH" in \
+        amd64) target=x86_64-unknown-linux-musl ;; \
+        arm64) target=aarch64-unknown-linux-musl ;; \
+        *) echo "unsupported target architecture: $TARGETARCH" >&2; exit 1 ;; \
+    esac \
+    && rustup target add "$target" \
+    && env "CARGO_TARGET_$(printf '%s' "$target" | tr '[:lower:]-' '[:upper:]_')_LINKER=musl-gcc" \
+       RUSTFLAGS="-C relocation-model=static" \
+       cargo build --release -p clouisle-agent --target "$target" \
+    && cp "target/$target/release/clouisle-agent" /build/clouisle-agent-guest
 
 # ============================================================
 # Stage 2: 运行镜像（多平台）
@@ -46,11 +54,13 @@ RUN apt-get update -qq && apt-get install -y -qq \
 # 复制编译产物
 COPY --from=builder /build/target/release/clouisle-api /usr/local/bin/
 COPY --from=builder /build/target/release/clouislectl /usr/local/bin/
-COPY --from=builder /build/target/release/clouisle-agent /usr/local/bin/
+COPY --from=builder /build/target/release/clouisled /usr/local/bin/
+COPY --from=builder /build/clouisle-agent-guest /usr/local/bin/clouisle-agent
 
 # 创建 firecracker / jailer 符号链接（解压后文件名带版本号）
-RUN ln -sf firecracker-v1.10.1-x86_64 /usr/local/bin/firecracker \
-    && ln -sf jailer-v1.10.1-x86_64 /usr/local/bin/jailer
+RUN if [ "$TARGETARCH" = "arm64" ]; then FC_ARCH=aarch64; else FC_ARCH=x86_64; fi \
+    && ln -sf "firecracker-v1.10.1-${FC_ARCH}" /usr/local/bin/firecracker \
+    && ln -sf "jailer-v1.10.1-${FC_ARCH}" /usr/local/bin/jailer
 
 # 健康检查
 HEALTHCHECK --interval=10s --timeout=3s --start-period=5s --retries=3 \
@@ -59,6 +69,9 @@ HEALTHCHECK --interval=10s --timeout=3s --start-period=5s --retries=3 \
 # 数据目录
 VOLUME ["/data"]
 EXPOSE 8080
+
+# The image contains both control-plane and node-daemon binaries. Deployment
+# manifests select the process explicitly with `command`.
 
 # 默认启动（SQLite 单机模式）
 # 生产环境建议：--db "postgres://user:pass@host:5432/clouisle"

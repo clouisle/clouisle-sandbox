@@ -77,6 +77,7 @@ pub struct SecretSpec {
 
 /// 重启策略（AR-02）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
 pub enum RestartPolicy {
     #[default]
     Never,
@@ -125,5 +126,15 @@ mod tests {
         assert_eq!(RestartPolicy::Never.as_str(), "never");
         assert_eq!(RestartPolicy::OnFailure.as_str(), "on_failure");
         assert_eq!(RestartPolicy::Always.as_str(), "always");
+    }
+
+    #[test]
+    fn restart_policy_serializes_as_snake_case() {
+        assert_eq!(
+            serde_json::to_string(&RestartPolicy::OnFailure).unwrap(),
+            "\"on_failure\""
+        );
+        let parsed: RestartPolicy = serde_json::from_str("\"on_failure\"").unwrap();
+        assert_eq!(parsed, RestartPolicy::OnFailure);
     }
 }

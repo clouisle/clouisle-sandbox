@@ -42,8 +42,23 @@ pub trait Store: Send + Sync {
         id: &str,
         vmm_meta: &clouisle_core::VmmMeta,
     ) -> StoreResult<()>;
+    /// Persist the expiry deadline after a sandbox becomes ready.
+    async fn update_sandbox_expiry(
+        &self,
+        id: &str,
+        expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> StoreResult<()>;
     async fn list_sandboxes(&self, status: Option<SandboxStatus>) -> StoreResult<Vec<Sandbox>>;
     async fn delete_sandbox(&self, id: &str) -> StoreResult<()>;
+
+    // ---- Node registry ----
+    /// Upsert a node registration or heartbeat lease.
+    async fn upsert_node(&self, node: &clouisle_core::RegisteredNode) -> StoreResult<()>;
+    /// Return nodes whose leases have not expired at `now_ms`.
+    async fn list_ready_nodes(
+        &self,
+        now_ms: i64,
+    ) -> StoreResult<Vec<clouisle_core::RegisteredNode>>;
 
     // ---- 执行记录 ----
     async fn save_execution(&self, record: &ExecutionRecord) -> StoreResult<()>;

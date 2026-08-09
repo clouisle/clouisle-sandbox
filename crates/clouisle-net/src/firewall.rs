@@ -70,54 +70,27 @@ impl FirewallManager {
         // 0. 将 Firecracker 创建的 tap0 加入网桥
         netns::attach_tap(sandbox_id)?;
 
-        // 1. netns 内加载 nftables 规则
+        // 1. guest netns 内规则；宿主 veth 规则捕获桥接后真正的三层出站流量。
         nftables::setup_ruleset(sandbox_id, &ns, &veth_ns, veth_host_ip)?;
-
-        // 2. 启动 DNS 代理（在 netns 内监听 10.0.0.1:53）
-        // 使用独立 OS 线程 + setns 进入沙盒 netns，避免污染 tokio 线程池
-        let proxy = DnsProxy::new(allow_egress.to_vec());
+        nftables::setup_host_egress(sandbox_id)?;
+        // 2. DNS 请求经 guest → bridge → host veth 发送；代理必须绑定 host veth 的网关地址，
+        // 而不是 netns bridge 的同地址，否则 ARP 会把请求转发到 host 而不会送达本地 socket。
+        let proxy = DnsProxy::with_sandbox(allow_egress.to_vec(), Some(sandbox_id.to_string()));
         let proxy_srv = proxy.clone();
-        let ns_path = format!("/var/run/netns/{ns}");
+        let dns_addr = veth_host_ip
+            .split_once('/')
+            .map_or_else(|| veth_host_ip.to_string(), |(addr, _)| addr.to_string());
         let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
-        let cancel_rx = std::sync::Mutex::new(Some(cancel_rx));
-        std::thread::Builder::new()
-            .name(format!("dns-{}", netns::short_name(sandbox_id, "")))
-            .spawn(move || {
-                // 进入沙盒 netns
-                let file = match std::fs::File::open(&ns_path) {
-                    Ok(f) => f,
-                    Err(e) => {
-                        tracing::warn!(ns = %ns_path, error = %e, "dns: open netns failed");
-                        return;
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = cancel_rx => tracing::debug!(bind = %dns_addr, "dns proxy cancelled"),
+                result = proxy_srv.serve(&dns_addr) => {
+                    if let Err(e) = result {
+                        tracing::warn!(bind = %dns_addr, error = %e, "dns proxy stopped");
                     }
-                };
-                if let Err(e) = nix::sched::setns(&file, nix::sched::CloneFlags::CLONE_NEWNET) {
-                    tracing::warn!(ns = %ns_path, error = %e, "dns: setns failed");
-                    return;
                 }
-                // 在 netns 内创建独立 tokio runtime
-                let rt = match tokio::runtime::Runtime::new() {
-                    Ok(r) => r,
-                    Err(e) => {
-                        tracing::warn!(error = %e, "dns: create runtime failed");
-                        return;
-                    }
-                };
-                let cancel = cancel_rx.lock().unwrap().take().unwrap();
-                rt.block_on(async {
-                    tokio::select! {
-                        _ = cancel => {
-                            tracing::debug!(ns = %ns_path, "dns proxy cancelled");
-                        }
-                        result = proxy_srv.serve("10.0.0.1") => {
-                            if let Err(e) = result {
-                                tracing::warn!(ns = %ns_path, error = %e, "dns proxy stopped");
-                            }
-                        }
-                    }
-                });
-            })
-            .map_err(|e| ClouisleError::io(format!("spawn dns thread: {e}")))?;
+            }
+        });
 
         // 记录 DNS 代理句柄
         self.dns_proxies.lock().await.insert(
@@ -141,11 +114,10 @@ impl FirewallManager {
             let _ = handle.cancel.send(());
         }
 
-        // 2. 删除 netns 内 nftables
+        // 2. 删除 guest netns 与宿主 veth 出站策略。
         let ns = netns::ns_name(sandbox_id);
         let _ = nftables::teardown_ruleset(sandbox_id, &ns);
-
-        // 3. 删除 netns（自动清理 TAP/veth/路由）
+        let _ = nftables::teardown_host_egress(sandbox_id);
         let _ = netns::delete_netns(sandbox_id);
 
         // 4. 清理状态

@@ -57,6 +57,12 @@ pub fn configure_network() -> Result<(), String> {
         .get("gateway")
         .ok_or_else(|| "clouisle.gateway not set in cmdline".to_string())?;
 
+    // 根文件系统可能预置了宿主 DNS；替换为本沙盒网关上的白名单代理。
+    let _ = std::fs::remove_file("/etc/resolv.conf");
+    if let Err(e) = std::fs::write("/etc/resolv.conf", format!("nameserver {gateway}\n")) {
+        tracing::warn!(error = %e, "failed to configure guest resolv.conf");
+    }
+
     // 优先 ifconfig（net-tools），缺失则用 ip 命令
     let ifcfg_ok = std::process::Command::new("ifconfig")
         .args(["eth0", guest_ip, "netmask", "255.255.255.252", "up"])
@@ -81,11 +87,9 @@ pub fn configure_network() -> Result<(), String> {
         }
     }
 
-    let _ = std::process::Command::new("route")
-        .args(["add", "default", "gw", gateway])
+    let _ = std::process::Command::new("ip")
+        .args(["route", "replace", "default", "via", gateway, "dev", "eth0"])
         .status();
-
-    // 记录接口状态（排查用）
     if let Ok(out) = std::process::Command::new("ip")
         .args(["addr", "show"])
         .output()

@@ -162,6 +162,7 @@ mod tests {
         }
         async fn restore(
             &self,
+            _: &str,
             _: &clouisle_core::SandboxSpec,
             _: &SnapshotPaths,
         ) -> clouisle_core::Result<VmHandle> {

@@ -18,7 +18,7 @@ pub mod proto {
 
 use proto::node_service_server::{NodeService, NodeServiceServer};
 use proto::{
-    CreateSandboxRequest, DeleteResult, ExecExit, ExecOutput, ExecRequest, ExecStream,
+    CreateSandboxRequest, DeleteResult, ExecRequest, ExecStream, FileRequest, FileResponse,
     HeartbeatCommand, HeartbeatReport, NodeId, NodeInfo, SandboxHandle, SandboxId,
 };
 
@@ -109,12 +109,15 @@ impl NodeService for NodeServiceImpl {
         request: Request<CreateSandboxRequest>,
     ) -> Result<Response<SandboxHandle>, Status> {
         let req = request.into_inner();
+        if req.sandbox_id.is_empty() {
+            return Err(Status::invalid_argument("sandbox_id is required"));
+        }
         let spec: SandboxSpec = serde_json::from_str(&req.spec_json)
             .map_err(|e| Status::invalid_argument(format!("bad spec_json: {e}")))?;
 
         let sandbox = self
             .agent
-            .create_sandbox(spec, self.store.as_ref())
+            .create_sandbox_with_id(req.sandbox_id, spec, self.store.as_ref())
             .await
             .map_err(to_status)?;
 
@@ -149,9 +152,12 @@ impl NodeService for NodeServiceImpl {
         }
     }
 
-    /// 执行命令（双向流，简化：请求→响应）。
-    type ExecStream = tokio_stream::wrappers::ReceiverStream<Result<ExecStream, Status>>;
+    /// Execute commands as a true output stream.
+    type ExecStream =
+        std::pin::Pin<Box<dyn futures::Stream<Item = Result<ExecStream, Status>> + Send>>;
 
+    // tonic fixes the stream error type to Status; boxing it is incompatible with its generated trait.
+    #[allow(clippy::result_large_err)]
     async fn exec(
         &self,
         request: Request<Streaming<ExecStream>>,
@@ -178,58 +184,126 @@ impl NodeService for NodeServiceImpl {
             None => return Err(Status::invalid_argument("no exec request in stream")),
         };
 
-        // 通过 agent 执行
-        let result = match self
-            .agent
-            .exec_command(
-                &req.sandbox_id,
-                req.argv,
-                req.env,
-                if req.cwd.is_empty() {
-                    None
-                } else {
-                    Some(req.cwd)
-                },
-                req.timeout_ms,
-            )
-            .await
+        #[cfg(not(target_os = "linux"))]
         {
-            Ok(r) => r,
-            Err(e) => {
-                let (tx, rx) = tokio::sync::mpsc::channel(8);
-                let _ = tx.try_send(Err(to_status(e)));
-                return Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
-                    rx,
-                )));
+            let _ = req;
+            return Err(Status::unimplemented("guest execution requires Linux"));
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            use crate::agent::NodeExecEvent;
+            use tokio_stream::StreamExt;
+
+            let sandbox_id = req.sandbox_id;
+            let task_sandbox_id = sandbox_id.clone();
+            let agent = self.agent.clone();
+            let (tx, rx) = tokio::sync::mpsc::channel(32);
+            tokio::spawn(async move {
+                let result = agent
+                    .exec_command_stream(
+                        &task_sandbox_id,
+                        req.argv,
+                        req.env,
+                        if req.cwd.is_empty() {
+                            None
+                        } else {
+                            Some(req.cwd)
+                        },
+                        req.timeout_ms,
+                        tx.clone(),
+                    )
+                    .await;
+                if let Err(error) = result {
+                    let _ = tx.send(Err(to_status(error))).await;
+                }
+            });
+            let stream = tokio_stream::wrappers::ReceiverStream::new(rx).map(move |event| {
+                event.map(|event| match event {
+                    NodeExecEvent::Stdout(data) => ExecStream {
+                        msg: Some(proto::exec_stream::Msg::ExecStdout(proto::ExecOutput {
+                            sandbox_id: sandbox_id.clone(),
+                            data: data.to_vec(),
+                        })),
+                    },
+                    NodeExecEvent::Stderr(data) => ExecStream {
+                        msg: Some(proto::exec_stream::Msg::ExecStderr(proto::ExecOutput {
+                            sandbox_id: sandbox_id.clone(),
+                            data: data.to_vec(),
+                        })),
+                    },
+                    NodeExecEvent::Exit(exit_code) => ExecStream {
+                        msg: Some(proto::exec_stream::Msg::ExecExit(proto::ExecExit {
+                            sandbox_id: sandbox_id.clone(),
+                            exit_code,
+                        })),
+                    },
+                })
+            });
+            Ok(Response::new(Box::pin(stream)))
+        }
+    }
+
+    async fn file_op(
+        &self,
+        request: Request<FileRequest>,
+    ) -> Result<Response<FileResponse>, Status> {
+        let request = request.into_inner();
+        let sandbox_id = request.sandbox_id;
+        let frame = match request.op {
+            Some(proto::file_request::Op::Write(write)) => clouisle_proto::Frame::WriteFile {
+                path: write.path,
+                mode: write.mode,
+                content: bytes::Bytes::from(write.content),
+            },
+            Some(proto::file_request::Op::Read(read)) => clouisle_proto::Frame::ReadFile {
+                path: read.path,
+                offset: 0,
+                length: u64::MAX,
+            },
+            Some(proto::file_request::Op::List(list)) => {
+                clouisle_proto::Frame::ListDir { path: list.path }
             }
+            None => return Err(Status::invalid_argument("file operation is required")),
         };
-
-        let (tx, rx) = tokio::sync::mpsc::channel(8);
-        if !result.stdout.is_empty() {
-            let _ = tx.try_send(Ok(ExecStream {
-                msg: Some(proto::exec_stream::Msg::ExecStdout(ExecOutput {
-                    sandbox_id: req.sandbox_id.clone(),
-                    data: result.stdout.to_vec(),
-                })),
-            }));
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (sandbox_id, frame);
+            return Err(Status::unimplemented("guest file operations require Linux"));
         }
-        if !result.stderr.is_empty() {
-            let _ = tx.try_send(Ok(ExecStream {
-                msg: Some(proto::exec_stream::Msg::ExecStderr(ExecOutput {
-                    sandbox_id: req.sandbox_id.clone(),
-                    data: result.stderr.to_vec(),
-                })),
-            }));
+        #[cfg(target_os = "linux")]
+        {
+            let response = self
+                .agent
+                .file_op(&sandbox_id, frame)
+                .await
+                .map_err(to_status)?;
+            let result = match response {
+                clouisle_proto::Frame::WriteFileResult { .. } => {
+                    proto::file_response::Result::WriteOk(true)
+                }
+                clouisle_proto::Frame::ReadFileResult { content, .. } => {
+                    proto::file_response::Result::Content(content.to_vec())
+                }
+                clouisle_proto::Frame::ListDirResult { entries } => {
+                    proto::file_response::Result::Entries(proto::FileEntries {
+                        entries: entries
+                            .into_iter()
+                            .map(|entry| proto::FileEntry {
+                                name: entry.name,
+                                size: entry.size,
+                                mode: entry.mode,
+                                mtime: entry.mtime,
+                                is_dir: entry.is_dir,
+                            })
+                            .collect(),
+                    })
+                }
+                _ => return Err(Status::internal("unexpected guest file response")),
+            };
+            Ok(Response::new(FileResponse {
+                result: Some(result),
+            }))
         }
-        let _ = tx.try_send(Ok(ExecStream {
-            msg: Some(proto::exec_stream::Msg::ExecExit(ExecExit {
-                sandbox_id: req.sandbox_id,
-                exit_code: result.exit_code,
-            })),
-        }));
-
-        Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
-            rx,
-        )))
     }
 }

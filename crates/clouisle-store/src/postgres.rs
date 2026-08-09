@@ -38,6 +38,13 @@ CREATE TABLE IF NOT EXISTS executions (
     node_id TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_exec_sandbox ON executions(sandbox_id);
+CREATE TABLE IF NOT EXISTS nodes (
+    node_id TEXT PRIMARY KEY,
+    node_json TEXT NOT NULL,
+    status TEXT NOT NULL,
+    last_heartbeat_ms BIGINT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_nodes_ready ON nodes(status, last_heartbeat_ms);
 ";
 
 /// PostgreSQL 存储。
@@ -231,6 +238,29 @@ impl Store for PostgresStore {
         Ok(())
     }
 
+    async fn update_sandbox_expiry(
+        &self,
+        id: &str,
+        expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> StoreResult<()> {
+        let client = self.client.lock().await;
+        let updated = client
+            .execute(
+                "UPDATE sandboxes SET expires_at=$1, updated_at=$2 WHERE id=$3",
+                &[
+                    &expires_at.map(|value| value.timestamp_millis()),
+                    &Utc::now().timestamp_millis(),
+                    &id,
+                ],
+            )
+            .await
+            .map_err(|error| StoreError::Internal(error.to_string()))?;
+        if updated == 0 {
+            return Err(StoreError::NotFound(format!("sandbox {id}")));
+        }
+        Ok(())
+    }
+
     async fn list_sandboxes(&self, status: Option<SandboxStatus>) -> StoreResult<Vec<Sandbox>> {
         let client = self.client.lock().await;
         let query = "SELECT id,spec_json,status,vmm_meta_json,created_at,updated_at,ready_at,expires_at,terminal_message,node_id FROM sandboxes";
@@ -259,6 +289,41 @@ impl Store for PostgresStore {
             return Err(StoreError::NotFound(format!("sandbox {id}")));
         }
         Ok(())
+    }
+
+    async fn upsert_node(&self, node: &clouisle_core::RegisteredNode) -> StoreResult<()> {
+        let json = serde_json::to_string(node).map_err(|e| StoreError::Internal(e.to_string()))?;
+        let status =
+            serde_json::to_string(&node.status).map_err(|e| StoreError::Internal(e.to_string()))?;
+        self.client.lock().await.execute(
+            "INSERT INTO nodes(node_id,node_json,status,last_heartbeat_ms) VALUES($1,$2,$3,$4) ON CONFLICT(node_id) DO UPDATE SET node_json=EXCLUDED.node_json,status=EXCLUDED.status,last_heartbeat_ms=EXCLUDED.last_heartbeat_ms",
+            &[&node.info.node_id, &json, &status, &node.last_heartbeat_ms],
+        ).await.map_err(|e| StoreError::Internal(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn list_ready_nodes(
+        &self,
+        now_ms: i64,
+    ) -> StoreResult<Vec<clouisle_core::RegisteredNode>> {
+        let rows = self
+            .client
+            .lock()
+            .await
+            .query(
+                "SELECT node_json FROM nodes WHERE status=$1 AND last_heartbeat_ms >= $2",
+                &[&"\"ready\"", &now_ms],
+            )
+            .await
+            .map_err(|e| StoreError::Internal(e.to_string()))?;
+        rows.iter()
+            .map(|row| {
+                let json: String = row
+                    .try_get(0)
+                    .map_err(|e| StoreError::Internal(e.to_string()))?;
+                serde_json::from_str(&json).map_err(|e| StoreError::Internal(e.to_string()))
+            })
+            .collect()
     }
 
     async fn save_execution(&self, record: &ExecutionRecord) -> StoreResult<()> {

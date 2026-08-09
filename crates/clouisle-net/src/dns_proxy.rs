@@ -37,8 +37,8 @@ impl std::error::Error for DnsError {}
 pub struct DnsProxy {
     allowed: Arc<RwLock<HashSet<String>>>,
     upstream: TokioAsyncResolver,
+    sandbox_id: Option<String>,
 }
-
 impl std::fmt::Debug for DnsProxy {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DnsProxy").finish_non_exhaustive()
@@ -46,21 +46,33 @@ impl std::fmt::Debug for DnsProxy {
 }
 
 impl DnsProxy {
-    /// 创建 DNS 代理。
     pub fn new(domains: Vec<String>) -> Self {
-        let upstream = TokioAsyncResolver::tokio(ResolverConfig::google(), ResolverOpts::default());
+        Self::with_sandbox(domains, None)
+    }
+
+    /// 创建绑定到指定 netns 的 DNS 代理。
+    pub fn with_sandbox(domains: Vec<String>, sandbox_id: impl Into<Option<String>>) -> Self {
+        let upstream =
+            TokioAsyncResolver::tokio(ResolverConfig::cloudflare(), ResolverOpts::default());
         Self {
             allowed: Arc::new(RwLock::new(domains.into_iter().collect())),
             upstream,
+            sandbox_id: sandbox_id.into(),
         }
     }
 
-    /// 检查域名是否在白名单中。
     pub async fn is_allowed(&self, domain: &str) -> bool {
+        let domain = domain.trim_end_matches('.');
         let allowed = self.allowed.read().await;
         allowed
             .iter()
             .any(|d| domain == d.as_str() || domain.ends_with(&format!(".{d}")))
+    }
+
+    fn allow_ip(&self, ip: &str) {
+        if let Some(sandbox_id) = &self.sandbox_id {
+            let _ = crate::nftables::allow_ip_host(sandbox_id, ip);
+        }
     }
 
     /// 启动 UDP DNS 服务器，监听 addr:53。
@@ -126,7 +138,7 @@ impl DnsProxy {
         Ok(())
     }
 
-    /// 转发 DNS 查询到上游解析器。
+    /// 转发 DNS 查询到上游解析器，并把解析出的地址加入当前 netns 白名单。
     async fn forward(&self, request: &Message, domain: &str, qtype: RecordType) -> Message {
         let mut response = Self::make_response(request, ResponseCode::NoError);
 
@@ -135,6 +147,7 @@ impl DnsProxy {
                 if let Ok(addrs) = self.upstream.lookup_ip(domain).await {
                     for addr in addrs.iter() {
                         if let std::net::IpAddr::V4(ipv4) = addr {
+                            self.allow_ip(&ipv4.to_string());
                             response.add_answer(hickory_proto::rr::Record::from_rdata(
                                 Name::from_ascii(domain).unwrap(),
                                 60,
@@ -150,6 +163,7 @@ impl DnsProxy {
                 if let Ok(addrs) = self.upstream.lookup_ip(domain).await {
                     for addr in addrs.iter() {
                         if let std::net::IpAddr::V6(ipv6) = addr {
+                            self.allow_ip(&ipv6.to_string());
                             response.add_answer(hickory_proto::rr::Record::from_rdata(
                                 Name::from_ascii(domain).unwrap(),
                                 60,

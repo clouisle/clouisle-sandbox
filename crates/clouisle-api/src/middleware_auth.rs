@@ -3,6 +3,7 @@
 //! 受保护路径需要 `Bearer <key>`。`/health` 与 `/metrics` 例外（探测端点）。
 
 use axum::extract::{Request, State};
+use axum::http::Method;
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 
@@ -23,8 +24,9 @@ pub async fn auth_middleware(
         return next.run(req).await;
     }
 
-    // dev 模式：未注册任何 key 时不强制认证（本地开发/测试）
-    if state.auth.is_empty().await {
+    // Development bypass is explicit on the authenticator; production instances
+    // created by main use a fail-closed authenticator.
+    if state.auth.is_empty().await && state.auth.allows_anonymous_dev() {
         req.extensions_mut().insert(Principal::dev());
         return next.run(req).await;
     }
@@ -36,6 +38,14 @@ pub async fn auth_middleware(
 
     match state.auth.authenticate(header).await {
         Ok(principal) => {
+            if matches!(
+                req.method(),
+                &Method::POST | &Method::PUT | &Method::PATCH | &Method::DELETE
+            ) && let Err(e) = state.auth.require_write(&principal)
+            {
+                let (status, body) = crate::error::into_error_response(e);
+                return (status, body).into_response();
+            }
             req.extensions_mut().insert(principal);
             next.run(req).await
         }

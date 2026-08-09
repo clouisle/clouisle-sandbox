@@ -46,7 +46,12 @@ impl Vmm for TestVmm {
     async fn snapshot(&self, _: &VmHandle, _k: SnapshotKind, _o: &SnapshotPaths) -> Result<()> {
         Ok(())
     }
-    async fn restore(&self, _: &clouisle_core::SandboxSpec, _: &SnapshotPaths) -> Result<VmHandle> {
+    async fn restore(
+        &self,
+        _: &str,
+        _: &clouisle_core::SandboxSpec,
+        _: &SnapshotPaths,
+    ) -> Result<VmHandle> {
         Ok(VmHandle {
             id: uuid::Uuid::now_v7().to_string(),
             backend: "test".into(),
@@ -81,10 +86,14 @@ fn app() -> Router {
         store,
         vmm,
         pool,
+        reservations: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+        manage_resources: true,
         agent: agent_conn,
         auth: Arc::new(auth::Authenticator::new()),
         #[cfg(target_os = "linux")]
         firewall: Arc::new(clouisle_net::FirewallManager::new()),
+        #[cfg(target_os = "linux")]
+        manage_network: false,
         version: "test",
     })
 }

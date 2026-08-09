@@ -17,6 +17,8 @@ service NodeService {
 
     // 转发命令执行
     rpc Exec(stream ExecStream) returns (stream ExecStream);
+    // Forward guest file operations for API routing to remote nodes.
+    rpc FileOp(FileRequest) returns (FileResponse);
 }
 
 message NodeInfo {
@@ -58,7 +60,8 @@ message DrainCommand {
 }
 
 message CreateSandboxRequest {
-    string spec_json = 1;  // JSON 序列化的 SandboxSpec
+    string sandbox_id = 1;
+    string spec_json = 2;  // JSON 序列化的 SandboxSpec
 }
 
 message SandboxHandle {
@@ -103,4 +106,47 @@ message ExecOutput {
 message ExecExit {
     string sandbox_id = 1;
     int32 exit_code = 2;
+}
+
+message FileRequest {
+    string sandbox_id = 1;
+    oneof op {
+        FileWrite write = 2;
+        FileRead read = 3;
+        FileList list = 4;
+    }
+}
+
+message FileWrite {
+    string path = 1;
+    bytes content = 2;
+    uint32 mode = 3;
+}
+
+message FileRead {
+    string path = 1;
+}
+
+message FileList {
+    string path = 1;
+}
+
+message FileEntry {
+    string name = 1;
+    uint64 size = 2;
+    uint32 mode = 3;
+    int64 mtime = 4;
+    bool is_dir = 5;
+}
+
+message FileResponse {
+    oneof result {
+        bool write_ok = 1;
+        bytes content = 2;
+        FileEntries entries = 3;
+    }
+}
+
+message FileEntries {
+    repeated FileEntry entries = 1;
 }

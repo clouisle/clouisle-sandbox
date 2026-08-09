@@ -1,13 +1,14 @@
 //! 沙盒生命周期 handler（FR-01）。
 
 use axum::Json;
-use axum::extract::{Path, Query, State};
+use axum::extract::{Extension, Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use serde::{Deserialize, Serialize};
 
 use clouisle_core::{ClouisleError, Sandbox, SandboxEvent, SandboxSpec, SandboxStatus};
 
+use crate::auth::Principal;
 use crate::error::ApiError;
 use crate::state::AppState;
 
@@ -39,11 +40,34 @@ pub struct ListResponse {
     pub total: usize,
 }
 
-/// 创建沙盒。
+fn redact_secrets(mut sandbox: Sandbox) -> Sandbox {
+    for secret in &mut sandbox.spec.secrets {
+        secret.value = "[REDACTED]".to_string();
+    }
+    sandbox
+}
+
+async fn materialize_secrets(
+    conn: &dyn crate::agent::AgentConnection,
+    sandbox: &Sandbox,
+) -> Result<(), ClouisleError> {
+    for secret in &sandbox.spec.secrets {
+        conn.write_file(
+            &format!("/run/secrets/{}", secret.name),
+            bytes::Bytes::copy_from_slice(secret.value.as_bytes()),
+            0o600,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
 pub async fn create_sandbox(
     State(state): State<AppState>,
-    Json(req): Json<CreateSandboxRequest>,
+    Extension(principal): Extension<Principal>,
+    Json(mut req): Json<CreateSandboxRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
+    req.spec.tenant_id = Some(principal.tenant_id.clone());
     // 1. 校验 spec
     if let Err(errors) = req.spec.validate() {
         return Err(ApiError(ClouisleError::validation(format!(
@@ -51,8 +75,12 @@ pub async fn create_sandbox(
         ))));
     }
 
-    // 2. 准入控制（预留资源）
-    let _reservation = state.pool.admit(&req.spec).await?;
+    // Remote nodes own their own pools; local VMMs retain permits here.
+    let reservation = if state.manage_resources {
+        Some(state.pool.admit(&req.spec).await?)
+    } else {
+        None
+    };
 
     // 3. 建沙盒记录
     let id = uuid::Uuid::now_v7().to_string();
@@ -61,26 +89,18 @@ pub async fn create_sandbox(
     state.store.create_sandbox(&sandbox).await?;
     tracing::info!(sandbox_id = %id, "sandbox admitted");
 
-    // 4. 创建 TAP 设备（网络隔离前置，VMM 需要已知 TAP 名）
-    let _tap_name = {
-        #[cfg(target_os = "linux")]
-        {
-            let tap = match state.firewall.create_network(&id).await {
-                Ok(t) => t,
-                Err(e) => {
-                    state
-                        .store
-                        .update_sandbox_status(&id, &SandboxStatus::Error)
-                        .await
-                        .ok();
-                    return Err(e.into());
-                }
-            };
-            Some(tap)
-        }
-        #[cfg(not(target_os = "linux"))]
-        None::<String>
-    };
+    // 4. 创建管理面 TAP；network.enabled=false 仍需 TCP agent 通道。
+    #[cfg(target_os = "linux")]
+    if state.manage_network
+        && let Err(error) = state.firewall.create_network(&id).await
+    {
+        state
+            .store
+            .update_sandbox_status(&id, &SandboxStatus::Error)
+            .await
+            .ok();
+        return Err(error.into());
+    }
 
     // 5. VMM create + start
     let start = std::time::Instant::now();
@@ -93,7 +113,9 @@ pub async fn create_sandbox(
                 .await
                 .ok();
             #[cfg(target_os = "linux")]
-            let _ = state.firewall.teardown_sandbox_network(&id).await;
+            if state.manage_network {
+                let _ = state.firewall.teardown_sandbox_network(&id).await;
+            }
             return Err(e.into());
         }
     };
@@ -123,21 +145,27 @@ pub async fn create_sandbox(
             .ok();
         let _ = state.vmm.stop(&handle, clouisle_vmm::StopMode::Force).await;
         #[cfg(target_os = "linux")]
-        let _ = state.firewall.teardown_sandbox_network(&id).await;
+        if state.manage_network {
+            let _ = state.firewall.teardown_sandbox_network(&id).await;
+        }
         return Err(e.into());
     }
 
-    // 6. 配置网络隔离 + nftables + DNS 代理（Linux only）
+    // 6. nftables 以 allowlist 控制出站；禁网时 allowlist 为空。
     #[cfg(target_os = "linux")]
-    {
-        let veth_host_ip = format!("{}/30", clouisle_net::netns::gateway_ip(&id));
-        let allow = req.spec.network.allow_egress.clone();
-        if let Err(e) = state
+    if state.manage_network {
+        let gateway = format!("{}/30", clouisle_net::netns::gateway_ip(&id));
+        let allow = if req.spec.network.enabled {
+            req.spec.network.allow_egress.clone()
+        } else {
+            Vec::new()
+        };
+        if let Err(error) = state
             .firewall
-            .setup_sandbox_network(&id, &veth_host_ip, &allow)
+            .setup_sandbox_network(&id, &gateway, &allow)
             .await
         {
-            tracing::error!(sandbox_id = %id, error = %e, "firewall setup failed");
+            tracing::error!(sandbox_id = %id, error = %error, "firewall setup failed");
             state
                 .store
                 .update_sandbox_status(&id, &SandboxStatus::Error)
@@ -145,7 +173,7 @@ pub async fn create_sandbox(
                 .ok();
             let _ = state.vmm.stop(&handle, clouisle_vmm::StopMode::Force).await;
             let _ = state.firewall.teardown_sandbox_network(&id).await;
-            return Err(e.into());
+            return Err(error.into());
         }
     }
 
@@ -153,13 +181,27 @@ pub async fn create_sandbox(
     let start_timeout = tokio::time::Duration::from_secs(req.spec.start_timeout_secs);
     let hello =
         tokio::time::timeout(start_timeout, state.agent.connect_and_hello(&handle, &id)).await;
-
     match hello {
-        Ok(Ok(_conn)) => {
+        Ok(Ok(conn)) => {
+            if let Err(error) = materialize_secrets(conn.as_ref(), &sandbox).await {
+                state
+                    .store
+                    .update_sandbox_status(&id, &SandboxStatus::Error)
+                    .await
+                    .ok();
+                let _ = state.vmm.stop(&handle, clouisle_vmm::StopMode::Force).await;
+                #[cfg(target_os = "linux")]
+                let _ = state.firewall.teardown_sandbox_network(&id).await;
+                return Err(error.into());
+            }
             sandbox.transition(SandboxEvent::AgentHello)?;
             state
                 .store
                 .update_sandbox_status(&id, &SandboxStatus::Running)
+                .await?;
+            state
+                .store
+                .update_sandbox_expiry(&id, sandbox.expires_at)
                 .await?;
             let dur = start.elapsed().as_millis() as f64;
             clouisle_obs::metrics::record_sandbox_create(
@@ -167,7 +209,14 @@ pub async fn create_sandbox(
                 dur,
             );
             tracing::info!(sandbox_id = %id, duration_ms = dur, "sandbox running");
-            Ok((StatusCode::CREATED, Json(sandbox)))
+            if let Some(reservation) = reservation {
+                state
+                    .reservations
+                    .lock()
+                    .await
+                    .insert(id.clone(), reservation);
+            }
+            Ok((StatusCode::CREATED, Json(redact_secrets(sandbox))))
         }
         Ok(Err(e)) => {
             state
@@ -197,31 +246,44 @@ pub async fn create_sandbox(
     }
 }
 
-/// `GET /api/v1/sandboxes/{id}`
 pub async fn get_sandbox(
     State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
     Path(id): Path<String>,
 ) -> Result<Json<Sandbox>, ApiError> {
     let sb = state.store.get_sandbox(&id).await?;
-    Ok(Json(sb))
+    state.auth.require_tenant(&principal, &sb)?;
+    Ok(Json(redact_secrets(sb)))
 }
 
-/// `GET /api/v1/sandboxes`
 pub async fn list_sandboxes(
     State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
     Query(q): Query<ListQuery>,
 ) -> Result<Json<ListResponse>, ApiError> {
-    let status = q.status.as_deref().map(|s| match s {
-        "pending" => SandboxStatus::Pending,
-        "starting" => SandboxStatus::Starting,
-        "running" => SandboxStatus::Running,
-        "stopping" => SandboxStatus::Stopping,
-        "stopped" => SandboxStatus::Stopped,
-        "error" => SandboxStatus::Error,
-        _ => SandboxStatus::Pending, // 未知过滤条件按空处理由调用方感知
-    });
+    let status = match q.status.as_deref() {
+        None => None,
+        Some("pending") => Some(SandboxStatus::Pending),
+        Some("starting") => Some(SandboxStatus::Starting),
+        Some("running") => Some(SandboxStatus::Running),
+        Some("stopping") => Some(SandboxStatus::Stopping),
+        Some("stopped") => Some(SandboxStatus::Stopped),
+        Some("error") => Some(SandboxStatus::Error),
+        Some(value) => {
+            return Err(ApiError(ClouisleError::validation(format!(
+                "unknown sandbox status: {value}"
+            ))));
+        }
+    };
 
-    let all = state.store.list_sandboxes(status).await?;
+    let all = state
+        .store
+        .list_sandboxes(status)
+        .await?
+        .into_iter()
+        .filter(|sandbox| sandbox.spec.tenant_id.as_deref() == Some(principal.tenant_id.as_str()))
+        .map(redact_secrets)
+        .collect::<Vec<_>>();
     let total = all.len();
     let offset = q.offset.unwrap_or(0).min(all.len());
     let limit = q.limit.unwrap_or(100).max(1);
@@ -229,33 +291,35 @@ pub async fn list_sandboxes(
     Ok(Json(ListResponse { items, total }))
 }
 
-/// `DELETE /api/v1/sandboxes/{id}`
 pub async fn delete_sandbox(
     State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
     let sb = state.store.get_sandbox(&id).await?;
+    state.auth.require_tenant(&principal, &sb)?;
 
-    // 若 VMM 在跑，先停
-    if let Some(pid) = sb.vmm_meta.pid {
-        let handle = clouisle_vmm::VmHandle {
-            id: sb.vmm_meta.vmm_id.clone().unwrap_or_else(|| id.clone()),
-            backend: sb.vmm_meta.backend.clone(),
-            pid: Some(pid),
-            api_socket: sb.vmm_meta.api_socket.clone(),
-            vsock_socket: sb.vmm_meta.vsock_socket.clone(),
-            vsock_cid: sb.vmm_meta.vsock_cid,
-        };
+    // The VMM owner may be remote, so PID absence must not skip deletion.
+    let handle = clouisle_vmm::VmHandle {
+        id: sb.vmm_meta.vmm_id.clone().unwrap_or_else(|| id.clone()),
+        backend: sb.vmm_meta.backend.clone(),
+        pid: sb.vmm_meta.pid,
+        api_socket: sb.vmm_meta.api_socket.clone(),
+        vsock_socket: sb.vmm_meta.vsock_socket.clone(),
+        vsock_cid: sb.vmm_meta.vsock_cid,
+    };
+    if sb.vmm_meta.vmm_id.is_some() {
         let _ = state.vmm.stop(&handle, clouisle_vmm::StopMode::Force).await;
     }
 
     state.store.delete_sandbox(&id).await?;
+    state.reservations.lock().await.remove(&id);
     // 清理网络隔离（Linux only）
     #[cfg(target_os = "linux")]
+    if state.manage_network
+        && let Err(error) = state.firewall.teardown_sandbox_network(&id).await
     {
-        if let Err(e) = state.firewall.teardown_sandbox_network(&id).await {
-            tracing::warn!(sandbox_id = %id, error = %e, "firewall teardown failed");
-        }
+        tracing::warn!(sandbox_id = %id, error = %error, "firewall teardown failed");
     }
     Ok(StatusCode::NO_CONTENT)
 }

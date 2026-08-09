@@ -6,14 +6,14 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use tokio::sync::RwLock;
 
-use clouisle_core::{ExecutionRecord, Sandbox, SandboxStatus};
-
 use super::store_trait::{Store, StoreError, StoreResult};
+use clouisle_core::{ExecutionRecord, RegisteredNode, Sandbox, SandboxStatus};
 
 #[derive(Debug, Clone, Default)]
 pub struct InMemoryStore {
     sandboxes: Arc<RwLock<HashMap<String, Sandbox>>>,
     executions: Arc<RwLock<HashMap<String, ExecutionRecord>>>,
+    nodes: Arc<RwLock<HashMap<String, RegisteredNode>>>,
 }
 
 impl InMemoryStore {
@@ -70,6 +70,19 @@ impl Store for InMemoryStore {
         Ok(())
     }
 
+    async fn update_sandbox_expiry(
+        &self,
+        id: &str,
+        expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> StoreResult<()> {
+        let mut map = self.sandboxes.write().await;
+        let sandbox = map
+            .get_mut(id)
+            .ok_or_else(|| StoreError::NotFound(format!("sandbox {id} not found")))?;
+        sandbox.expires_at = expires_at;
+        Ok(())
+    }
+
     async fn list_sandboxes(&self, status: Option<SandboxStatus>) -> StoreResult<Vec<Sandbox>> {
         let map = self.sandboxes.read().await;
         let all: Vec<Sandbox> = map.values().cloned().collect();
@@ -84,6 +97,27 @@ impl Store for InMemoryStore {
         map.remove(id)
             .ok_or_else(|| StoreError::NotFound(format!("sandbox {id} not found")))?;
         Ok(())
+    }
+
+    async fn upsert_node(&self, node: &RegisteredNode) -> StoreResult<()> {
+        self.nodes
+            .write()
+            .await
+            .insert(node.info.node_id.clone(), node.clone());
+        Ok(())
+    }
+
+    async fn list_ready_nodes(&self, now_ms: i64) -> StoreResult<Vec<RegisteredNode>> {
+        Ok(self
+            .nodes
+            .read()
+            .await
+            .values()
+            .filter(|node| {
+                node.status == clouisle_core::NodeStatus::Ready && node.last_heartbeat_ms >= now_ms
+            })
+            .cloned()
+            .collect())
     }
 
     async fn save_execution(&self, record: &ExecutionRecord) -> StoreResult<()> {

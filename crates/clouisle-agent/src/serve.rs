@@ -23,6 +23,7 @@ pub fn process_frames(decoder: &mut FrameDecoder, data: &[u8]) -> AgentResult<Ve
 }
 
 /// 处理单条 host 帧，产生响应帧流。
+/// 该同步辅助仅供无 socket 的单元测试使用；TCP 服务使用 `run_exec`。
 pub fn handle_frame(frame: Frame) -> AgentResult<Vec<Frame>> {
     match frame {
         Frame::Ping => Ok(vec![Frame::Pong]),
@@ -35,7 +36,7 @@ pub fn handle_frame(frame: Frame) -> AgentResult<Vec<Frame>> {
             env,
             cwd,
             timeout_ms,
-        } => Ok(run_exec(&id, argv, env, cwd, timeout_ms)),
+        } => Ok(run_exec_sync(&id, argv, env, cwd, timeout_ms)),
         other => Ok(vec![Frame::Error {
             message: format!("unrecognized host frame: {other:?}"),
             code: 2,
@@ -43,8 +44,8 @@ pub fn handle_frame(frame: Frame) -> AgentResult<Vec<Frame>> {
     }
 }
 
-/// 在本地执行命令（CI 无 AF_VSOCK，用 std::process 模拟 guest 执行）。
-fn run_exec(
+/// 在本地同步执行命令，仅供无 socket 的单元测试使用。
+fn run_exec_sync(
     id: &str,
     argv: Vec<String>,
     env: HashMap<String, String>,
@@ -62,29 +63,8 @@ fn run_exec(
     if let Some(c) = cwd {
         cmd.current_dir(c);
     }
-
-    // 简化：spawn + wait，无 token 级 select（真实实现用 tokio + killpg）
     match cmd.output() {
-        Ok(out) => {
-            let mut frames = Vec::new();
-            if !out.stdout.is_empty() {
-                frames.push(Frame::Stdout {
-                    id: id.into(),
-                    chunk: Bytes::from(out.stdout),
-                });
-            }
-            if !out.stderr.is_empty() {
-                frames.push(Frame::Stderr {
-                    id: id.into(),
-                    chunk: Bytes::from(out.stderr),
-                });
-            }
-            frames.push(Frame::Exited {
-                id: id.into(),
-                code: out.status.code().unwrap_or(-1),
-            });
-            frames
-        }
+        Ok(out) => output_frames(id, out.status.code().unwrap_or(-1), out.stdout, out.stderr),
         Err(e) => vec![Frame::Error {
             message: format!("spawn failed: {e}"),
             code: 3,
@@ -92,7 +72,183 @@ fn run_exec(
     }
 }
 
-/// 服务主循环原型（读一帧测一帧）。真实版本在 Linux 上用 vsock socket + tokio。
+fn output_frames(id: &str, code: i32, stdout: Vec<u8>, stderr: Vec<u8>) -> Vec<Frame> {
+    let mut frames = Vec::new();
+    if !stdout.is_empty() {
+        frames.push(Frame::Stdout {
+            id: id.into(),
+            chunk: Bytes::from(stdout),
+        });
+    }
+    if !stderr.is_empty() {
+        frames.push(Frame::Stderr {
+            id: id.into(),
+            chunk: Bytes::from(stderr),
+        });
+    }
+    frames.push(Frame::Exited {
+        id: id.into(),
+        code,
+    });
+    frames
+}
+
+/// 在 guest 中异步执行命令，超时后杀死整个命令进程组。
+async fn run_exec(
+    id: &str,
+    argv: Vec<String>,
+    env: HashMap<String, String>,
+    cwd: Option<String>,
+    timeout_ms: u64,
+) -> Vec<Frame> {
+    use tokio::io::AsyncReadExt;
+
+    if argv.is_empty() {
+        return vec![Frame::Exited {
+            id: id.into(),
+            code: -1,
+        }];
+    }
+
+    let mut cmd = tokio::process::Command::new(&argv[0]);
+    cmd.args(&argv[1..])
+        .envs(env)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    if let Some(c) = cwd {
+        cmd.current_dir(c);
+    }
+    #[cfg(unix)]
+    cmd.process_group(0);
+
+    let mut child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(e) => {
+            return vec![Frame::Error {
+                message: format!("spawn failed: {e}"),
+                code: 3,
+            }];
+        }
+    };
+    let pid = child.id();
+    let mut stdout = child.stdout.take().expect("stdout piped");
+    let mut stderr = child.stderr.take().expect("stderr piped");
+    let stdout_task = tokio::spawn(async move {
+        let mut bytes = Vec::new();
+        let _ = stdout.read_to_end(&mut bytes).await;
+        bytes
+    });
+    let stderr_task = tokio::spawn(async move {
+        let mut bytes = Vec::new();
+        let _ = stderr.read_to_end(&mut bytes).await;
+        bytes
+    });
+
+    let code = match tokio::time::timeout(
+        std::time::Duration::from_millis(timeout_ms),
+        child.wait(),
+    )
+    .await
+    {
+        Ok(Ok(status)) => status.code().unwrap_or(-1),
+        Ok(Err(e)) => {
+            return vec![Frame::Error {
+                message: format!("wait failed: {e}"),
+                code: 3,
+            }];
+        }
+        Err(_) => {
+            #[cfg(unix)]
+            if let Some(pid) = pid {
+                // `process_group(0)` creates a group led by the child PID.
+                unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
+            }
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            -1
+        }
+    };
+    let stdout = stdout_task.await.unwrap_or_default();
+    let stderr = stderr_task.await.unwrap_or_default();
+    output_frames(id, code, stdout, stderr)
+}
+
+fn guest_path(path: &str) -> Result<std::path::PathBuf, String> {
+    use std::path::Component;
+
+    if path.is_empty() {
+        return Err("path is required".into());
+    }
+    let parsed = std::path::Path::new(path);
+    if parsed
+        .components()
+        .any(|component| matches!(component, Component::ParentDir | Component::Prefix(_)))
+    {
+        return Err(format!("path traversal is not allowed: {path}"));
+    }
+    Ok(parsed.to_path_buf())
+}
+
+fn write_file(path: String, mode: u32, content: Bytes) -> Result<Frame, String> {
+    let target = guest_path(&path)?;
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("create parent directory: {e}"))?;
+    }
+    std::fs::write(&target, content).map_err(|e| format!("write {path}: {e}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(mode))
+            .map_err(|e| format!("chmod {path}: {e}"))?;
+    }
+    Ok(Frame::WriteFileResult { path })
+}
+
+fn read_file(path: String, offset: u64, length: u64) -> Result<Frame, String> {
+    let target = guest_path(&path)?;
+    let content = std::fs::read(&target).map_err(|e| format!("read {path}: {e}"))?;
+    let start = usize::try_from(offset).map_err(|_| "offset too large".to_string())?;
+    if start > content.len() {
+        return Err(format!("offset beyond end of file: {path}"));
+    }
+    let requested = usize::try_from(length).unwrap_or(usize::MAX);
+    let end = start.saturating_add(requested).min(content.len());
+    Ok(Frame::ReadFileResult {
+        path,
+        content: Bytes::copy_from_slice(&content[start..end]),
+    })
+}
+
+fn list_dir(path: String) -> Result<Frame, String> {
+    let target = guest_path(&path)?;
+    let mut entries = Vec::new();
+    for entry in std::fs::read_dir(&target).map_err(|e| format!("list {path}: {e}"))? {
+        let entry = entry.map_err(|e| format!("read directory entry: {e}"))?;
+        let metadata = entry.metadata().map_err(|e| format!("stat entry: {e}"))?;
+        #[cfg(unix)]
+        use std::os::unix::fs::PermissionsExt;
+        #[cfg(unix)]
+        let mode = metadata.permissions().mode();
+        #[cfg(not(unix))]
+        let mode = 0;
+        let mtime = metadata
+            .modified()
+            .ok()
+            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|duration| duration.as_secs() as i64)
+            .unwrap_or_default();
+        entries.push(clouisle_proto::DirEntry {
+            name: entry.file_name().to_string_lossy().into_owned(),
+            size: metadata.len(),
+            mode,
+            mtime,
+            is_dir: metadata.is_dir(),
+        });
+    }
+    Ok(Frame::ListDirResult { entries })
+}
+
+/// 服务主循环：每次请求都产生确定性的响应帧。
 pub async fn serve_loop<R, W>(reader: &mut R, writer: &mut W) -> AgentResult<()>
 where
     R: tokio::io::AsyncRead + Unpin,
@@ -100,42 +256,42 @@ where
 {
     loop {
         let frame = clouisle_proto::codec::read_frame(reader).await?;
-        if let Frame::ExecReq {
-            id,
-            argv,
-            env,
-            cwd,
-            timeout_ms,
-        } = frame
-        {
-            // 流式写回
-            for f in run_exec(&id, argv, env, cwd, timeout_ms) {
-                clouisle_proto::codec::write_frame(writer, &f).await?;
-            }
-        } else {
-            // Echo 简单帧
-            match frame {
-                Frame::Ping => clouisle_proto::codec::write_frame(writer, &Frame::Pong).await?,
-                Frame::Hello { .. } => {
-                    clouisle_proto::codec::write_frame(
-                        writer,
-                        &Frame::Hello {
-                            agent_version: env!("CARGO_PKG_VERSION").to_string(),
-                        },
-                    )
-                    .await?
-                }
-                _ => {
-                    clouisle_proto::codec::write_frame(
-                        writer,
-                        &Frame::Error {
-                            message: "unsupported".into(),
-                            code: 4,
-                        },
-                    )
-                    .await?
-                }
-            }
+        let responses = match frame {
+            Frame::ExecReq {
+                id,
+                argv,
+                env,
+                cwd,
+                timeout_ms,
+            } => run_exec(&id, argv, env, cwd, timeout_ms).await,
+            Frame::WriteFile {
+                path,
+                mode,
+                content,
+            } => write_file(path, mode, content)
+                .map(|frame| vec![frame])
+                .unwrap_or_else(|message| vec![Frame::Error { message, code: 3 }]),
+            Frame::ReadFile {
+                path,
+                offset,
+                length,
+            } => read_file(path, offset, length)
+                .map(|frame| vec![frame])
+                .unwrap_or_else(|message| vec![Frame::Error { message, code: 3 }]),
+            Frame::ListDir { path } => list_dir(path)
+                .map(|frame| vec![frame])
+                .unwrap_or_else(|message| vec![Frame::Error { message, code: 3 }]),
+            Frame::Ping => vec![Frame::Pong],
+            Frame::Hello { .. } => vec![Frame::Hello {
+                agent_version: env!("CARGO_PKG_VERSION").to_string(),
+            }],
+            other => vec![Frame::Error {
+                message: format!("unsupported frame: {other:?}"),
+                code: 4,
+            }],
+        };
+        for response in responses {
+            clouisle_proto::codec::write_frame(writer, &response).await?;
         }
     }
 }
@@ -156,14 +312,14 @@ pub async fn run_serve() -> AgentResult<()> {
     let addr = format!("0.0.0.0:{AGENT_PORT}");
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
-        .map_err(|e| AgentError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+        .map_err(|e| AgentError::Io(std::io::Error::other(e)))?;
     tracing::info!("agent listening on TCP {addr}");
 
     loop {
         let (stream, peer) = listener
             .accept()
             .await
-            .map_err(|e| AgentError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+            .map_err(|e| AgentError::Io(std::io::Error::other(e)))?;
         tracing::info!("connection from {peer}");
         let (mut reader, mut writer) = tokio::io::split(stream);
         tokio::spawn(async move {
@@ -249,6 +405,85 @@ mod tests {
             Frame::Exited { code, .. } => assert_eq!(code, 0),
             other => panic!("expected Exited, got {other:?}"),
         }
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn serve_loop_file_roundtrip_and_traversal_rejection() {
+        let path = format!("/tmp/clouisle-agent-test-{}.txt", std::process::id());
+        let (mut client, server_side) = duplex(4096);
+        let (mut reader, mut writer) = tokio::io::split(server_side);
+        let server = tokio::spawn(async move { serve_loop(&mut reader, &mut writer).await });
+
+        write_frame(
+            &mut client,
+            &Frame::WriteFile {
+                path: path.clone(),
+                mode: 0o600,
+                content: Bytes::from_static(b"hello"),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            read_frame(&mut client).await.unwrap(),
+            Frame::WriteFileResult { .. }
+        ));
+
+        write_frame(
+            &mut client,
+            &Frame::ReadFile {
+                path: path.clone(),
+                offset: 1,
+                length: 3,
+            },
+        )
+        .await
+        .unwrap();
+        match read_frame(&mut client).await.unwrap() {
+            Frame::ReadFileResult { content, .. } => assert_eq!(&content[..], b"ell"),
+            other => panic!("expected ReadFileResult, got {other:?}"),
+        }
+
+        write_frame(
+            &mut client,
+            &Frame::WriteFile {
+                path: "/tmp/../escape".into(),
+                mode: 0o600,
+                content: Bytes::from_static(b"no"),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            read_frame(&mut client).await.unwrap(),
+            Frame::Error { .. }
+        ));
+
+        let _ = std::fs::remove_file(path);
+        server.abort();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn serve_loop_timeout_kills_process_group() {
+        let (mut client, server_side) = duplex(4096);
+        let (mut reader, mut writer) = tokio::io::split(server_side);
+        let server = tokio::spawn(async move { serve_loop(&mut reader, &mut writer).await });
+        write_frame(
+            &mut client,
+            &Frame::ExecReq {
+                id: "timeout".into(),
+                argv: vec!["sh".into(), "-c".into(), "sleep 5".into()],
+                env: HashMap::new(),
+                cwd: None,
+                timeout_ms: 30,
+            },
+        )
+        .await
+        .unwrap();
+        let frame = read_frame(&mut client).await.unwrap();
+        assert!(matches!(frame, Frame::Exited { code: -1, .. }));
         server.abort();
     }
 }

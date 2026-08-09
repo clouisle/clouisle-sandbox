@@ -54,9 +54,6 @@ impl Sandbox {
     /// 构造一个处于 `Pending` 的新沙盒。
     pub fn new(id: String, spec: SandboxSpec) -> Self {
         let now = Utc::now();
-        let expires_at = spec
-            .ttl_secs
-            .map(|ttl| now + chrono::Duration::seconds(ttl as i64));
         Self {
             id,
             spec,
@@ -64,7 +61,8 @@ impl Sandbox {
             created_at: now,
             updated_at: now,
             ready_at: None,
-            expires_at,
+            // TTL is a running-sandbox lifetime, not a startup deadline.
+            expires_at: None,
             vmm_meta: VmmMeta::default(),
             terminal_message: None,
             node_id: None,
@@ -78,6 +76,10 @@ impl Sandbox {
         self.updated_at = Utc::now();
         if next == SandboxStatus::Running {
             self.ready_at = Some(self.updated_at);
+            self.expires_at = self
+                .spec
+                .ttl_secs
+                .map(|ttl| self.updated_at + chrono::Duration::seconds(ttl as i64));
         }
         Ok(())
     }
@@ -130,11 +132,14 @@ mod tests {
     }
 
     #[test]
-    fn ttl_sets_expires() {
+    fn ttl_starts_when_sandbox_is_running() {
         let mut sp = spec();
         sp.ttl_secs = Some(60);
-        let s = Sandbox::new("sbx-1".into(), sp);
-        assert!(s.expires_at.is_some());
+        let mut sandbox = Sandbox::new("sbx-1".into(), sp);
+        assert!(sandbox.expires_at.is_none());
+        sandbox.transition(SandboxEvent::Start).unwrap();
+        sandbox.transition(SandboxEvent::AgentHello).unwrap();
+        assert!(sandbox.expires_at.is_some());
     }
 
     #[test]

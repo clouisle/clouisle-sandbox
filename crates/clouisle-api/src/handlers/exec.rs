@@ -1,13 +1,14 @@
 //! 命令执行 handler（FR-02）：同步 + 流式 + 历史查询。
 
 use axum::Json;
-use axum::extract::{Path, Query, State};
+use axum::extract::{Extension, Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use serde::{Deserialize, Serialize};
 
 use clouisle_core::{ClouisleError, ExecutionRecord, ExecutionSpec, truncate_output};
 
+use crate::auth::Principal;
 use crate::error::ApiError;
 use crate::state::AppState;
 
@@ -75,8 +76,10 @@ pub struct ExecResponse {
 async fn ensure_executable(
     state: &AppState,
     sandbox_id: &str,
+    principal: &Principal,
 ) -> Result<clouisle_core::Sandbox, ApiError> {
     let sb = state.store.get_sandbox(sandbox_id).await?;
+    state.auth.require_tenant(principal, &sb)?;
     if !sb.is_executable() {
         return Err(ApiError(ClouisleError::invalid_state(format!(
             "sandbox {sandbox_id} is not running (status={})",
@@ -89,28 +92,24 @@ async fn ensure_executable(
 /// 同步执行。
 pub async fn exec_sync(
     State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
     Path(sandbox_id): Path<String>,
     Json(req): Json<ExecRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
+    let sb = ensure_executable(&state, &sandbox_id, &principal).await?;
+    let mut env = sb.spec.env.clone();
+    env.extend(req.env.clone());
     let spec = ExecutionSpec {
         argv: req.argv.clone(),
-        env: req.env.clone(),
+        env: env.clone(),
         cwd: req.cwd.clone(),
         timeout_ms: req.timeout_ms,
     };
     spec.validate()?;
-
-    let sb = ensure_executable(&state, &sandbox_id).await?;
     let handle = meta_to_handle(&sb.vmm_meta, &sandbox_id);
-
     let conn = state.agent.connect_and_hello(&handle, &sandbox_id).await?;
     let result = conn
-        .exec(
-            req.argv.clone(),
-            req.env.clone(),
-            req.cwd.clone(),
-            req.timeout_ms,
-        )
+        .exec(req.argv.clone(), env, req.cwd.clone(), req.timeout_ms)
         .await?;
 
     // 持久化执行记录
@@ -150,65 +149,82 @@ pub async fn exec_sync(
 /// 流式执行（SSE）。
 pub async fn exec_stream(
     State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
     Path(sandbox_id): Path<String>,
     Json(req): Json<ExecRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
-    // 简化：mock 模式下仍走同步路径，但以 SSE 格式返回。
+    let sb = ensure_executable(&state, &sandbox_id, &principal).await?;
+    let mut env = sb.spec.env.clone();
+    env.extend(req.env.clone());
     let spec = ExecutionSpec {
         argv: req.argv.clone(),
-        env: req.env.clone(),
+        env: env.clone(),
         cwd: req.cwd.clone(),
         timeout_ms: req.timeout_ms,
     };
     spec.validate()?;
-    let sb = ensure_executable(&state, &sandbox_id).await?;
     let handle = meta_to_handle(&sb.vmm_meta, &sandbox_id);
     let conn = state.agent.connect_and_hello(&handle, &sandbox_id).await?;
-    let result = conn
-        .exec(req.argv, req.env, req.cwd, req.timeout_ms)
-        .await?;
-
-    let stream = tokio_stream_fallback(result);
+    let (tx, rx) = tokio::sync::mpsc::channel(32);
+    tokio::spawn(async move {
+        if let Err(error) = conn
+            .exec_stream(req.argv, env, req.cwd, req.timeout_ms, tx.clone())
+            .await
+        {
+            let _ = tx
+                .send(crate::agent::ExecStreamEvent::Error(error.message))
+                .await;
+        }
+    });
+    use tokio_stream::StreamExt;
+    let stream = tokio_stream::wrappers::ReceiverStream::new(rx).map(|event| {
+        let event = match event {
+            crate::agent::ExecStreamEvent::Stdout(chunk) => axum::response::sse::Event::default()
+                .event("stdout")
+                .data(String::from_utf8_lossy(&chunk)),
+            crate::agent::ExecStreamEvent::Stderr(chunk) => axum::response::sse::Event::default()
+                .event("stderr")
+                .data(String::from_utf8_lossy(&chunk)),
+            crate::agent::ExecStreamEvent::Exit(code) => axum::response::sse::Event::default()
+                .event("exit")
+                .data(code.to_string()),
+            crate::agent::ExecStreamEvent::Error(message) => axum::response::sse::Event::default()
+                .event("error")
+                .data(message),
+        };
+        Ok::<_, std::convert::Infallible>(event)
+    });
     Ok(axum::response::Sse::new(stream))
-}
-
-fn tokio_stream_fallback(
-    result: clouisle_core::execution::ExecutionResult,
-) -> impl futures::Stream<Item = std::result::Result<axum::response::sse::Event, std::convert::Infallible>>
-{
-    use futures::stream;
-    let mut events = Vec::new();
-    if !result.stdout.is_empty() {
-        events.push(Ok(axum::response::sse::Event::default()
-            .event("stdout")
-            .data(String::from_utf8_lossy(&result.stdout))));
-    }
-    if !result.stderr.is_empty() {
-        events.push(Ok(axum::response::sse::Event::default()
-            .event("stderr")
-            .data(String::from_utf8_lossy(&result.stderr))));
-    }
-    events.push(Ok(axum::response::sse::Event::default()
-        .event("exit")
-        .data(format!("{}", result.exit_code))));
-    stream::iter(events)
 }
 
 /// `GET .../exec` 历史。
 pub async fn list_executions(
     State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
     Path(sandbox_id): Path<String>,
-    Query(_q): Query<ExecQuery>,
+    Query(q): Query<ExecQuery>,
 ) -> Result<Json<Vec<ExecutionRecord>>, ApiError> {
-    let list = state.store.list_executions(&sandbox_id).await?;
+    let sandbox = state.store.get_sandbox(&sandbox_id).await?;
+    state.auth.require_tenant(&principal, &sandbox)?;
+    let limit = q.limit.unwrap_or(100);
+    let list = state
+        .store
+        .list_executions(&sandbox_id)
+        .await?
+        .into_iter()
+        .take(limit)
+        .collect();
     Ok(Json(list))
 }
 
 /// `GET .../exec/{exec_id}` 单条。
 pub async fn get_execution(
     State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
     Path((sandbox_id, exec_id)): Path<(String, String)>,
 ) -> Result<Json<ExecutionRecord>, ApiError> {
+    let sandbox = state.store.get_sandbox(&sandbox_id).await?;
+    state.auth.require_tenant(&principal, &sandbox)?;
     let rec = state.store.get_execution(&exec_id).await?;
     if rec.sandbox_id != sandbox_id {
         return Err(ApiError(ClouisleError::not_found(format!(

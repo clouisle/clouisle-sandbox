@@ -78,6 +78,25 @@ impl SandboxSpec {
             ));
         }
 
+        let mut secret_names = std::collections::HashSet::new();
+        for secret in &self.secrets {
+            if secret.name.is_empty()
+                || secret.name == "."
+                || secret.name == ".."
+                || secret.name.contains(['/', '\\', '\0'])
+            {
+                errors.push(ValidationError::new(
+                    "secrets",
+                    "secret names must be non-empty file names without path separators",
+                ));
+            } else if !secret_names.insert(&secret.name) {
+                errors.push(ValidationError::new(
+                    "secrets",
+                    "secret names must be unique",
+                ));
+            }
+        }
+
         if errors.is_empty() {
             Ok(())
         } else {
@@ -145,5 +164,32 @@ mod tests {
         let a = valid_spec();
         let b = valid_spec();
         assert_eq!(a.pool_key(), b.pool_key());
+    }
+
+    #[test]
+    fn rejects_path_like_or_duplicate_secret_names() {
+        let mut spec = valid_spec();
+        spec.secrets = vec![
+            SecretSpec {
+                name: "../escape".into(),
+                value: "x".into(),
+            },
+            SecretSpec {
+                name: "same".into(),
+                value: "x".into(),
+            },
+            SecretSpec {
+                name: "same".into(),
+                value: "y".into(),
+            },
+        ];
+        let errors = spec.validate().unwrap_err();
+        assert_eq!(
+            errors
+                .iter()
+                .filter(|error| error.field == "secrets")
+                .count(),
+            2
+        );
     }
 }

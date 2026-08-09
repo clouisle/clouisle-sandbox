@@ -30,6 +30,11 @@ spec:
                 secretKeyRef:
                   name: clouisle-db
                   key: dsn
+            - name: CLOUISLE_API_KEYS
+              valueFrom:
+                secretKeyRef:
+                  name: clouisle-api-keys
+                  key: keys
           ports:
             - containerPort: 8080
           # 优雅关闭：SIGTERM → /health/ready 返回 503 → LB 摘流 → 等 30s → 退出
@@ -69,3 +74,13 @@ metadata:
 type: Opaque
 stringData:
   dsn: "postgres://clouisle:changeme@postgres:5432/clouisle"
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: clouisle-api-keys
+  namespace: clouisle
+type: Opaque
+stringData:
+  # Replace before deployment. Format: key:tenant:read|full, comma-separated.
+  keys: "replace-before-deploy:default:full"

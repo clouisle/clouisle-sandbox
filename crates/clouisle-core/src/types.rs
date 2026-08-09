@@ -63,6 +63,20 @@ pub struct NodeStatusReport {
     pub load_avg: [f64; 3],
 }
 
+/// Persisted control-plane view of a node agent.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RegisteredNode {
+    pub info: NodeInfo,
+    /// Authenticated gRPC address used for lifecycle forwarding.
+    pub endpoint: String,
+    pub status: NodeStatus,
+    /// Unix milliseconds of the latest accepted heartbeat.
+    pub last_heartbeat_ms: i64,
+    pub allocated_vcpu: u16,
+    pub allocated_memory_mb: u64,
+    pub running_sandboxes: usize,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

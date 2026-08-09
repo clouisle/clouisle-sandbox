@@ -6,6 +6,7 @@ name = "clouisle-bench"
 version.workspace = true
 edition.workspace = true
 
+
 [[bench]]
 name = "boot_latency"
 harness = false

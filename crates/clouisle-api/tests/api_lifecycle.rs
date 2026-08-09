@@ -68,7 +68,7 @@ impl Vmm for TestVmm {
     async fn snapshot(&self, _h: &VmHandle, _k: SnapshotKind, _o: &SnapshotPaths) -> Result<()> {
         Ok(())
     }
-    async fn restore(&self, _s: &SandboxSpec, _f: &SnapshotPaths) -> Result<VmHandle> {
+    async fn restore(&self, _: &str, _s: &SandboxSpec, _f: &SnapshotPaths) -> Result<VmHandle> {
         Ok(VmHandle {
             id: uuid::Uuid::now_v7().to_string(),
             backend: "test".into(),
@@ -104,10 +104,14 @@ fn test_state() -> AppState {
         store,
         vmm,
         pool,
+        reservations: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+        manage_resources: true,
         agent: agent_conn,
         auth: Arc::new(auth::Authenticator::new()),
         #[cfg(target_os = "linux")]
         firewall: Arc::new(clouisle_net::FirewallManager::new()),
+        #[cfg(target_os = "linux")]
+        manage_network: false,
         version: "test",
     }
 }
@@ -372,7 +376,11 @@ async fn concurrent_creates_no_crosstalk() {
             created += 1;
         }
     }
-    assert_eq!(created, 20, "all 20 should create");
+    let expected = AppState::host_capacity().vcpu.min(20) as usize;
+    assert_eq!(
+        created, expected,
+        "admission must hold capacity permits across concurrent creates"
+    );
 }
 
 #[tokio::test]
@@ -404,4 +412,178 @@ async fn exec_history_recorded() {
     let (status, body) = get(&app, &format!("/api/v1/sandboxes/{id}/exec/{exec_id}")).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["exit_code"], 0);
+}
+
+#[tokio::test]
+async fn sandbox_environment_is_inherited_and_exec_environment_overrides_it() {
+    let app = app();
+    let (_, body) = post_json(
+        &app,
+        "/api/v1/sandboxes",
+        serde_json::json!({
+            "image": { "reference": "alpine" },
+            "resources": { "vcpu": 1, "memory_mb": 64, "disk_mb": 512 },
+            "env": { "FROM_SANDBOX": "sandbox", "OVERRIDE": "old" }
+        }),
+    )
+    .await;
+    let id = body["id"].as_str().unwrap();
+    let (status, inherited) = post_json(
+        &app,
+        &format!("/api/v1/sandboxes/{id}/exec"),
+        serde_json::json!({ "argv": ["printenv", "FROM_SANDBOX"] }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(inherited["stdout"], "sandbox\n");
+    let (status, overridden) = post_json(
+        &app,
+        &format!("/api/v1/sandboxes/{id}/exec"),
+        serde_json::json!({ "argv": ["printenv", "OVERRIDE"], "env": { "OVERRIDE": "request" } }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(overridden["stdout"], "request\n");
+}
+
+#[tokio::test]
+async fn secrets_are_redacted_and_path_like_names_are_rejected() {
+    let app = app();
+    let (status, created) = post_json(
+        &app,
+        "/api/v1/sandboxes",
+        serde_json::json!({
+            "image": { "reference": "alpine" },
+            "secrets": [{ "name": "TOKEN", "value": "must-not-leak" }]
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(created["spec"]["secrets"][0]["value"], "[REDACTED]");
+    let (_, invalid) = post_json(
+        &app,
+        "/api/v1/sandboxes",
+        serde_json::json!({
+            "image": { "reference": "alpine" },
+            "secrets": [{ "name": "../escape", "value": "x" }]
+        }),
+    )
+    .await;
+    assert_eq!(invalid["error"]["code"], "VALIDATION");
+}
+
+#[tokio::test]
+async fn execution_history_limit_and_unknown_status_are_validated() {
+    let app = app();
+    let (_, body) = post_json(
+        &app,
+        "/api/v1/sandboxes",
+        serde_json::json!({ "image": { "reference": "alpine" } }),
+    )
+    .await;
+    let id = body["id"].as_str().unwrap();
+    for _ in 0..2 {
+        let (status, _) = post_json(
+            &app,
+            &format!("/api/v1/sandboxes/{id}/exec"),
+            serde_json::json!({ "argv": ["echo", "x"] }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+    let (status, limited) = get(&app, &format!("/api/v1/sandboxes/{id}/exec?limit=1")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(limited.as_array().unwrap().len(), 1);
+    let (status, _) = get(&app, "/api/v1/sandboxes?status=unknown").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn production_authentication_enforces_scope_and_tenant_ownership() {
+    let authenticator = auth::Authenticator::new_production();
+    authenticator
+        .register("owner-key", "tenant-a", auth::Scope::Full)
+        .await;
+    authenticator
+        .register("reader-key", "tenant-b", auth::Scope::Read)
+        .await;
+    authenticator
+        .register("other-key", "tenant-b", auth::Scope::Full)
+        .await;
+    let mut state = test_state();
+    state.auth = Arc::new(authenticator);
+    let app = build_router(state);
+
+    let unauthenticated = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/v1/sandboxes")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+
+    let readonly_create = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/sandboxes")
+                .header("authorization", "Bearer reader-key")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "image": { "reference": "alpine" },
+                        "resources": { "vcpu": 1, "memory_mb": 64, "disk_mb": 512 }
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(readonly_create.status(), StatusCode::FORBIDDEN);
+
+    let created = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/sandboxes")
+                .header("authorization", "Bearer owner-key")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "image": { "reference": "alpine" },
+                        "resources": { "vcpu": 1, "memory_mb": 64, "disk_mb": 512 }
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let body = to_bytes(created.into_body(), 1024 * 1024).await.unwrap();
+    let id = serde_json::from_slice::<serde_json::Value>(&body).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let cross_tenant = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/api/v1/sandboxes/{id}"))
+                .header("authorization", "Bearer other-key")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(cross_tenant.status(), StatusCode::NOT_FOUND);
 }

@@ -1,5 +1,6 @@
 //! 全局应用状态。
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use clouisle_core::Resources;
@@ -19,10 +20,17 @@ pub struct AppState {
     pub store: Arc<dyn Store>,
     pub vmm: Arc<dyn Vmm>,
     pub pool: Arc<ResourcePool>,
+    /// Reservations held for each live local sandbox; dropping on delete releases capacity.
+    pub reservations: Arc<tokio::sync::Mutex<HashMap<String, clouisle_scheduler::Reservation>>>,
+    /// True only when this API directly owns the local VMM resource pool.
+    pub manage_resources: bool,
     pub agent: Arc<dyn AgentConnector>,
     pub auth: Arc<Authenticator>,
     #[cfg(target_os = "linux")]
     pub firewall: Arc<FirewallManager>,
+    /// Production owns netns/TAP lifecycle; HTTP test fixtures disable it.
+    #[cfg(target_os = "linux")]
+    pub manage_network: bool,
     /// 服务版本
     pub version: &'static str,
 }

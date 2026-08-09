@@ -4,6 +4,7 @@ x-firecracker-volumes: &fc-volumes
   - /dev/kvm:/dev/kvm                     # KVM 透传（必须）
   - /opt/clouisle/vmlinux:/opt/clouisle/vmlinux:ro  # guest 内核
   - /opt/clouisle/rootfs:/opt/clouisle/rootfs:ro    # 基础 rootfs
+  - /opt/clouisle/images:/opt/clouisle/images       # OCI-built rootfs cache
 
 services:
   # ============ 控制平面：apiserver ============
@@ -15,10 +16,11 @@ services:
     network_mode: host                      # netns / nftables 需要宿主网络
     environment:
       - RUST_LOG=info
+      - CLOUISLE_API_KEYS=local-development-key:local:full
     # 用 postgres 连接串（HA 就绪）
     command:
       - --addr=0.0.0.0:8080
-      - --db=postgres://clouisle:changeme@apiserver:5432/clouisle
+      - --db=postgres://clouisle:changeme@postgres:5432/clouisle
     volumes:
       - *fc-volumes
       - clouisle-data:/data
@@ -28,6 +30,27 @@ services:
     ports:
       - "8080:8080"
     restart: unless-stopped
+
+  # ============ 数据平面：clouisled ==========
+  clouisled:
+    build: .
+    image: clouisle-sandbox:0.1.0
+    container_name: clouisle-node
+    entrypoint: ["clouisled"]
+    command:
+      - --addr=0.0.0.0:9090
+      - --db=/data/clouisled.db
+      - --node-id=local
+    privileged: true
+    network_mode: host
+    environment:
+      - RUST_LOG=info
+    volumes:
+      - *fc-volumes
+      - /opt/clouisle/images:/opt/clouisle/images
+      - clouisled-data:/data
+    restart: unless-stopped
+
 
   # ============ 存储：PostgreSQL（HA 就绪） ============
   postgres:
@@ -47,5 +70,6 @@ services:
     restart: unless-stopped
 
 volumes:
+  clouisled-data:
   clouisle-data:
   pg-data:
