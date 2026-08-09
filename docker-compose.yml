@@ -72,5 +72,8 @@ services:
 
 volumes:
   clouisled-data:
+    driver: local
   clouisle-data:
+    driver: local
   pg-data:
+    driver: local
