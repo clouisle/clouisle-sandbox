@@ -666,3 +666,66 @@ async fn image_prefetch_returns_observable_job() {
     assert_eq!(status, StatusCode::OK);
     assert!(matches!(body["status"].as_str(), Some("queued" | "running" | "succeeded")));
 }
+
+#[tokio::test]
+async fn e2b_platform_sandbox_lifecycle_contract() {
+    let app = app();
+    let (status, body) = post_json(
+        &app,
+        "/sandboxes",
+        serde_json::json!({
+            "templateID": "alpine:latest",
+            "timeout": 60,
+            "metadata": { "owner": "test" },
+            "envVars": { "E2B_TEST": "yes" }
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let id = body["sandboxID"].as_str().unwrap().to_string();
+    assert_eq!(body["templateID"], "alpine:latest");
+    assert!(body["envdVersion"].is_string());
+
+    let (status, connected) = post_json(
+        &app,
+        &format!("/sandboxes/{id}/connect"),
+        serde_json::json!({ "timeout": 60 }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(connected["sandboxID"], id);
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/sandboxes/{id}/pause"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    let (status, resumed) = post_json(
+        &app,
+        &format!("/sandboxes/{id}/resume"),
+        serde_json::json!({ "timeout": 60 }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(resumed["sandboxID"], id);
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/sandboxes/{id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+}
