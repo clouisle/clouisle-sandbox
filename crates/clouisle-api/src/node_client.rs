@@ -239,6 +239,7 @@ mod scheduled_tests {
                 allocated_vcpu: 0,
                 allocated_memory_mb: 0,
                 running_sandboxes: 0,
+                sandbox_ids: Vec::new(),
             })
             .await
             .unwrap();

@@ -177,6 +177,7 @@ mod linux {
                 allocated_vcpu: heartbeat.allocated_vcpu,
                 allocated_memory_mb: heartbeat.allocated_memory_mb,
                 running_sandboxes: heartbeat.running_sandboxes.len(),
+                sandbox_ids: heartbeat.running_sandboxes.clone(),
             };
             if let Err(error) = client
                 .post(&url)

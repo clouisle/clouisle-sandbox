@@ -594,7 +594,15 @@ mod tests {
     };
 
     #[derive(Clone)]
-    struct TestVmm;
+    struct TestVmm {
+        probe_alive: bool,
+    }
+
+    impl Default for TestVmm {
+        fn default() -> Self {
+            Self { probe_alive: true }
+        }
+    }
 
     #[async_trait]
     impl Vmm for TestVmm {
@@ -611,6 +619,9 @@ mod tests {
                 vsock_socket: None,
                 vsock_cid: None,
             })
+        }
+        async fn probe(&self, _: &VmHandle) -> clouisle_core::Result<bool> {
+            Ok(self.probe_alive)
         }
         async fn start(&self, _: &VmHandle) -> clouisle_core::Result<()> {
             Ok(())
@@ -677,14 +688,14 @@ mod tests {
 
     #[tokio::test]
     async fn registration_has_node_id() {
-        let agent = NodeAgent::new(config(), Arc::new(TestVmm));
+        let agent = NodeAgent::new(config(), Arc::new(TestVmm::default()));
         let reg = agent.registration();
         assert_eq!(reg.node.node_id, "node-1");
     }
 
     #[tokio::test]
     async fn create_sandbox_updates_heartbeat() {
-        let agent = NodeAgent::new(config(), Arc::new(TestVmm));
+        let agent = NodeAgent::new(config(), Arc::new(TestVmm::default()));
         let store = InMemoryStore::new();
         let sb = agent
             .create_sandbox(SandboxSpec::default(), &store)
@@ -700,7 +711,7 @@ mod tests {
 
     #[tokio::test]
     async fn delete_releases_resources() {
-        let agent = NodeAgent::new(config(), Arc::new(TestVmm));
+        let agent = NodeAgent::new(config(), Arc::new(TestVmm::default()));
         let store = InMemoryStore::new();
         let sb = agent
             .create_sandbox(SandboxSpec::default(), &store)
@@ -714,7 +725,7 @@ mod tests {
 
     #[tokio::test]
     async fn delete_unknown_id_not_found() {
-        let agent = NodeAgent::new(config(), Arc::new(TestVmm));
+        let agent = NodeAgent::new(config(), Arc::new(TestVmm::default()));
         let store = InMemoryStore::new();
         let err = agent.delete_sandbox("nope", &store).await.unwrap_err();
         assert_eq!(err.kind, ErrorKind::NotFound);
@@ -722,7 +733,7 @@ mod tests {
 
     #[tokio::test]
     async fn reconcile_restores_running() {
-        let agent = NodeAgent::new(config(), Arc::new(TestVmm));
+        let agent = NodeAgent::new(config(), Arc::new(TestVmm::default()));
         let store = InMemoryStore::new();
         let sb = agent
             .create_sandbox(SandboxSpec::default(), &store)
@@ -730,7 +741,7 @@ mod tests {
             .unwrap();
 
         // 模拟重启：新 agent 实例
-        let agent2 = NodeAgent::new(config(), Arc::new(TestVmm));
+        let agent2 = NodeAgent::new(config(), Arc::new(TestVmm::default()));
         let n = agent2.reconcile_from_store(&store).await;
         assert_eq!(n, 1);
         assert_eq!(agent2.sandboxes.read().await.len(), 1);
@@ -739,9 +750,30 @@ mod tests {
 
     #[tokio::test]
     async fn heartbeat_empty() {
-        let agent = NodeAgent::new(config(), Arc::new(TestVmm));
+        let agent = NodeAgent::new(config(), Arc::new(TestVmm::default()));
         let hb = agent.heartbeat().await;
         assert!(hb.running_sandboxes.is_empty());
         assert_eq!(hb.node_id, "node-1");
     }
+    #[tokio::test]
+    async fn reconcile_marks_dead_runtime_error() {
+        let store = InMemoryStore::new();
+        let creator = NodeAgent::new(config(), Arc::new(TestVmm::default()));
+        let sandbox = creator
+            .create_sandbox(SandboxSpec::default(), &store)
+            .await
+            .unwrap();
+
+        let restarted = NodeAgent::new(
+            config(),
+            Arc::new(TestVmm {
+                probe_alive: false,
+            }),
+        );
+        assert_eq!(restarted.reconcile_from_store(&store).await, 0);
+        let persisted = store.get_sandbox(&sandbox.id).await.unwrap();
+        assert_eq!(persisted.status, SandboxStatus::Error);
+        assert!(persisted.terminal_message.is_some());
+    }
 }
+

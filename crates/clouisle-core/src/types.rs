@@ -75,6 +75,9 @@ pub struct RegisteredNode {
     pub allocated_vcpu: u16,
     pub allocated_memory_mb: u64,
     pub running_sandboxes: usize,
+    /// Exact runtime IDs reported by the node heartbeat.
+    #[serde(default)]
+    pub sandbox_ids: Vec<String>,
 }
 
 #[cfg(test)]
