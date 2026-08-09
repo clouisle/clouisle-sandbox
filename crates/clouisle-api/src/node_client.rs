@@ -17,6 +17,18 @@ use clouisled::server::proto::{
     CreateSandboxRequest, FileList, FileRead, FileRequest, FileWrite, SandboxId,
 };
 
+fn normalize_grpc_endpoint(endpoint: &str) -> String {
+    let endpoint = endpoint.trim();
+    if endpoint.is_empty() {
+        return String::new();
+    }
+    if endpoint.starts_with("http://") || endpoint.starts_with("https://") {
+        endpoint.to_string()
+    } else {
+        format!("http://{endpoint}")
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct GrpcNodeVmm {
     endpoint: String,
@@ -25,7 +37,7 @@ pub struct GrpcNodeVmm {
 impl GrpcNodeVmm {
     pub fn new(endpoint: impl Into<String>) -> Self {
         Self {
-            endpoint: endpoint.into(),
+            endpoint: normalize_grpc_endpoint(&endpoint.into()),
         }
     }
 
@@ -244,16 +256,26 @@ mod scheduled_tests {
             "http://node-a:9090"
         );
     }
+    #[test]
+    fn normalizes_node_endpoint_without_scheme() {
+        assert_eq!(
+            normalize_grpc_endpoint("10.144.144.2:28991"),
+            "http://10.144.144.2:28991"
+        );
+        assert_eq!(
+            normalize_grpc_endpoint(" http://node:9090 "),
+            "http://node:9090"
+        );
+    }
 }
 
 #[async_trait]
 impl Vmm for ScheduledNodeVmm {
     async fn create(&self, sandbox_id: &str, spec: &SandboxSpec) -> Result<VmHandle> {
         let node = self.node_for(spec).await?;
-        let mut handle = GrpcNodeVmm::new(&node.endpoint)
-            .create(sandbox_id, spec)
-            .await?;
-        handle.backend = format!("grpc:{}", node.endpoint);
+        let endpoint = normalize_grpc_endpoint(&node.endpoint);
+        let mut handle = GrpcNodeVmm::new(&endpoint).create(sandbox_id, spec).await?;
+        handle.backend = format!("grpc:{endpoint}");
         Ok(handle)
     }
     async fn start(&self, _: &VmHandle) -> Result<()> {
@@ -300,7 +322,7 @@ pub struct GrpcAgentConnector {
 impl GrpcAgentConnector {
     pub fn new(endpoint: impl Into<String>) -> Self {
         Self {
-            endpoint: endpoint.into(),
+            endpoint: normalize_grpc_endpoint(&endpoint.into()),
         }
     }
 }
@@ -315,14 +337,18 @@ impl AgentConnector for GrpcAgentConnector {
         let endpoint = handle
             .backend
             .strip_prefix("grpc:")
-            .unwrap_or(&self.endpoint);
-        NodeServiceClient::connect(endpoint.to_string())
+            .map(normalize_grpc_endpoint)
+            .unwrap_or_else(|| self.endpoint.clone());
+        if endpoint.is_empty() {
+            return Err(ClouisleError::invalid_state("missing node endpoint"));
+        }
+        NodeServiceClient::connect(endpoint.clone())
             .await
             .map_err(|error| {
                 ClouisleError::new(ErrorKind::Vmm, format!("connect node: {error}"))
             })?;
         Ok(Box::new(GrpcAgentConnection {
-            endpoint: endpoint.to_string(),
+            endpoint,
             sandbox_id: sandbox_id.to_string(),
         }))
     }

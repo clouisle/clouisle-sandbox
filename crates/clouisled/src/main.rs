@@ -96,6 +96,8 @@ mod linux {
         let vmm = Arc::new(FirecrackerVmm::new(firecracker));
         vmm.check_environment()?;
         let agent = NodeAgent::new(config, vmm);
+        let restored = agent.reconcile_from_store(store.as_ref()).await;
+        tracing::info!(restored, "reconciled node sandboxes");
         if let Some(control_plane) = cli.control_plane {
             let api_key = cli
                 .control_plane_api_key
