@@ -237,78 +237,93 @@ curl localhost:8080/metrics
 
 生产服务必须配置 `CLOUISLE_API_KEYS`，格式为逗号分隔的 `key:tenant:read|full`。所有 `/api/v1/*` 请求需要 `Authorization: Bearer <key>`；`read` key 只能读取，`full` key 才能创建、执行、上传、删除和更新节点租约。认证 key 决定沙盒所属租户；其他租户访问沙盒、执行记录和文件资源一律返回 `404`。`/health`、`/health/live`、`/health/ready` 与 `/metrics` 刻意保持公开。
 
-### 沙盒生命周期
+### 完整 HTTP 接口参考
 
-| 方法 | 路径 | 说明 |
-|------|------|------|
-| POST | `/api/v1/sandboxes` | 创建沙盒 |
-| GET | `/api/v1/sandboxes` | 列出沙盒（`?status=&limit=&offset=`） |
-| GET | `/api/v1/sandboxes/{id}` | 查询单个沙盒 |
-| DELETE | `/api/v1/sandboxes/{id}` | 删除沙盒 |
+下表枚举 `clouisle-apiserver` 注册的全部路由。`{id}` 和 `{exec_id}` 均为 UUID 字符串。除明确标注外，所有 `/api/v1/*` 成功响应均为 JSON。
 
-### 命令执行
+| 方法 | 路径 | 权限 | 请求或查询参数 | 成功响应 |
+|------|------|------|----------------|----------|
+| POST | `/api/v1/sandboxes` | `full` | `CreateSandboxRequest` JSON | `201` + `Sandbox` |
+| GET | `/api/v1/sandboxes` | `read`/`full` | `status`、`limit`、`offset` | `200` + `{items: Sandbox[], total: number}` |
+| GET | `/api/v1/sandboxes/{id}` | 所有者 | — | `200` + `Sandbox` |
+| DELETE | `/api/v1/sandboxes/{id}` | 所有者 + `full` | — | `204` |
+| POST | `/api/v1/sandboxes/{id}/exec` | 所有者 + `full` | `ExecRequest` JSON | `200` + `ExecResponse` |
+| POST | `/api/v1/sandboxes/{id}/exec/stream` | 所有者 + `full` | `ExecRequest` JSON | `200` + `text/event-stream`（`stdout`、`stderr`、`exit`、`error`） |
+| GET | `/api/v1/sandboxes/{id}/exec` | 所有者 | `limit`（默认 `100`） | `200` + `ExecutionRecord[]` |
+| GET | `/api/v1/sandboxes/{id}/exec/{exec_id}` | 所有者 | — | `200` + `ExecutionRecord` |
+| POST | `/api/v1/sandboxes/{id}/files/upload` | 所有者 + `full` | 必填 `path` query + 原始字节（≤50 MiB） | `200` + `{ok: true}` |
+| GET | `/api/v1/sandboxes/{id}/files/download` | 所有者 | 必填 `path` query | `200` + 原始字节，`application/octet-stream` |
+| GET | `/api/v1/sandboxes/{id}/files/ls` | 所有者 | 必填 `path` query | `200` + `{items: DirEntry[]}` |
+| POST | `/api/v1/nodes` | `full` | `RegisteredNode` JSON | `204` |
+| GET | `/api/v1/nodes` | `read`/`full` | — | `200` + 最近 15 秒有心跳的 `RegisteredNode[]` |
+| GET | `/health` | 公开 | — | `200` 或 `503` + `{status, store, version}` |
+| GET | `/health/live` | 公开 | — | `200` + `{status: "alive"}` |
+| GET | `/health/ready` | 公开 | — | `200` 或 `503` + `{status: "ready"|"not_ready"}` |
+| GET | `/metrics` | 公开 | — | `200` Prometheus 文本（`text/plain; version=0.0.4`） |
 
-| 方法 | 路径 | 说明 |
-|------|------|------|
-| POST | `/api/v1/sandboxes/{id}/exec` | 同步执行命令 |
-| POST | `/api/v1/sandboxes/{id}/exec/stream` | 流式执行（SSE，stdout/stderr 逐行推送） |
-| GET | `/api/v1/sandboxes/{id}/exec` | 执行历史记录 |
-| GET | `/api/v1/sandboxes/{id}/exec/{exec_id}` | 单条执行记录 |
+沙盒列表的 `status` 可取 `pending`、`starting`、`running`、`stopping`、`stopped`、`error`；其他值返回 `400`。`limit` 默认 `100`，`offset` 默认 `0`，传入 `limit=0` 时按 `1` 处理。文件 `path` 必须非空，且不得包含 `..` 或平台路径前缀。
 
-### 节点注册表
+### 请求与响应模型
 
-| 方法 | 路径 | 说明 |
-|------|------|------|
-| POST | `/api/v1/nodes` | 注册或刷新节点心跳租约（`full` scope） |
-| GET | `/api/v1/nodes` | 列出仍在有效心跳租约内的节点 |
+#### `CreateSandboxRequest`
 
-### 文件传输
+`POST /api/v1/sandboxes` 将以下字段直接放在 JSON 顶层。
 
-| 方法 | 路径 | 说明 |
-|------|------|------|
-| POST | `/api/v1/sandboxes/{id}/files/upload?path=` | 上传文件（≤50MB） |
-| GET | `/api/v1/sandboxes/{id}/files/download?path=` | 下载文件 |
-| GET | `/api/v1/sandboxes/{id}/files/ls?path=` | 列目录 |
-
-### 可观测性
-
-| 方法 | 路径 | 说明 |
-|------|------|------|
-| GET | `/health` | 公开的综合健康检查 |
-| GET | `/health/live` | 公开的存活探针（K8s `livenessProbe`） |
-| GET | `/health/ready` | 公开的就绪探针（K8s `readinessProbe`） |
-| GET | `/metrics` | 公开的 Prometheus 指标 |
-
-### 请求体结构
-
-#### `SandboxSpec`（创建沙盒）
-
-| 字段 | 类型 | 默认值 | 说明 |
+| 字段 | 类型 | 默认值 | 契约 |
 |------|------|--------|------|
-| `image` | `{reference, digest?}` | — | 镜像引用，如 `"alpine"` |
-| `resources.vcpu` | `u16` | `1` | vCPU 数量（1~4） |
-| `resources.memory_mb` | `u32` | `256` | 内存（MiB，≥64） |
-| `resources.disk_mb` | `u32` | `512` | 磁盘 scratch（MiB，≥64） |
-| `resources.bandwidth_mbps` | `u32?` | `null` | 出站带宽上限 |
-| `resources.iops` | `u32?` | `null` | 磁盘 IOPS 上限 |
-| `network.enabled` | `bool` | `true` | 是否启用网络 |
-| `network.allow_egress` | `[string]` | `[]` | 出站域名白名单，空=禁止全部出站 |
-| `mounts` | `[{source,target,readonly}]` | `[]` | 卷挂载 |
-| `secrets` | `[{name,value}]` | `[]` | 密钥注入（`/run/secrets/<name>`） |
-| `ttl_secs` | `u64?` | `null` | 运行期秒数；沙盒到达 `Running` 后开始计时，到期强制销毁 |
-| `start_timeout_secs` | `u64` | `10` | 启动超时（秒） |
-| `env` | `{string:string}` | `{}` | 环境变量 |
-| `restart_policy` | `"never"` / `"on_failure"` / `"always"` | `"never"` | 重启策略 |
+| `image.reference` | string | 必填 | OCI 镜像引用，不得为空白 |
+| `image.digest` | string/null | `null` | 可选的不可变镜像 digest |
+| `resources.vcpu` | integer | `1` | 虚拟 CPU 数量，`1..=4` |
+| `resources.memory_mb` | integer | `256` | 内存，单位 MiB，范围 `64..=8192` |
+| `resources.disk_mb` | integer | `512` | Scratch 磁盘，单位 MiB，至少 `64` |
+| `resources.bandwidth_mbps` | integer/null | `null` | 出站带宽上限，单位 Mbps；提供时至少 `1` Mbps |
+| `resources.iops` | integer/null | `null` | 磁盘 I/O 每秒操作数；提供时至少 `1` IOPS |
+| `resources.pids_max` | integer/null | `512` | guest cgroup 进程数量上限 |
+| `network.enabled` | boolean | `true` | `false` 时仍保留管理 agent 通道；公网出站被拒绝 |
+| `network.allow_egress` | string[] | `[]` | DNS 域名白名单；空数组拒绝全部公网出站 |
+| `mounts` | `{source,target,readonly}`[] | `[]` | 请求的 host 到 guest 挂载 |
+| `secrets` | `{name,value}`[] | `[]` | 写入 `/run/secrets/<name>`；名称必须唯一且为普通文件名，响应会脱敏 value |
+| `ttl_secs` | integer/null | `null` | 运行期秒数；仅到达 `Running` 后开始计时 |
+| `start_timeout_secs` | integer | `10` | agent ready 截止时间，单位秒，范围 `1..=300` |
+| `env` | object | `{}` | guest 环境变量 |
+| `node_selector` | object | `{}` | 集群调度时所需的节点标签 |
+| `restart_policy` | `never`/`on_failure`/`always` | `never` | 持久化重启策略 |
+| `tenant_id` | string/null | 忽略 | 会被认证 key 的租户覆盖 |
+| `sync` | boolean | `true` | 为 wire compatibility 接受；当前无论其值均等待 guest ready |
 
-#### `ExecRequest`
+create/get/list 返回的 `Sandbox` 含有 `id`、`spec`、`status`、`created_at`、`updated_at`、`ready_at`、`expires_at`、`vmm_meta`、`terminal_message`、`node_id`。时间戳为 RFC 3339 UTC 字符串。`vmm_meta` 含有 `backend`、可选进程 `pid`、`api_socket`、`vsock_socket`、数值 `vsock_cid`、`vmm_id`、`extra`。
 
-| 字段 | 类型 | 默认值 | 说明 |
+#### `ExecRequest`、`ExecResponse` 与执行历史
+
+| 字段 | 类型 | 默认值 | 契约 |
 |------|------|--------|------|
-| `argv` | `[string]` | — | 命令及参数，如 `["echo","hello"]` |
-| `env` | `{string:string}` | `{}` | 额外环境变量 |
-| `cwd` | `string?` | `null` | 工作目录 |
-| `timeout_ms` | `u64` | `30000` | 执行超时（毫秒） |
-| `stream` | `bool` | `false` | 是否 SSE 流式输出 |
+| `argv` | string[] | 必填 | 非空的命令及参数数组 |
+| `env` | object | `{}` | 覆盖沙盒环境中同名变量 |
+| `cwd` | string/null | `null` | guest 工作目录 |
+| `timeout_ms` | integer | `30000` | 执行超时，单位毫秒，至少为 `1` ms |
+| `stream` | boolean | `false` | 为兼容性接受；以 `/exec` 或 `/exec/stream` 路径选择响应模式 |
+
+`ExecResponse` 为 `{exec_id, exit_code, stdout, stderr, duration_ms, timed_out, stdout_truncated, stderr_truncated}`，其中 `duration_ms` 单位为毫秒。输出以 UTF-8 lossy 文本返回，stdout/stderr 各最多保留 1 MiB，截断会由字段明确标识。`ExecutionRecord` 额外含有 `{id, sandbox_id, spec, started_at, finished_at, node_id}`。流式端点发送 SSE，但不会创建执行历史记录。
+
+#### `RegisteredNode` 与文件响应
+
+`POST /api/v1/nodes` 必须包含下列字段（`labels` 可省略，默认 `{}`），且 `endpoint` 不得为空。`total_memory_mb`、`total_disk_mb`、`allocated_memory_mb` 单位为 MiB；`last_heartbeat_ms` 为 Unix 毫秒；`total_vcpu`、`allocated_vcpu`、`running_sandboxes` 均为数量。
+
+```json
+{
+  "info": {
+    "node_id": "node-a", "hostname": "node-a", "total_vcpu": 16,
+    "total_memory_mb": 32768, "total_disk_mb": 102400,
+    "kvm_available": true, "kernel_version": "6.8", "firecracker_version": "1.10.1",
+    "labels": {"zone": "a"}
+  },
+  "endpoint": "http://node-a:9090", "status": "ready",
+  "last_heartbeat_ms": 1735689600000, "allocated_vcpu": 0,
+  "allocated_memory_mb": 0, "running_sandboxes": 0
+}
+```
+
+`status` 可为 `ready`、`unreachable`、`down`、`draining`。目录项为 `{name, size, mode, mtime, is_dir}`：`size` 单位为字节，`mode` 是数值 Unix 文件模式，`mtime` 为 Unix 秒。下载响应会在 `Content-Disposition` 中提供安全文件名。
 
 ### 错误响应
 
@@ -317,14 +332,14 @@ curl localhost:8080/metrics
 | HTTP 状态码 | `code` | 说明 |
 |-------------|--------|------|
 | 400 | `VALIDATION` | 请求参数校验失败 |
-| 404 | `NOT_FOUND` | 沙盒/执行记录不存在 |
-| 409 | `INVALID_STATE` | 状态冲突（如对已停止沙盒执行命令） |
-| 507 | `RESOURCE_EXHAUSTED` | 资源不足（CPU/内存/磁盘配额超限） |
-| 401 | `UNAUTHENTICATED` | 未提供有效 API key |
-| 403 | `FORBIDDEN` | 权限不足（只读 key 尝试写操作） |
-| 429 | `QUOTA_EXCEEDED` | 租户/沙盒数配额超限 |
-| 500 | `INTERNAL` | 内部错误 |
-| 503 | `VMM` | VMM 层错误（Firecracker 不可用等） |
+| 401 | `UNAUTHENTICATED` | 未提供或提供了无效 API key |
+| 403 | `FORBIDDEN` | 只读 key 尝试执行变更操作 |
+| 404 | `NOT_FOUND` | 调用方不可见的沙盒、执行记录或文件资源 |
+| 409 | `INVALID_STATE` | 状态冲突，例如对未运行沙盒执行命令 |
+| 422 | — | JSON 无法反序列化为该端点请求类型 |
+| 429 | `QUOTA_EXCEEDED` | 租户或沙盒数量配额超限 |
+| 500 | `INTERNAL`、`VMM`、`IO`、`NETWORK`、`IMAGE`、`TIMEOUT`、`STORE` | 内部或基础设施失败 |
+| 503 | — | `/health` 或 `/health/ready` 报告存储不可用 |
 
 ## 数据库
 
@@ -486,7 +501,7 @@ console.log("exit:", result.exit_code, "stdout:", result.stdout);
 | `clouisle-store` | `Store` trait + SQLite / InMemory / PostgreSQL 实现 |
 | `clouisle-scheduler` | 资源准入（Semaphore RAII）+ 多节点放置策略 |
 | `clouisle-api` | Axum HTTP 服务（沙盒 CRUD / exec / 文件 / 健康 / 指标） |
-| `clouisle-proto` | host↔guest vsock 帧协议（长度前缀 + postcard） |
+| `clouisle-proto` | host↔guest 的分帧 TCP 协议（长度前缀 + postcard） |
 | `clouisle-agent` | guest 内二进制（PID 1 init + serve） |
 | `clouislectl` | 命令行工具 |
 | `clouisled` | 节点代理（gRPC 服务 + 注册/心跳/reconciler） |

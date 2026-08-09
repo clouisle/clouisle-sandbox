@@ -38,7 +38,7 @@ Each sandbox is a real microVM (Firecracker + KVM) with its own kernel and root 
                     │    ├─ netns (clo-<hash>)                 │
                     │    ├─ TAP (10.0.0.2/30) + veth pair      │
                     │    ├─ nftables default drop ingress      │
-                    │    └─ Egress allowlist (@allowed_v4)     │
+                    │    └─ DNS-resolved egress allowlist       │
                     └──────────────────────────────────────────┘
 ```
 
@@ -247,78 +247,93 @@ curl localhost:8080/metrics
 
 `CLOUISLE_API_KEYS` is required by the production server. Its format is a comma-separated list of `key:tenant:read|full` entries. Every `/api/v1/*` request needs `Authorization: Bearer <key>`; `read` keys may only read, while `full` keys may create, execute, upload, delete, and update node leases. The authenticated key determines the sandbox tenant, and a different tenant receives `404` for sandbox, execution, and file resources. `/health`, `/health/live`, `/health/ready`, and `/metrics` are deliberately public.
 
-### Sandbox Lifecycle
+### Complete HTTP reference
 
-| Method | Path | Description |
-|--------|------|-------------|
-| POST | `/api/v1/sandboxes` | Create sandbox |
-| GET | `/api/v1/sandboxes` | List sandboxes (`?status=&limit=&offset=`) |
-| GET | `/api/v1/sandboxes/{id}` | Get single sandbox |
-| DELETE | `/api/v1/sandboxes/{id}` | Delete sandbox |
+This table enumerates every route registered by `clouisle-apiserver`. `{id}` and `{exec_id}` are UUID strings. All `/api/v1/*` responses use JSON unless noted otherwise.
 
-### Command Execution
+| Method | Path | Scope | Request or query | Success response |
+|--------|------|-------|------------------|------------------|
+| POST | `/api/v1/sandboxes` | `full` | `CreateSandboxRequest` JSON | `201` + `Sandbox` |
+| GET | `/api/v1/sandboxes` | `read`/`full` | `status`, `limit`, `offset` | `200` + `{items: Sandbox[], total: number}` |
+| GET | `/api/v1/sandboxes/{id}` | owner | — | `200` + `Sandbox` |
+| DELETE | `/api/v1/sandboxes/{id}` | owner + `full` | — | `204` |
+| POST | `/api/v1/sandboxes/{id}/exec` | owner + `full` | `ExecRequest` JSON | `200` + `ExecResponse` |
+| POST | `/api/v1/sandboxes/{id}/exec/stream` | owner + `full` | `ExecRequest` JSON | `200` + `text/event-stream` (`stdout`, `stderr`, `exit`, `error`) |
+| GET | `/api/v1/sandboxes/{id}/exec` | owner | `limit` (default `100`) | `200` + `ExecutionRecord[]` |
+| GET | `/api/v1/sandboxes/{id}/exec/{exec_id}` | owner | — | `200` + `ExecutionRecord` |
+| POST | `/api/v1/sandboxes/{id}/files/upload` | owner + `full` | required `path` query + raw request bytes (≤50 MiB) | `200` + `{ok: true}` |
+| GET | `/api/v1/sandboxes/{id}/files/download` | owner | required `path` query | `200` + raw bytes, `application/octet-stream` |
+| GET | `/api/v1/sandboxes/{id}/files/ls` | owner | required `path` query | `200` + `{items: DirEntry[]}` |
+| POST | `/api/v1/nodes` | `full` | `RegisteredNode` JSON | `204` |
+| GET | `/api/v1/nodes` | `read`/`full` | — | `200` + `RegisteredNode[]` with heartbeats from the last 15 seconds |
+| GET | `/health` | public | — | `200` or `503` + `{status, store, version}` |
+| GET | `/health/live` | public | — | `200` + `{status: "alive"}` |
+| GET | `/health/ready` | public | — | `200` or `503` + `{status: "ready"|"not_ready"}` |
+| GET | `/metrics` | public | — | `200` Prometheus text (`text/plain; version=0.0.4`) |
 
-| Method | Path | Description |
-|--------|------|-------------|
-| POST | `/api/v1/sandboxes/{id}/exec` | Sync exec command |
-| POST | `/api/v1/sandboxes/{id}/exec/stream` | Streaming exec (SSE, per-line stdout/stderr) |
-| GET | `/api/v1/sandboxes/{id}/exec` | Execution history |
-| GET | `/api/v1/sandboxes/{id}/exec/{exec_id}` | Single execution record |
+For sandbox listing, `status` accepts `pending`, `starting`, `running`, `stopping`, `stopped`, or `error`; an unknown value returns `400`. `limit` defaults to `100`, `offset` defaults to `0`, and a supplied `limit=0` is coerced to `1`. File paths must be non-empty and must not contain `..` or a platform prefix.
 
-### Node Registry
+### Request and response models
 
-| Method | Path | Description |
-|--------|------|-------------|
-| POST | `/api/v1/nodes` | Register or refresh a node heartbeat lease (`full` scope) |
-| GET | `/api/v1/nodes` | List nodes with a valid heartbeat lease |
+#### `CreateSandboxRequest`
 
-### File Transfer
+`POST /api/v1/sandboxes` flattens the following fields at the JSON top level.
 
-| Method | Path | Description |
-|--------|------|-------------|
-| POST | `/api/v1/sandboxes/{id}/files/upload?path=` | Upload file (≤50MB) |
-| GET | `/api/v1/sandboxes/{id}/files/download?path=` | Download file |
-| GET | `/api/v1/sandboxes/{id}/files/ls?path=` | List directory |
+| Field | Type | Default | Contract |
+|-------|------|---------|----------|
+| `image.reference` | string | required | OCI image reference; cannot be blank |
+| `image.digest` | string/null | `null` | Optional immutable image digest |
+| `resources.vcpu` | integer | `1` | Virtual CPU count, `1..=4` |
+| `resources.memory_mb` | integer | `256` | Memory in MiB, `64..=8192` |
+| `resources.disk_mb` | integer | `512` | Scratch disk in MiB, at least `64` |
+| `resources.bandwidth_mbps` | integer/null | `null` | Egress bandwidth cap in Mbps; when supplied, at least `1` Mbps |
+| `resources.iops` | integer/null | `null` | Disk I/O operations per second; when supplied, at least `1` IOPS |
+| `resources.pids_max` | integer/null | `512` | Guest cgroup process-count limit |
+| `network.enabled` | boolean | `true` | `false` still retains the management agent channel; public egress is denied |
+| `network.allow_egress` | string[] | `[]` | DNS domain allowlist; empty denies public egress |
+| `mounts` | `{source,target,readonly}`[] | `[]` | Requested host-to-guest mounts |
+| `secrets` | `{name,value}`[] | `[]` | Materialized as `/run/secrets/<name>`; names are unique bare filenames and responses redact values |
+| `ttl_secs` | integer/null | `null` | Runtime lifetime in seconds; starts only after `Running` |
+| `start_timeout_secs` | integer | `10` | Agent-ready deadline in seconds, `1..=300` |
+| `env` | object | `{}` | Guest environment variables |
+| `node_selector` | object | `{}` | Required node labels when cluster scheduling is enabled |
+| `restart_policy` | `never`/`on_failure`/`always` | `never` | Persisted restart policy |
+| `tenant_id` | string/null | ignored | Replaced with the tenant from the authenticated key |
+| `sync` | boolean | `true` | Accepted for wire compatibility; creation currently waits for guest readiness regardless of its value |
 
-### Observability
+The `Sandbox` returned by create/get/list contains `id`, `spec`, `status`, `created_at`, `updated_at`, `ready_at`, `expires_at`, `vmm_meta`, `terminal_message`, and `node_id`. Timestamps are RFC 3339 UTC strings. `vmm_meta` contains `backend`, optional process `pid`, `api_socket`, `vsock_socket`, numeric `vsock_cid`, `vmm_id`, and `extra`.
 
-| Method | Path | Description |
-|--------|------|-------------|
-| GET | `/health` | Public aggregate health check |
-| GET | `/health/live` | Public liveness probe (K8s `livenessProbe`) |
-| GET | `/health/ready` | Public readiness probe (K8s `readinessProbe`) |
-| GET | `/metrics` | Public Prometheus metrics |
+#### `ExecRequest`, `ExecResponse`, and execution history
 
-### Request Bodies
+| Field | Type | Default | Contract |
+|-------|------|---------|----------|
+| `argv` | string[] | required | Non-empty command and argument vector |
+| `env` | object | `{}` | Overrides keys from the sandbox environment |
+| `cwd` | string/null | `null` | Guest working directory |
+| `timeout_ms` | integer | `30000` | Execution timeout in milliseconds; must be at least `1` ms |
+| `stream` | boolean | `false` | Accepted for compatibility; select `/exec` or `/exec/stream` to choose response mode |
 
-#### `SandboxSpec` (create sandbox)
+`ExecResponse` is `{exec_id, exit_code, stdout, stderr, duration_ms, timed_out, stdout_truncated, stderr_truncated}`; `duration_ms` is milliseconds. Output is UTF-8-lossy text and each stream is retained up to 1 MiB; truncation is explicit. `ExecutionRecord` adds `{id, sandbox_id, spec, started_at, finished_at, node_id}`. The streaming endpoint emits SSE but does not create an execution-history record.
 
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `image` | `{reference, digest?}` | — | Image reference, e.g. `"alpine"` |
-| `resources.vcpu` | `u16` | `1` | vCPU count (1~4) |
-| `resources.memory_mb` | `u32` | `256` | Memory (MiB, ≥64) |
-| `resources.disk_mb` | `u32` | `512` | Disk scratch (MiB, ≥64) |
-| `resources.bandwidth_mbps` | `u32?` | `null` | Egress bandwidth cap |
-| `resources.iops` | `u32?` | `null` | Disk IOPS cap |
-| `network.enabled` | `bool` | `true` | Enable networking |
-| `network.allow_egress` | `[string]` | `[]` | Egress domain allowlist, empty = deny all egress |
-| `mounts` | `[{source,target,readonly}]` | `[]` | Volume mounts |
-| `secrets` | `[{name,value}]` | `[]` | Secret injection (`/run/secrets/<name>`) |
-| `ttl_secs` | `u64?` | `null` | Running lifetime in seconds; starts when the sandbox reaches `Running`, then force-destroys it on expiry |
-| `start_timeout_secs` | `u64` | `10` | Start timeout (seconds) |
-| `env` | `{string:string}` | `{}` | Environment variables |
-| `restart_policy` | `"never"` / `"on_failure"` / `"always"` | `"never"` | Restart policy |
+#### `RegisteredNode` and file responses
 
-#### `ExecRequest`
+`POST /api/v1/nodes` requires the fields shown below (`labels` may be omitted and defaults to `{}`); `endpoint` must not be empty. `total_memory_mb`, `total_disk_mb`, and `allocated_memory_mb` use MiB; `last_heartbeat_ms` is Unix milliseconds; `total_vcpu`, `allocated_vcpu`, and `running_sandboxes` are counts.
 
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `argv` | `[string]` | — | Command and args, e.g. `["echo","hello"]` |
-| `env` | `{string:string}` | `{}` | Extra environment vars |
-| `cwd` | `string?` | `null` | Working directory |
-| `timeout_ms` | `u64` | `30000` | Exec timeout (ms) |
-| `stream` | `bool` | `false` | SSE streaming output |
+```json
+{
+  "info": {
+    "node_id": "node-a", "hostname": "node-a", "total_vcpu": 16,
+    "total_memory_mb": 32768, "total_disk_mb": 102400,
+    "kvm_available": true, "kernel_version": "6.8", "firecracker_version": "1.10.1",
+    "labels": {"zone": "a"}
+  },
+  "endpoint": "http://node-a:9090", "status": "ready",
+  "last_heartbeat_ms": 1735689600000, "allocated_vcpu": 0,
+  "allocated_memory_mb": 0, "running_sandboxes": 0
+}
+```
+
+`status` is one of `ready`, `unreachable`, `down`, or `draining`. A directory entry is `{name, size, mode, mtime, is_dir}` where `size` is bytes, `mode` is the numeric Unix file mode, and `mtime` is Unix seconds. Downloads include a safe filename in `Content-Disposition`.
 
 ### Error Responses
 
@@ -327,14 +342,14 @@ Unified format: `{ "error": { "code": "...", "message": "...", "details": null }
 | HTTP Status | `code` | Description |
 |-------------|--------|-------------|
 | 400 | `VALIDATION` | Request validation failed |
-| 404 | `NOT_FOUND` | Sandbox/execution record not found |
-| 409 | `INVALID_STATE` | State conflict (e.g. exec on stopped sandbox) |
-| 507 | `RESOURCE_EXHAUSTED` | Insufficient resources (CPU/mem/disk quota) |
-| 401 | `UNAUTHENTICATED` | Missing/invalid API key |
-| 403 | `FORBIDDEN` | Insufficient scope (read-only key on write op) |
-| 429 | `QUOTA_EXCEEDED` | Tenant/sandbox quota exceeded |
-| 500 | `INTERNAL` | Internal error |
-| 503 | `VMM` | VMM layer error (Firecracker unavailable, etc.) |
+| 401 | `UNAUTHENTICATED` | Missing or invalid API key |
+| 403 | `FORBIDDEN` | Read-only key attempted a mutation |
+| 404 | `NOT_FOUND` | Sandbox, execution, or file resource is not visible to the caller |
+| 409 | `INVALID_STATE` | State conflict, such as exec on a non-running sandbox |
+| 422 | — | JSON cannot be deserialized into the endpoint request type |
+| 429 | `QUOTA_EXCEEDED` | Tenant or sandbox quota exceeded |
+| 500 | `INTERNAL`, `VMM`, `IO`, `NETWORK`, `IMAGE`, `TIMEOUT`, or `STORE` | Internal or infrastructure failure |
+| 503 | — | `/health` or `/health/ready` reports unavailable storage |
 
 ## Database
 
@@ -496,7 +511,7 @@ console.log("exit:", result.exit_code, "stdout:", result.stdout);
 | `clouisle-store` | `Store` trait + SQLite / InMemory / PostgreSQL |
 | `clouisle-scheduler` | Resource admission (Semaphore RAII) + multi-node placement |
 | `clouisle-api` | Axum HTTP service (sandbox CRUD / exec / files / health / metrics) |
-| `clouisle-proto` | host↔guest vsock frame protocol (length-prefix + postcard) |
+| `clouisle-proto` | host↔guest framed TCP protocol (length-prefix + postcard) |
 | `clouisle-agent` | Guest binary (PID 1 init + serve) |
 | `clouislectl` | CLI tool |
 | `clouisled` | Node agent (gRPC service + register/heartbeat/reconciler) |
