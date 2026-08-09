@@ -1,13 +1,15 @@
 //! OCI 镜像拉取与 ext4 构建（FR-06）。
 
 use std::collections::HashMap;
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use oci_distribution::Reference;
 use oci_distribution::client::{Client, ClientConfig};
-use oci_distribution::manifest::{OciDescriptor, OciManifest};
+use oci_distribution::manifest::{OciDescriptor, OciImageManifest};
 use oci_distribution::secrets::RegistryAuth;
+use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::RwLock;
 use tracing::{debug, info};
@@ -44,6 +46,8 @@ pub struct ImageManager {
     cache: Arc<RwLock<HashMap<String, String>>>,
     cache_dir: PathBuf,
     agent_binary: Option<PathBuf>,
+    /// Lazily computed, streaming SHA-256 of the injected agent binary.
+    agent_fingerprint: Arc<OnceLock<Result<String, String>>>,
     client: Client,
     auth: RegistryAuth,
 }
@@ -60,6 +64,7 @@ impl ImageManager {
             cache: Arc::new(RwLock::new(HashMap::new())),
             cache_dir: PathBuf::from("/tmp/clouisle-cache"),
             agent_binary: None,
+            agent_fingerprint: Arc::new(OnceLock::new()),
             client: Client::new(ClientConfig::default()),
             auth: RegistryAuth::Anonymous,
         }
@@ -74,6 +79,7 @@ impl ImageManager {
     /// 指定要注入的 clouisle-agent 二进制路径。
     pub fn with_agent_binary(mut self, path: impl Into<PathBuf>) -> Self {
         self.agent_binary = Some(path.into());
+        self.agent_fingerprint = Arc::new(OnceLock::new());
         self
     }
 
@@ -87,40 +93,51 @@ impl ImageManager {
         self
     }
 
-    /// 检查缓存是否命中（仅当 digest 已知时有效，无需网络）。
+    /// Check the two-level rootfs cache when the image digest is already known.
+    /// The key includes the injected-agent digest, so a guest-agent upgrade
+    /// never reuses a rootfs containing a stale executable.
     pub async fn cache_hit(&self, spec: &ImageSpec) -> bool {
-        match &spec.digest {
-            Some(d) => self.cached(d).await.is_some(),
-            None => false,
-        }
+        let Some(image_digest) = &spec.digest else {
+            return false;
+        };
+        let Ok(key) = self.cache_key_for_image(image_digest) else {
+            return false;
+        };
+        self.cached(&key).await.is_some()
     }
 
-    /// 拉取 OCI 镜像，构建 ext4 根文件系统，返回 `.ext4` 文件路径。
+    /// Pull an OCI image and build an ext4 rootfs, returning its `.ext4` path.
     ///
-    /// 缓存键为镜像 digest：若 `spec.digest` 已指定则直接使用（可避免网络往返），
-    /// 否则先拉取 manifest 解析出 digest。
+    /// The cache key combines the platform image-manifest digest with the
+    /// injected guest-agent digest. A pinned image digest can therefore check
+    /// the cache without a registry request, while still invalidating on an
+    /// agent upgrade.
     pub async fn pull_and_build(&self, spec: &ImageSpec) -> Result<String, ImageError> {
-        // dig有 pinned digest 时优先命中缓存，零网络开销。
-        if let Some(digest) = &spec.digest
-            && let Some(path) = self.cached(digest).await
-        {
-            info!(key = %digest, path = %path, "pinned digest cache hit");
-            return Ok(path);
+        if let Some(image_digest) = &spec.digest {
+            let key = self.cache_key_for_image(image_digest)?;
+            if let Some(path) = self.cached(&key).await {
+                info!(key = %key, path = %path, "pinned digest cache hit");
+                return Ok(path);
+            }
         }
 
         let reference = Reference::try_from(spec.reference.clone())
             .map_err(|e| ImageError::InvalidReference(spec.reference.clone(), e.to_string()))?;
 
-        debug!(reference = %spec.reference, "pulling manifest");
+        debug!(reference = %spec.reference, "pulling platform image manifest");
         let (manifest, digest) = self
             .client
-            .pull_manifest(&reference, &self.auth)
+            .pull_image_manifest(&reference, &self.auth)
             .await
-            .map_err(|e| ImageError::Registry(format!("pull manifest: {e}")))?;
+            .map_err(|error| {
+                ImageError::Registry(format!("pull platform image manifest: {error}"))
+            })?;
 
-        let key = spec.digest.clone().unwrap_or(digest);
+        let image_digest = spec.digest.as_deref().unwrap_or(&digest);
+        let key = self.cache_key_for_image(image_digest)?;
 
-        // 二次检查：无 pinned digest 时此刻才解析出 key。
+        // Second cache check: the unpinned digest is only available after the
+        // platform image manifest has been selected.
         if let Some(path) = self.cached(&key).await {
             return Ok(path);
         }
@@ -150,23 +167,26 @@ impl ImageManager {
         }
     }
 
-    /// 真正的构建管道：解压 layers → 注入 agent → 写入启动脚本 → 生成 ext4。
+    fn cache_key_for_image(&self, image_digest: &str) -> Result<String, ImageError> {
+        let Some(agent_binary) = &self.agent_binary else {
+            return Ok(image_digest.to_string());
+        };
+        let fingerprint = self
+            .agent_fingerprint
+            .get_or_init(|| fingerprint_file(agent_binary).map_err(|error| error.to_string()));
+        let fingerprint = fingerprint
+            .as_ref()
+            .map_err(|error| ImageError::AgentBinary(error.clone()))?;
+        Ok(format!("{image_digest}-agent-{fingerprint}"))
+    }
+
+    /// Build an ext4 rootfs from an already platform-resolved image manifest.
     async fn build(
         &self,
         reference: &Reference,
-        manifest: OciManifest,
+        image_manifest: OciImageManifest,
         key: &str,
     ) -> Result<String, ImageError> {
-        let image_manifest = match manifest {
-            OciManifest::Image(m) => m,
-            OciManifest::ImageIndex(_) => {
-                // 客户端自带 platform_resolver，正常不会返回 index；若出现说明平台不匹配。
-                return Err(ImageError::Registry(
-                    "resolved manifest is an image index (no matching platform)".into(),
-                ));
-            }
-        };
-
         // 解压工作目录（TempDir 在 build 结束时自动清理）。
         let work = tempfile::tempdir()?;
         let rootfs = work.path().join("rootfs");
@@ -187,9 +207,6 @@ impl ImageManager {
         if let Some(agent_path) = &self.agent_binary {
             self.inject_agent(agent_path, &rootfs).await?;
         }
-
-        // 写入 guest 启动脚本。
-        self.write_init_script(&rootfs)?;
 
         // 生成 ext4。
         tokio::fs::create_dir_all(&self.cache_dir).await?;
@@ -260,24 +277,6 @@ impl ImageManager {
         Ok(())
     }
 
-    /// 写入 /etc/init.d/rcS 启动 guest agent。
-    fn write_init_script(&self, rootfs: &Path) -> Result<(), ImageError> {
-        let init_d = rootfs.join("etc/init.d");
-        std::fs::create_dir_all(&init_d)?;
-        let rc = init_d.join("rcS");
-        // shell 启动 clouisle-agent（agent 自行处理 vsock 连接）。
-        let script = b"#!/bin/sh\n# Clouisle guest agent starter\nif [ -x /usr/local/bin/clouisle-agent ]; then\n  /usr/local/bin/clouisle-agent &\nfi\n";
-        std::fs::write(&rc, script)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(&rc)?.permissions();
-            perms.set_mode(0o755);
-            std::fs::set_permissions(&rc, perms)?;
-        }
-        Ok(())
-    }
-
     /// 用 fallocate + mkfs.ext4 + mount + cp + umount 构建 ext4 镜像。
     #[cfg(target_os = "linux")]
     fn build_ext4(&self, rootfs: &Path, out_path: &Path) -> Result<(), ImageError> {
@@ -341,20 +340,19 @@ fn cache_path(cache_dir: &Path, key: &str) -> PathBuf {
 }
 
 /// 递归计算目录/文件大小。
+/// Recursively calculate a rootfs size without following layer symlinks.
+/// OCI images commonly contain symlinked directories; following them can form
+/// loops such as `/var/run -> /run`.
 #[allow(dead_code)]
 fn dir_size(path: &Path) -> Result<u64, std::io::Error> {
-    if path.is_file() {
-        return Ok(path.metadata()?.len());
+    let metadata = std::fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_dir() {
+        return Ok(metadata.len());
     }
+
     let mut total = 0u64;
     for entry in std::fs::read_dir(path)? {
-        let entry = entry?;
-        let p = entry.path();
-        if p.is_dir() {
-            total += dir_size(&p)?;
-        } else {
-            total += entry.metadata()?.len();
-        }
+        total += dir_size(&entry?.path())?;
     }
     Ok(total)
 }
@@ -377,6 +375,20 @@ fn run_cmd(program: &str, args: &[&str]) -> Result<(), ImageError> {
             stderr.trim(),
         )))
     }
+}
+
+fn fingerprint_file(path: &Path) -> Result<String, std::io::Error> {
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 32 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hex::encode(hasher.finalize()))
 }
 
 /// 按 media type 解压并展开 tar 归档到 dst。
@@ -482,6 +494,25 @@ mod tests {
     }
 
     #[test]
+    fn agent_fingerprint_invalidates_rootfs_cache_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let agent = dir.path().join("clouisle-agent");
+        std::fs::write(&agent, b"agent-v1").unwrap();
+        let first = ImageManager::new()
+            .with_agent_binary(&agent)
+            .cache_key_for_image("sha256:image")
+            .unwrap();
+
+        std::fs::write(&agent, b"agent-v2").unwrap();
+        let second = ImageManager::new()
+            .with_agent_binary(&agent)
+            .cache_key_for_image("sha256:image")
+            .unwrap();
+
+        assert_ne!(first, second);
+    }
+
+    #[test]
     fn extract_plain_tar() {
         let src = tempfile::tempdir().unwrap();
         let dst = tempfile::tempdir().unwrap();
@@ -511,13 +542,15 @@ mod tests {
         );
     }
 
-    /// 真实镜像拉取 + ext4 构建端到端。需要网络 + Linux(root, fallocate/mkfs.ext4/mount)。
-    /// 服务器上运行：`cargo test -p clouisle-images -- --ignored real_image_pull_and_build`
+    /// Multi-arch OCI index resolution plus ext4 construction. This exercises
+    /// `pull_and_build` end to end, so using `pull_manifest` instead of
+    /// `pull_image_manifest` regresses this test.
     #[tokio::test]
-    #[ignore = "requires network + Linux root to build ext4"]
-    async fn real_image_pull_and_build() {
+    #[ignore = "requires registry access and Linux root to build ext4"]
+    async fn multi_arch_index_resolves_and_builds_rootfs() {
         let cache_dir = tempfile::tempdir().unwrap();
         // 注入一个真实可执行文件作为 agent 二进制（这里用 /bin/true 占位验证管道）。
+
         let mgr = ImageManager::new()
             .with_cache_dir(cache_dir.path())
             .with_agent_binary("/bin/sh");
@@ -532,5 +565,17 @@ mod tests {
         // 第二次调用应命中缓存（无 pinned digest 时也会重新拉 manifest 但跳过构建）。
         let path2 = mgr.pull_and_build(&spec).await.unwrap();
         assert_eq!(path, path2);
+    }
+    #[cfg(unix)]
+    #[test]
+    fn dir_size_does_not_follow_directory_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("payload"), b"abc").unwrap();
+        symlink(".", root.path().join("loop")).unwrap();
+
+        // The symlink itself is counted; its directory target is not recursed.
+        assert_eq!(dir_size(root.path()).unwrap(), 4);
     }
 }

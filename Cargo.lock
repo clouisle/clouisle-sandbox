@@ -505,6 +505,7 @@ dependencies = [
  "futures",
  "libc",
  "nix 0.29.0",
+ "rtnetlink",
  "serde",
  "thiserror 2.0.19",
  "tokio",

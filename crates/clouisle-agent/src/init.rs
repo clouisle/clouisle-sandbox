@@ -43,62 +43,96 @@ pub fn read_cmdline() -> String {
     std::fs::read_to_string("/proc/cmdline").unwrap_or_default()
 }
 
-/// 配置 guest 网络（eth0 静态 IP + 默认网关）。
-///
-/// 从内核 cmdline 读取 `clouisle.guest_ip` / `clouisle.gateway`，
-/// 用 ifconfig/route 配置 eth0。不依赖发行版网络管理（Ubuntu 的
-/// systemd-networkd 不认内核 `ip=` 参数）。
-pub fn configure_network() -> Result<(), String> {
+/// Configure the guest's static TCP management network without relying on
+/// distro utilities such as `ip` or `ifconfig`, which OCI application images
+/// commonly omit.
+#[cfg(target_os = "linux")]
+pub async fn configure_network() -> Result<(), String> {
+    use std::net::{IpAddr, Ipv4Addr};
+
+    ensure_proc_mounted()?;
     let params = parse_cmdline(&read_cmdline());
     let guest_ip = params
         .get("guest_ip")
-        .ok_or_else(|| "clouisle.guest_ip not set in cmdline".to_string())?;
+        .ok_or_else(|| "clouisle.guest_ip not set in cmdline".to_string())?
+        .parse::<Ipv4Addr>()
+        .map_err(|error| format!("invalid clouisle.guest_ip: {error}"))?;
     let gateway = params
         .get("gateway")
-        .ok_or_else(|| "clouisle.gateway not set in cmdline".to_string())?;
+        .ok_or_else(|| "clouisle.gateway not set in cmdline".to_string())?
+        .parse::<Ipv4Addr>()
+        .map_err(|error| format!("invalid clouisle.gateway: {error}"))?;
 
-    // 根文件系统可能预置了宿主 DNS；替换为本沙盒网关上的白名单代理。
     let _ = std::fs::remove_file("/etc/resolv.conf");
-    if let Err(e) = std::fs::write("/etc/resolv.conf", format!("nameserver {gateway}\n")) {
-        tracing::warn!(error = %e, "failed to configure guest resolv.conf");
+    if let Err(error) = std::fs::write("/etc/resolv.conf", format!("nameserver {gateway}\n")) {
+        tracing::warn!(%error, "failed to configure guest resolv.conf");
     }
 
-    // 优先 ifconfig（net-tools），缺失则用 ip 命令
-    let ifcfg_ok = std::process::Command::new("ifconfig")
-        .args(["eth0", guest_ip, "netmask", "255.255.255.252", "up"])
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
+    let (connection, handle, _) =
+        rtnetlink::new_connection().map_err(|error| format!("open netlink: {error}"))?;
+    tokio::spawn(connection);
 
-    if ifcfg_ok {
-        // ifconfig up 隐含 link up
-    } else {
-        // ip 命令：先 link up，再配地址
-        let up_ok = std::process::Command::new("ip")
-            .args(["link", "set", "eth0", "up"])
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
-        let _ = std::process::Command::new("ip")
-            .args(["addr", "add", &format!("{guest_ip}/30"), "dev", "eth0"])
-            .status();
-        if !up_ok {
-            return Err(format!("failed to bring eth0 up (guest_ip={guest_ip})"));
-        }
-    }
+    use futures::TryStreamExt;
+    let link = handle
+        .link()
+        .get()
+        .match_name("eth0".into())
+        .execute()
+        .try_next()
+        .await
+        .map_err(|error| format!("find eth0: {error}"))?
+        .ok_or_else(|| "eth0 not found".to_string())?;
+    let index = link.header.index;
+    handle
+        .link()
+        .set(index)
+        .up()
+        .execute()
+        .await
+        .map_err(|error| format!("bring eth0 up: {error}"))?;
+    handle
+        .address()
+        .add(index, IpAddr::V4(guest_ip), 30)
+        .replace()
+        .execute()
+        .await
+        .map_err(|error| format!("assign guest address: {error}"))?;
+    handle
+        .route()
+        .add()
+        .v4()
+        .output_interface(index)
+        .gateway(gateway)
+        .replace()
+        .execute()
+        .await
+        .map_err(|error| format!("install guest default route: {error}"))?;
 
-    let _ = std::process::Command::new("ip")
-        .args(["route", "replace", "default", "via", gateway, "dev", "eth0"])
-        .status();
-    if let Ok(out) = std::process::Command::new("ip")
-        .args(["addr", "show"])
-        .output()
-    {
-        tracing::info!(addrs = %String::from_utf8_lossy(&out.stdout), "guest addr state");
-    }
-
-    tracing::info!(guest_ip = %guest_ip, gateway = %gateway, "guest network configured");
+    tracing::info!(%guest_ip, %gateway, "guest network configured");
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn ensure_proc_mounted() -> Result<(), String> {
+    use nix::errno::Errno;
+    use nix::mount::{MsFlags, mount};
+
+    std::fs::create_dir_all("/proc").map_err(|error| format!("create /proc: {error}"))?;
+    match mount(
+        Some("proc"),
+        "/proc",
+        Some("proc"),
+        MsFlags::empty(),
+        None::<&str>,
+    ) {
+        Ok(()) | Err(Errno::EBUSY) => Ok(()),
+        Err(error) => Err(format!("mount /proc: {error}")),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub async fn configure_network() -> Result<(), String> {
+    Err("guest network configuration requires Linux".to_string())
 }
 
 #[cfg(test)]

@@ -209,10 +209,17 @@ impl FirecrackerVmm {
         let base = spec.env.get("boot_args").cloned().unwrap_or_else(|| {
             "console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda rw".to_string()
         });
-        // 追加 guest IP 配置（10.{a}.{b}.2/30，网关 10.{a}.{b}.1）
+        // OCI application images usually lack a distro init. The injected,
+        // statically linked guest agent is therefore the portable PID 1.
+        let init = if base.split_whitespace().any(|arg| arg.starts_with("init=")) {
+            ""
+        } else {
+            " init=/usr/local/bin/clouisle-agent"
+        };
+        // Append guest static IP configuration (10.{a}.{b}.2/30, gateway .1).
         let (a, b) = Self::sandbox_subnet(sandbox_id);
         format!(
-            "{base} ip=10.{a}.{b}.2::10.{a}.{b}.1:255.255.255.252::eth0:off \
+            "{base}{init} ip=10.{a}.{b}.2::10.{a}.{b}.1:255.255.255.252::eth0:off \
              clouisle.guest_ip=10.{a}.{b}.2 clouisle.gateway=10.{a}.{b}.1"
         )
     }
@@ -790,6 +797,7 @@ mod tests {
         let spec = SandboxSpec::default();
         let args = vmm.boot_args("sandbox-1", &spec);
         assert!(args.contains("console=ttyS0"));
+        assert!(args.contains("init=/usr/local/bin/clouisle-agent"));
         assert!(args.contains("clouisle.guest_ip="));
     }
 
@@ -800,6 +808,17 @@ mod tests {
         spec.env.insert("boot_args".into(), "custom=1".into());
         let args = vmm.boot_args("sandbox-1", &spec);
         assert!(args.starts_with("custom=1 "));
+    }
+
+    #[test]
+    fn boot_args_preserve_explicit_init() {
+        let vmm = FirecrackerVmm::new(FirecrackerConfig::default());
+        let mut spec = SandboxSpec::default();
+        spec.env
+            .insert("boot_args".into(), "init=/custom-init custom=1".into());
+        let args = vmm.boot_args("sandbox-1", &spec);
+        assert!(args.contains("init=/custom-init"));
+        assert!(!args.contains("init=/usr/local/bin/clouisle-agent"));
     }
 
     #[tokio::test]
