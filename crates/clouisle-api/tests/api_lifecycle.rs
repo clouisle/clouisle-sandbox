@@ -649,3 +649,19 @@ async fn initialization_command_failure_does_not_report_running() {
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
     assert_eq!(body["error"]["code"], "VMM");
 }
+
+#[tokio::test]
+async fn image_prefetch_returns_observable_job() {
+    let app = app();
+    let (status, body) = post_json(
+        &app,
+        "/api/v1/images/prefetch",
+        serde_json::json!({ "image": { "reference": "alpine:latest" } }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let job_id = body["job_id"].as_str().unwrap();
+    let (status, body) = get(&app, &format!("/api/v1/images/prefetch/{job_id}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(matches!(body["status"].as_str(), Some("queued" | "running" | "succeeded")));
+}
