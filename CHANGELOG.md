@@ -22,3 +22,4 @@
 - The static guest agent configures its management NIC through netlink, so OCI application images do not need `ip` or `ifconfig` binaries.
 - Release images build amd64 and arm64 concurrently on native GitHub-hosted runners, reuse architecture-scoped BuildKit caches, and assemble tags only after both digests succeed.
 - Docker dependency compilation is isolated with cargo-chef, while Linux CI reuses one cached Cargo target for clippy and build.
+- Docker Compose isolates PostgreSQL behind loopback port 55433 and disables the API image healthcheck for the gRPC-only clouisled process, preventing host-port collisions and restart loops.

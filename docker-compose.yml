@@ -18,7 +18,7 @@ services:
     # 用 postgres 连接串（HA 就绪）
     command:
       - --addr=0.0.0.0:8080
-      - --db=postgres://clouisle:changeme@127.0.0.1:5432/clouisle
+      - --db=postgres://clouisle:changeme@127.0.0.1:55433/clouisle
     volumes:
       - *fc-kvm
       - *fc-kernel
@@ -49,6 +49,8 @@ services:
       - *fc-rootfs
       - *fc-image-cache
       - clouisled-data:/data
+    healthcheck:
+      disable: true
     restart: unless-stopped
 
 
@@ -56,7 +58,8 @@ services:
   postgres:
     image: postgres:16-alpine
     container_name: clouisle-postgres
-    network_mode: host
+    ports:
+      - "127.0.0.1:55433:5432"
     environment:
       - POSTGRES_USER=clouisle
       - POSTGRES_PASSWORD=changeme
