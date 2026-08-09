@@ -16,49 +16,57 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  # ============ 代码质量检查 ============
+  # Keep the established required-check name, but formatting needs no dependency build.
   lint:
     name: Lint (fmt + clippy)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v5
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
-          components: rustfmt, clippy
-      - name: Install dependencies
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq protobuf-compiler pkg-config libssl-dev
+          components: rustfmt
       - name: Format check
         run: cargo fmt --check --all
-      - name: Clippy (Linux)
-        run: cargo clippy --workspace --features test-utils -- -D warnings
 
-  # ============ 编译检查（Linux amd64） ============
+  # Clippy and build share one runner and one target directory.
   build-linux:
     name: Build (Linux amd64)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: linux-amd64
       - name: Install dependencies
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq protobuf-compiler pkg-config libssl-dev
+      - name: Clippy (Linux)
+        run: cargo clippy --workspace --features test-utils --locked -- -D warnings
       - name: Build
-        run: cargo build --workspace
+        run: cargo build --workspace --locked
 
-  # ============ 编译检查（macOS arm64） ============
+  # macOS is a portability check; deployable runtime binaries are Linux containers.
   build-macos:
     name: Build (macOS arm64)
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v5
       - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: macos-arm64
       - name: Install protoc
         run: |
           brew untap aws/tap || true
           brew install protobuf
-      - name: Build
-        run: cargo build --workspace
+      - name: Check
+        run: cargo check --workspace --locked

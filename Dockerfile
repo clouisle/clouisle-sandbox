@@ -1,39 +1,66 @@
-# ============================================================
-# Stage 1: 编译 Rust 二进制（多平台）
-# ============================================================
-FROM --platform=$TARGETPLATFORM rust:1-slim-bookworm AS builder
+# syntax=docker/dockerfile:1.7
 
-ARG TARGETPLATFORM
-ARG BUILDPLATFORM
+# ============================================================
+# Stage 1: cache workspace dependencies independently of source
+# ============================================================
+FROM rust:1-slim-bookworm AS chef
+
 ARG TARGETARCH
 
-RUN apt-get update -qq && apt-get install -y -qq protobuf-compiler pkg-config libssl-dev musl-tools && rm -rf /var/lib/apt/lists/*
+RUN apt-get update -qq && apt-get install -y -qq \
+    protobuf-compiler pkg-config libssl-dev musl-tools \
+    && rm -rf /var/lib/apt/lists/* \
+    && cargo install cargo-chef --version 0.1.74 --locked \
+    && case "$TARGETARCH" in \
+        amd64) rustup target add x86_64-unknown-linux-musl ;; \
+        arm64) rustup target add aarch64-unknown-linux-musl ;; \
+        *) echo "unsupported target architecture: $TARGETARCH" >&2; exit 1 ;; \
+    esac
 
 WORKDIR /build
+
+FROM chef AS planner
 COPY Cargo.toml Cargo.lock ./
 COPY crates/ ./crates/
 COPY benches/ ./benches/
 COPY sdk/rust/ ./sdk/rust/
+RUN cargo chef prepare --recipe-path recipe.json
 
-# API/CLI 在运行镜像中执行；guest agent 必须静态链接，兼容 Ubuntu 18.04 rootfs。
-# Builder 与运行目标同架构，使 musl-gcc 可为 amd64 和 arm64 生成本机静态二进制。
-RUN cargo build --release -p clouisle-api -p clouislectl -p clouisled \
+FROM chef AS builder
+ARG TARGETARCH
+COPY --from=planner /build/recipe.json recipe.json
+RUN cargo chef cook --release --locked --recipe-path recipe.json \
+    -p clouisle-api -p clouislectl -p clouisled
+RUN case "$TARGETARCH" in \
+        amd64) target=x86_64-unknown-linux-musl ;; \
+        arm64) target=aarch64-unknown-linux-musl ;; \
+        *) echo "unsupported target architecture: $TARGETARCH" >&2; exit 1 ;; \
+    esac \
+    && env "CARGO_TARGET_$(printf '%s' "$target" | tr '[:lower:]-' '[:upper:]_')_LINKER=musl-gcc" \
+       RUSTFLAGS="-C relocation-model=static" \
+       cargo chef cook --release --locked --recipe-path recipe.json \
+       -p clouisle-agent --target "$target"
+
+COPY Cargo.toml Cargo.lock ./
+COPY crates/ ./crates/
+COPY benches/ ./benches/
+COPY sdk/rust/ ./sdk/rust/
+RUN cargo build --release --locked -p clouisle-api -p clouislectl -p clouisled \
     && case "$TARGETARCH" in \
         amd64) target=x86_64-unknown-linux-musl ;; \
         arm64) target=aarch64-unknown-linux-musl ;; \
         *) echo "unsupported target architecture: $TARGETARCH" >&2; exit 1 ;; \
     esac \
-    && rustup target add "$target" \
     && env "CARGO_TARGET_$(printf '%s' "$target" | tr '[:lower:]-' '[:upper:]_')_LINKER=musl-gcc" \
        RUSTFLAGS="-C relocation-model=static" \
-       cargo build --release -p clouisle-agent --target "$target" \
+       cargo build --release --locked -p clouisle-agent --target "$target" \
     && cp "target/$target/release/clouisle-agent" /build/clouisle-agent-guest
 
 # ============================================================
 # Stage 2: 运行镜像（多平台）
 #   根据 TARGETARCH 下载对应架构的 Firecracker
 # ============================================================
-FROM --platform=$TARGETPLATFORM debian:bookworm-slim
+FROM debian:bookworm-slim
 
 ARG TARGETARCH
 

@@ -20,3 +20,5 @@
 - CI/CD（GitHub Actions：lint / test / build / release）
 - Runtime delivery is container-only: releases publish OCI images, and operator CLI commands execute through Docker Compose.
 - The static guest agent configures its management NIC through netlink, so OCI application images do not need `ip` or `ifconfig` binaries.
+- Release images build amd64 and arm64 concurrently on native GitHub-hosted runners, reuse architecture-scoped BuildKit caches, and assemble tags only after both digests succeed.
+- Docker dependency compilation is isolated with cargo-chef, while Linux CI reuses one cached Cargo target for clippy and build.

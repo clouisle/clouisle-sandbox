@@ -53,3 +53,14 @@ Planning complete; implementation not started.
 6. [ ] Document capability boundaries, security, rollout, and rollback
 
 See `docs/plan/cross-platform-docker-dev-vmm.md` for the requirements, traceability matrix, contracts, staged plan, acceptance cases, and risks.
+
+## Hosted Multi-architecture Build Optimization
+
+1. [x] Refactor Docker dependency layers with cargo-chef
+2. [x] Build amd64 and arm64 concurrently on native GitHub-hosted runners
+3. [x] Cache BuildKit output independently per architecture
+4. [x] Merge immutable digests into versioned and latest manifests
+5. [x] Reuse Cargo work across Linux CI checks
+6. [x] Verify optimized Docker build and release workflows
+
+See `docs/plan/hosted-multiarch-build-optimization.md` for the baseline, hosted-runner topology, cache design, validation, and rollback plan.
