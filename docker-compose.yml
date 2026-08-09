@@ -8,8 +8,7 @@ x-firecracker-volumes:
 services:
   # ============ 控制平面：apiserver ============
   apiserver:
-    build: .
-    image: clouisle-apiserver:v0.1.5
+    image: registry.cn-shanghai.aliyuncs.com/clouisle/clouisle-sandbox:v0.1.5
     container_name: clouisle-apiserver
     privileged: true                        # 访问 /dev/kvm + 创建 netns
     network_mode: host                      # netns / nftables 需要宿主网络
@@ -33,8 +32,7 @@ services:
 
   # ============ 数据平面：clouisled ==========
   clouisled:
-    build: .
-    image: clouisle-sandbox:v0.1.5
+    image: registry.cn-shanghai.aliyuncs.com/clouisle/clouisle-sandbox:v0.1.5
     container_name: clouisle-node
     entrypoint: ["clouisled"]
     command:

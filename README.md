@@ -55,8 +55,9 @@ Ideal for development and single-node production. One `docker compose up` starts
 #    images/kernel/build-kernel.sh → /opt/clouisle/vmlinux
 #    images/rootfs/build-rootfs.sh → /opt/clouisle/rootfs/base.ext4
 
-# 2. Build and start
-docker compose up -d --build
+# 2. Pull the published image and start
+docker compose pull
+docker compose up -d
 
 # 3. Verify
 curl localhost:8080/health
@@ -71,6 +72,14 @@ docker compose logs -f apiserver
 # 6. Stop
 docker compose down
 ```
+
+Both `apiserver` and `clouisled` use the same published image:
+
+```text
+registry.cn-shanghai.aliyuncs.com/clouisle/clouisle-sandbox:v0.1.5
+```
+
+The image defaults to `clouisle-api`; the `clouisled` service overrides the entrypoint.
 
 **Image structure** (`Dockerfile` multi-stage build):
 

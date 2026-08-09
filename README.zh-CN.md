@@ -53,8 +53,9 @@
 #    images/kernel/build-kernel.sh → /opt/clouisle/vmlinux
 #    images/rootfs/build-rootfs.sh → /opt/clouisle/rootfs/base.ext4
 
-# 2. 构建并启动
-docker compose up -d --build
+# 2. 拉取已发布镜像并启动
+docker compose pull
+docker compose up -d
 
 # 3. 验证
 curl localhost:8080/health
@@ -69,6 +70,14 @@ docker compose logs -f apiserver
 # 6. 停止
 docker compose down
 ```
+
+`apiserver` 与 `clouisled` 使用同一个已发布镜像：
+
+```text
+registry.cn-shanghai.aliyuncs.com/clouisle/clouisle-sandbox:v0.1.5
+```
+
+镜像默认启动 `clouisle-api`；`clouisled` 服务通过 entrypoint 覆盖启动命令。
 
 **镜像架构**（`Dockerfile` 多阶段构建）：
 
