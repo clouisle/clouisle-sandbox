@@ -518,6 +518,48 @@ impl Vmm for FirecrackerVmm {
         Ok(handle)
     }
 
+    async fn image_cache_hit(&self, spec: &SandboxSpec) -> Result<bool> {
+        let image = ImageSpec {
+            reference: spec.image.reference.clone(),
+            digest: spec.image.digest.clone(),
+        };
+        Ok(self.image_manager.cache_hit(&image).await)
+    }
+
+    async fn prefetch_image(&self, spec: &SandboxSpec) -> Result<()> {
+        let image = ImageSpec {
+            reference: spec.image.reference.clone(),
+            digest: spec.image.digest.clone(),
+        };
+        self.image_manager
+            .pull_and_build(&image)
+            .await
+            .map(|_| ())
+            .map_err(|error| {
+                ClouisleError::new(
+                    ErrorKind::Vmm,
+                    format!("prefetch OCI rootfs {}: {error}", spec.image.reference),
+                )
+            })
+    }
+
+    async fn probe(&self, handle: &VmHandle) -> Result<bool> {
+        if let Some(pid) = handle.pid {
+            use nix::sys::signal::kill;
+            use nix::unistd::Pid;
+            if kill(Pid::from_raw(pid as i32), None).is_err() {
+                return Ok(false);
+            }
+        }
+        let Some(socket) = handle.api_socket.as_deref() else {
+            return Ok(false);
+        };
+        if !Path::new(socket).exists() {
+            return Ok(false);
+        }
+        Ok(self.fc_get(handle, "/vm/config").await.is_ok())
+    }
+
     async fn start(&self, h: &VmHandle) -> Result<()> {
         #[derive(Serialize)]
         struct Action<'a> {

@@ -36,6 +36,16 @@ pub trait Store: Send + Sync {
     async fn create_sandbox(&self, sandbox: &Sandbox) -> StoreResult<()>;
     async fn get_sandbox(&self, id: &str) -> StoreResult<Sandbox>;
     async fn update_sandbox_status(&self, id: &str, status: &SandboxStatus) -> StoreResult<()>;
+
+    /// Update lifecycle state and persist a human-readable failure/recovery reason.
+    async fn update_sandbox_status_message(
+        &self,
+        id: &str,
+        status: &SandboxStatus,
+        message: Option<&str>,
+    ) -> StoreResult<()>;
+    /// Persist the runtime owner so restart reconciliation can find the node.
+    async fn update_sandbox_node(&self, id: &str, node_id: Option<&str>) -> StoreResult<()>;
     /// 更新沙盒的 VMM 元数据（创建后回填）。
     async fn update_sandbox_vmm_meta(
         &self,

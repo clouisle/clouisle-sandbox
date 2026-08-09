@@ -84,6 +84,21 @@ pub trait Vmm: Send + Sync {
     /// `sandbox_id` 由控制平面统一生成（用于 netns 名、设备名一致性）。
     async fn create(&self, sandbox_id: &str, spec: &SandboxSpec) -> Result<VmHandle>;
 
+    /// Return whether the image is already usable without registry I/O.
+    async fn image_cache_hit(&self, _spec: &SandboxSpec) -> Result<bool> {
+        Ok(true)
+    }
+
+    /// Pull and materialize an image before sandbox creation.
+    async fn prefetch_image(&self, _spec: &SandboxSpec) -> Result<()> {
+        Ok(())
+    }
+
+    /// Probe a persisted runtime after a control-plane restart.
+    async fn probe(&self, _handle: &VmHandle) -> Result<bool> {
+        Ok(true)
+    }
+
     /// 启动 guest（InstanceStart）。
     async fn start(&self, h: &VmHandle) -> Result<()>;
 

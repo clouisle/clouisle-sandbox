@@ -207,6 +207,39 @@ impl Store for SqliteStore {
         Ok(())
     }
 
+    async fn update_sandbox_status_message(
+        &self,
+        id: &str,
+        status: &SandboxStatus,
+        message: Option<&str>,
+    ) -> StoreResult<()> {
+        let conn = self.conn.lock().await;
+        let updated = conn
+            .execute(
+                "UPDATE sandboxes SET status=?1, terminal_message=?2, updated_at=?3 WHERE id=?4",
+                rusqlite::params![status.as_str(), message, Utc::now().timestamp_millis(), id],
+            )
+            .map_err(|error| StoreError::Sqlite(error.to_string()))?;
+        if updated == 0 {
+            return Err(StoreError::NotFound(format!("sandbox {id}")));
+        }
+        Ok(())
+    }
+
+    async fn update_sandbox_node(&self, id: &str, node_id: Option<&str>) -> StoreResult<()> {
+        let conn = self.conn.lock().await;
+        let updated = conn
+            .execute(
+                "UPDATE sandboxes SET node_id=?1, updated_at=?2 WHERE id=?3",
+                rusqlite::params![node_id, Utc::now().timestamp_millis(), id],
+            )
+            .map_err(|error| StoreError::Sqlite(error.to_string()))?;
+        if updated == 0 {
+            return Err(StoreError::NotFound(format!("sandbox {id}")));
+        }
+        Ok(())
+    }
+
     async fn update_sandbox_vmm_meta(&self, id: &str, vmm_meta: &VmmMeta) -> StoreResult<()> {
         let conn = self.conn.lock().await;
         let vmm_meta_json =

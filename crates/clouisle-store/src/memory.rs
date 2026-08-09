@@ -56,6 +56,35 @@ impl Store for InMemoryStore {
         Ok(())
     }
 
+    async fn update_sandbox_status_message(
+        &self,
+        id: &str,
+        status: &SandboxStatus,
+        message: Option<&str>,
+    ) -> StoreResult<()> {
+        let mut map = self.sandboxes.write().await;
+        let sb = map
+            .get_mut(id)
+            .ok_or_else(|| StoreError::NotFound(format!("sandbox {id} not found")))?;
+        sb.status = *status;
+        sb.terminal_message = message.map(str::to_owned);
+        sb.updated_at = chrono::Utc::now();
+        if *status == SandboxStatus::Running {
+            sb.ready_at = Some(sb.updated_at);
+        }
+        Ok(())
+    }
+
+    async fn update_sandbox_node(&self, id: &str, node_id: Option<&str>) -> StoreResult<()> {
+        let mut map = self.sandboxes.write().await;
+        let sb = map
+            .get_mut(id)
+            .ok_or_else(|| StoreError::NotFound(format!("sandbox {id} not found")))?;
+        sb.node_id = node_id.map(str::to_owned);
+        sb.updated_at = chrono::Utc::now();
+        Ok(())
+    }
+
     async fn update_sandbox_vmm_meta(
         &self,
         id: &str,

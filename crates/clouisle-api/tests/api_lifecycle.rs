@@ -57,6 +57,9 @@ impl Vmm for TestVmm {
             vsock_cid: None,
         })
     }
+    async fn image_cache_hit(&self, spec: &SandboxSpec) -> Result<bool> {
+        Ok(spec.image.reference != "missing:latest")
+    }
     async fn start(&self, _h: &VmHandle) -> Result<()> {
         self.running
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);

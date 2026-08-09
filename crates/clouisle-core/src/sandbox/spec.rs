@@ -26,6 +26,13 @@ pub struct SandboxSpec {
     /// 环境变量注入。
     #[serde(default)]
     pub env: std::collections::HashMap<String, String>,
+    /// One-time argv executed after the guest agent is ready and before the
+    /// sandbox is exposed as running.
+    #[serde(default)]
+    pub init_command: Vec<String>,
+    /// Maximum time allowed for the initialization command.
+    #[serde(default = "default_init_timeout_ms")]
+    pub init_timeout_ms: u64,
     /// 节点选择标签（Phase 3 多节点调度）。
     #[serde(default)]
     pub node_selector: std::collections::HashMap<String, String>,
@@ -39,6 +46,9 @@ pub struct SandboxSpec {
 fn default_start_timeout() -> u64 {
     10
 }
+fn default_init_timeout_ms() -> u64 {
+    30_000
+}
 
 impl Default for SandboxSpec {
     fn default() -> Self {
@@ -51,6 +61,8 @@ impl Default for SandboxSpec {
             ttl_secs: None,
             start_timeout_secs: 10,
             env: std::collections::HashMap::new(),
+            init_command: Vec::new(),
+            init_timeout_ms: default_init_timeout_ms(),
             node_selector: std::collections::HashMap::new(),
             restart_policy: RestartPolicy::default(),
             tenant_id: None,
@@ -75,6 +87,25 @@ impl SandboxSpec {
             errors.push(ValidationError::new(
                 "start_timeout_secs",
                 "start_timeout_secs must be in [1, 300]",
+            ));
+        }
+
+        if self.init_command.iter().any(|part| part.trim().is_empty()) {
+            errors.push(ValidationError::new(
+                "init_command",
+                "init_command entries must not be empty",
+            ));
+        }
+        if self.init_command.is_empty() && self.init_timeout_ms != default_init_timeout_ms() {
+            errors.push(ValidationError::new(
+                "init_timeout_ms",
+                "init_timeout_ms is only valid with init_command",
+            ));
+        }
+        if self.init_timeout_ms == 0 || self.init_timeout_ms > 300_000 {
+            errors.push(ValidationError::new(
+                "init_timeout_ms",
+                "init_timeout_ms must be in [1, 300000]",
             ));
         }
 
