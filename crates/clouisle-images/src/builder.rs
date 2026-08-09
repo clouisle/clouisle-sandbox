@@ -9,16 +9,34 @@ use oci_distribution::Reference;
 use oci_distribution::client::{Client, ClientConfig};
 use oci_distribution::manifest::{OciDescriptor, OciImageManifest};
 use oci_distribution::secrets::RegistryAuth;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, Notify, RwLock};
 use tracing::{debug, info};
+#[derive(Clone)]
+pub struct ImageManager {
+    cache: Arc<RwLock<HashMap<String, String>>>,
+    cache_dir: PathBuf,
+    agent_binary: Option<PathBuf>,
+    /// Lazily computed, streaming SHA-256 of the injected agent binary.
+    agent_fingerprint: Arc<OnceLock<Result<String, String>>>,
+    client: Client,
+    auth: RegistryAuth,
+    /// One registry/build pipeline per image reference or digest.
+    inflight: Arc<Mutex<HashMap<String, Arc<Notify>>>>,
+}
 
 /// 镜像引用。
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
 pub struct ImageSpec {
     pub reference: String,
     pub digest: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct CacheAlias {
+    digest: String,
 }
 
 /// 镜像管道错误。
@@ -40,17 +58,6 @@ pub enum ImageError {
     UnsupportedPlatform(String),
 }
 
-/// OCI 镜像管理器：拉取镜像、构建 ext4 根文件系统、按 digest 缓存。
-#[derive(Clone)]
-pub struct ImageManager {
-    cache: Arc<RwLock<HashMap<String, String>>>,
-    cache_dir: PathBuf,
-    agent_binary: Option<PathBuf>,
-    /// Lazily computed, streaming SHA-256 of the injected agent binary.
-    agent_fingerprint: Arc<OnceLock<Result<String, String>>>,
-    client: Client,
-    auth: RegistryAuth,
-}
 
 impl Default for ImageManager {
     fn default() -> Self {
@@ -67,7 +74,30 @@ impl ImageManager {
             agent_fingerprint: Arc::new(OnceLock::new()),
             client: Client::new(ClientConfig::default()),
             auth: RegistryAuth::Anonymous,
+            inflight: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+    /// Check the memory/disk rootfs cache, including unpinned references.
+    pub async fn cache_hit(&self, spec: &ImageSpec) -> bool {
+        let image_digest = match &spec.digest {
+            Some(digest) => Some(digest.clone()),
+            None => self.reference_digest(&spec.reference).await,
+        };
+        let Some(image_digest) = image_digest else {
+            return false;
+        };
+        let Ok(key) = self.cache_key_for_image(&image_digest) else {
+            return false;
+        };
+        self.cached(&key).await.is_some()
+    }
+
+    async fn reference_digest(&self, reference: &str) -> Option<String> {
+        let path = reference_alias_path(&self.cache_dir, reference);
+        let bytes = tokio::fs::read(path).await.ok()?;
+        serde_json::from_slice::<CacheAlias>(&bytes)
+            .ok()
+            .map(|alias| alias.digest)
     }
 
     /// 覆盖 ext4 缓存目录。
@@ -93,34 +123,56 @@ impl ImageManager {
         self
     }
 
-    /// Check the two-level rootfs cache when the image digest is already known.
-    /// The key includes the injected-agent digest, so a guest-agent upgrade
-    /// never reuses a rootfs containing a stale executable.
-    pub async fn cache_hit(&self, spec: &ImageSpec) -> bool {
-        let Some(image_digest) = &spec.digest else {
-            return false;
-        };
-        let Ok(key) = self.cache_key_for_image(image_digest) else {
-            return false;
-        };
-        self.cached(&key).await.is_some()
-    }
 
     /// Pull an OCI image and build an ext4 rootfs, returning its `.ext4` path.
     ///
-    /// The cache key combines the platform image-manifest digest with the
-    /// injected guest-agent digest. A pinned image digest can therefore check
-    /// the cache without a registry request, while still invalidating on an
-    /// agent upgrade.
+    /// Concurrent requests for the same tag/digest share one registry/build
+    /// pipeline. A completed alias is persisted so a new process can detect
+    /// an unpinned tag without contacting the registry again.
     pub async fn pull_and_build(&self, spec: &ImageSpec) -> Result<String, ImageError> {
-        if let Some(image_digest) = &spec.digest {
-            let key = self.cache_key_for_image(image_digest)?;
-            if let Some(path) = self.cached(&key).await {
-                info!(key = %key, path = %path, "pinned digest cache hit");
+        let flight_key = spec
+            .digest
+            .as_deref()
+            .map(|digest| format!("digest:{digest}"))
+            .unwrap_or_else(|| format!("reference:{}", spec.reference));
+        loop {
+            if let Some(path) = self.cached_path_for_spec(spec).await {
                 return Ok(path);
             }
-        }
 
+            let waiter = {
+                let mut inflight = self.inflight.lock().await;
+                if let Some(notify) = inflight.get(&flight_key) {
+                    Some(notify.clone())
+                } else {
+                    inflight.insert(flight_key.clone(), Arc::new(Notify::new()));
+                    None
+                }
+            };
+            if let Some(notify) = waiter {
+                notify.notified().await;
+                continue;
+            }
+
+            let result = self.pull_and_build_inner(spec).await;
+            if let Some(notify) = self.inflight.lock().await.remove(&flight_key) {
+                notify.notify_waiters();
+                notify.notify_one();
+            }
+            return result;
+        }
+    }
+
+    async fn cached_path_for_spec(&self, spec: &ImageSpec) -> Option<String> {
+        let image_digest = match &spec.digest {
+            Some(digest) => Some(digest.clone()),
+            None => self.reference_digest(&spec.reference).await,
+        }?;
+        let key = self.cache_key_for_image(&image_digest).ok()?;
+        self.cached(&key).await
+    }
+
+    async fn pull_and_build_inner(&self, spec: &ImageSpec) -> Result<String, ImageError> {
         let reference = Reference::try_from(spec.reference.clone())
             .map_err(|e| ImageError::InvalidReference(spec.reference.clone(), e.to_string()))?;
 
@@ -135,15 +187,15 @@ impl ImageManager {
 
         let image_digest = spec.digest.as_deref().unwrap_or(&digest);
         let key = self.cache_key_for_image(image_digest)?;
-
-        // Second cache check: the unpinned digest is only available after the
-        // platform image manifest has been selected.
         if let Some(path) = self.cached(&key).await {
+            self.write_reference_alias(&spec.reference, image_digest).await?;
             return Ok(path);
         }
 
         info!(key = %key, reference = %spec.reference, "building ext4 rootfs");
-        self.build(&reference, manifest, &key).await
+        let path = self.build(&reference, manifest, &key).await?;
+        self.write_reference_alias(&spec.reference, image_digest).await?;
+        Ok(path)
     }
 
     /// 检查内存 + 磁盘两级缓存。
@@ -178,6 +230,23 @@ impl ImageManager {
             .as_ref()
             .map_err(|error| ImageError::AgentBinary(error.clone()))?;
         Ok(format!("{image_digest}-agent-{fingerprint}"))
+    }
+
+    async fn write_reference_alias(
+        &self,
+        reference: &str,
+        digest: &str,
+    ) -> Result<(), ImageError> {
+        tokio::fs::create_dir_all(&self.cache_dir).await?;
+        let path = reference_alias_path(&self.cache_dir, reference);
+        let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
+        let content = serde_json::to_vec(&CacheAlias {
+            digest: digest.to_string(),
+        })
+        .map_err(|error| ImageError::Registry(format!("serialize cache alias: {error}")))?;
+        tokio::fs::write(&tmp, content).await?;
+        tokio::fs::rename(tmp, path).await?;
+        Ok(())
     }
 
     /// Build an ext4 rootfs from an already platform-resolved image manifest.
@@ -337,6 +406,12 @@ impl ImageManager {
 fn cache_path(cache_dir: &Path, key: &str) -> PathBuf {
     let safe = key.replace([':', '/', '\\'], "_");
     cache_dir.join(format!("{safe}.ext4"))
+}
+
+fn reference_alias_path(cache_dir: &Path, reference: &str) -> PathBuf {
+    let mut hasher = Sha256::new();
+    hasher.update(reference.as_bytes());
+    cache_dir.join(format!("ref-{}.json", hex::encode(hasher.finalize())))
 }
 
 /// 递归计算目录/文件大小。
