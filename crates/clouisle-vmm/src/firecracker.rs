@@ -57,6 +57,8 @@ pub struct FirecrackerConfig {
     pub enable_seccomp: bool,
     /// 已构建的 rootfs 镜像缓存目录
     pub images_dir: PathBuf,
+    /// 每沙盒独立 rootfs 副本目录（冷创建时复制，避免共享镜像写互相污染）
+    pub rootfs_work_dir: PathBuf,
 }
 
 impl Default for FirecrackerConfig {
@@ -69,6 +71,7 @@ impl Default for FirecrackerConfig {
             use_jailer: true,
             enable_seccomp: true,
             images_dir: PathBuf::from("/tmp/clouisle-cache"),
+            rootfs_work_dir: PathBuf::from("/tmp/clouisle-cache/.rootfs"),
         }
     }
 }
@@ -91,7 +94,207 @@ pub struct FirecrackerVmm {
     vms: Arc<Mutex<HashMap<String, FcProcess>>>,
 }
 
+/// 在宿主 cgroup v2 `io` 控制器上限制 FC 进程对 rootfs 所在设备的
+/// IOPS（guest 的 disk IO 经 FC 后端读/写 rootfs 文件，host 侧限制生效）。
+/// `None`/0 不限制。清理由 [`remove_io_limit`] 负责。
+fn apply_io_limit(
+    sandbox_id: &str,
+    iops: Option<u32>,
+    fc_pid: u64,
+    rootfs: &std::path::Path,
+) -> Result<()> {
+    use std::fs;
+    use std::os::unix::fs::MetadataExt;
+    let Some(iops) = iops.filter(|i| *i > 0) else {
+        return Ok(());
+    };
+    let base = "/sys/fs/cgroup/clouisle-io";
+    let _ = fs::create_dir_all(base);
+    let _ = fs::write(format!("{base}/cgroup.subtree_control"), "+io");
+    let dir = format!("{base}/{sandbox_id}");
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).map_err(|e| ClouisleError::io(format!("create io cgroup: {e}")))?;
+    let dev = fs::metadata(rootfs)
+        .map_err(|e| ClouisleError::io(format!("stat rootfs {rootfs:?}: {e}")))?
+        .dev();
+    let major = ((dev >> 8) & 0xfff) | ((dev >> 32) & !0xfff);
+    let minor = (dev & 0xff) | ((dev >> 12) & !0xff);
+    fs::write(
+        format!("{dir}/io.max"),
+        format!("{major}:{minor} riops={iops} wiops={iops}"),
+    )
+    .map_err(|e| ClouisleError::io(format!("write io.max: {e}")))?;
+    fs::write(format!("{dir}/cgroup.procs"), fc_pid.to_string())
+        .map_err(|e| ClouisleError::io(format!("move fc into io cgroup: {e}")))?;
+    tracing::info!(sandbox_id, iops, "applied host io.max limit");
+    Ok(())
+}
+
+/// 删除沙盒的 io 限制 cgroup（stop 清理）。
+fn remove_io_limit(sandbox_id: &str) {
+    let dir = format!("/sys/fs/cgroup/clouisle-io/{sandbox_id}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 impl FirecrackerVmm {
+    async fn create_inner(
+        &self,
+        sandbox_id: &str,
+        spec: &SandboxSpec,
+        subnet: Option<(u16, u16)>,
+    ) -> Result<VmHandle> {
+        self.check_environment()?;
+
+        let id = sandbox_id.to_string();
+        let (handle, sock_path, child) = self.spawn_firecracker(&id, subnet)?;
+        // TAP device is created by FirewallManager before VMM creation.
+        let host_dev = "tap0";
+
+        let mut vms = self.vms.lock().await;
+        vms.insert(
+            id.clone(),
+            FcProcess {
+                handle: handle.clone(),
+                child: Some(child),
+            },
+        );
+        drop(vms);
+
+        let configured: Result<()> = async {
+            // 等待 API socket 就绪
+            self.wait_for_socket(&sock_path).await?;
+
+            #[derive(Serialize)]
+            struct MachineConfig {
+                vcpu_count: u16,
+                mem_size_mib: u32,
+                smt: bool,
+                track_dirty_pages: bool,
+            }
+            self.fc_put(
+                &handle,
+                "/machine-config",
+                &MachineConfig {
+                    vcpu_count: spec.resources.vcpu,
+                    mem_size_mib: spec.resources.memory_mb,
+                    smt: false,
+                    track_dirty_pages: false,
+                },
+            )
+            .await?;
+
+            #[derive(Serialize)]
+            struct BootSource<'a> {
+                kernel_image_path: &'a str,
+                boot_args: &'a str,
+            }
+            let kernel_path = self.config.kernel_path.to_string_lossy().into_owned();
+            let boot_args = match subnet {
+                Some((a, b)) => self.boot_args_for_subnet(spec, a, b),
+                None => self.boot_args(&id, spec),
+            };
+            self.fc_put(
+                &handle,
+                "/boot-source",
+                &BootSource {
+                    kernel_image_path: &kernel_path,
+                    boot_args: &boot_args,
+                },
+            )
+            .await?;
+
+            #[derive(Serialize)]
+            struct DriveAdd<'a> {
+                drive_id: &'a str,
+                path_on_host: &'a str,
+                is_root_device: bool,
+                is_read_only: bool,
+            }
+            let rootfs = self
+                .prepare_rootfs(spec, &id)
+                .await?
+                .to_string_lossy()
+                .into_owned();
+            info!(rootfs = %rootfs, "configuring rootfs drive");
+            self.fc_put(
+                &handle,
+                "/drives/rootfs",
+                &DriveAdd {
+                    drive_id: "rootfs",
+                    path_on_host: &rootfs,
+                    is_root_device: true,
+                    is_read_only: false,
+                },
+            )
+            .await?;
+            if let Some(fc_pid) = handle.pid {
+                // io.max 需要宿主 cgroup io 控制器暴露对应块设备；受限环境
+                // （容器/无 nvme 注册）写入失败时记录并继续，不阻断沙盒。
+                if let Err(error) = apply_io_limit(
+                    &id,
+                    spec.resources.iops,
+                    fc_pid,
+                    std::path::Path::new(&rootfs),
+                ) {
+                    tracing::warn!(sandbox_id = %id, %error, "apply host io limit failed");
+                }
+            }
+
+            // 快照预热（显式子网）不带 vsock：FC 恢复时无法重配 vsock 设备，
+            // 快照内固化路径会导致多 clone 绑定冲突；agent 走 TCP 不依赖 vsock。
+            if subnet.is_none() {
+                #[derive(Serialize)]
+                struct VsockConfig<'a> {
+                    guest_cid: u64,
+                    uds_path: &'a str,
+                }
+                let cid = handle
+                    .vsock_cid
+                    .ok_or_else(|| ClouisleError::invalid_state("missing guest CID"))?;
+                let vsock_path = handle
+                    .vsock_socket
+                    .as_deref()
+                    .ok_or_else(|| ClouisleError::invalid_state("missing vsock socket path"))?;
+                self.fc_put(
+                    &handle,
+                    "/vsock",
+                    &VsockConfig {
+                        guest_cid: cid,
+                        uds_path: vsock_path,
+                    },
+                )
+                .await?;
+            }
+
+            // 管理面 TCP agent 依赖 eth0；network.enabled=false 仍需该接口，
+            // 其出站能力由 nftables 以空 allowlist 拒绝。
+            #[derive(Serialize)]
+            struct NetIface<'a> {
+                iface_id: &'a str,
+                host_dev_name: &'a str,
+            }
+            self.fc_put(
+                &handle,
+                "/network-interfaces/eth0",
+                &NetIface {
+                    iface_id: "eth0",
+                    host_dev_name: host_dev,
+                },
+            )
+            .await?;
+            Ok(())
+        }
+        .await;
+
+        if let Err(error) = configured {
+            let _ = self.stop(&handle, StopMode::Force).await;
+            return Err(error);
+        }
+
+        info!(id = %id, pid = ?handle.pid, cid = ?handle.vsock_cid, "firecracker VM configured");
+        Ok(handle)
+    }
+
     pub fn new(config: FirecrackerConfig) -> Self {
         let image_manager = ImageManager::new()
             .with_cache_dir(config.images_dir.clone())
@@ -168,6 +371,7 @@ impl FirecrackerVmm {
     }
 
     /// 构建 rootfs 路径：`{images_dir}/{image_reference_sanitized}.ext4`
+    #[cfg(test)]
     fn rootfs_path(&self, spec: &SandboxSpec) -> PathBuf {
         let key = spec
             .image
@@ -179,14 +383,37 @@ impl FirecrackerVmm {
         self.config.images_dir.join(format!("{safe}.ext4"))
     }
 
+    /// 解析共享镜像缓存并复制为每沙盒独立副本（冷创建路径）。
+    ///
+    /// 所有沙盒直接共享同一个 ext4 镜像文件时，一个沙盒的写入（大输出、安装
+    /// 依赖、文件操作）会持久化到共享镜像并填满磁盘，导致其他沙盒
+    /// `write_file` ENOSPC——多租户数据面不隔离。这里为每个沙盒复制一份，
+    /// 写入互不影响；副本随 `stop` 清理。快照 restore 路径不经过本函数
+    /// （FC 快照固化 drive 路径，属 FC clone 已知限制，另行记录）。
+    async fn prepare_rootfs(&self, spec: &SandboxSpec, sandbox_id: &str) -> Result<PathBuf> {
+        let cached = self.resolve_rootfs(spec).await?;
+        let work = self.config.rootfs_work_dir.clone();
+        tokio::fs::create_dir_all(&work).await.map_err(|error| {
+            ClouisleError::io(format!(
+                "create rootfs work dir {}: {error}",
+                work.display()
+            ))
+        })?;
+        let target = work.join(format!("{sandbox_id}.ext4"));
+        tokio::fs::copy(&cached, &target).await.map_err(|error| {
+            ClouisleError::io(format!(
+                "copy rootfs {} -> {}: {error}",
+                cached.display(),
+                target.display()
+            ))
+        })?;
+        Ok(target)
+    }
+
     /// Resolve an image reference to a local ext4 rootfs. Existing managed
     /// cache entries remain usable for offline operation; cache misses are
     /// built from OCI and inject the guest agent before Firecracker starts.
     async fn resolve_rootfs(&self, spec: &SandboxSpec) -> Result<PathBuf> {
-        let legacy = self.rootfs_path(spec);
-        if legacy.is_file() {
-            return Ok(legacy);
-        }
         let image = ImageSpec {
             reference: spec.image.reference.clone(),
             digest: spec.image.digest.clone(),
@@ -206,6 +433,12 @@ impl FirecrackerVmm {
     /// 内核命令行参数，从 spec 的 env 中提取 `boot_args` 或使用默认值。
     /// 默认值包含 rootfs 挂载 + guest 静态 IP（与 clouisle-net netns 网段一致）。
     fn boot_args(&self, sandbox_id: &str, spec: &SandboxSpec) -> String {
+        let (a, b) = Self::sandbox_subnet(sandbox_id);
+        self.boot_args_for_subnet(spec, a, b)
+    }
+
+    /// 用显式子网构造内核 cmdline（快照预热路径）。
+    fn boot_args_for_subnet(&self, spec: &SandboxSpec, a: u16, b: u16) -> String {
         let base = spec.env.get("boot_args").cloned().unwrap_or_else(|| {
             "console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda rw".to_string()
         });
@@ -217,7 +450,6 @@ impl FirecrackerVmm {
             " init=/usr/local/bin/clouisle-agent"
         };
         // Append guest static IP configuration (10.{a}.{b}.2/30, gateway .1).
-        let (a, b) = Self::sandbox_subnet(sandbox_id);
         format!(
             "{base}{init} ip=10.{a}.{b}.2::10.{a}.{b}.1:255.255.255.252::eth0:off \
              clouisle.guest_ip=10.{a}.{b}.2 clouisle.gateway=10.{a}.{b}.1"
@@ -300,6 +532,38 @@ impl FirecrackerVmm {
         Ok(())
     }
 
+    /// PATCH JSON 请求到 Firecracker API。
+    async fn fc_patch<T: Serialize>(&self, handle: &VmHandle, path: &str, body: &T) -> Result<()> {
+        let client = self.fc_client();
+        let uri = self.api_uri(handle, path)?;
+        let json = serde_json::to_vec(body)
+            .map_err(|e| ClouisleError::new(ErrorKind::Vmm, format!("serialize: {e}")))?;
+        let req = Request::patch(hyper::Uri::from(uri))
+            .header("Content-Type", "application/json")
+            .body(Full::new(Bytes::from(json)))
+            .map_err(|e| ClouisleError::new(ErrorKind::Vmm, format!("build request: {e}")))?;
+        let resp = tokio::time::timeout(Duration::from_secs(30), client.request(req))
+            .await
+            .map_err(|_| {
+                ClouisleError::new(
+                    ErrorKind::Vmm,
+                    format!("firecracker PATCH {path} timed out"),
+                )
+            })?
+            .map_err(|e| {
+                ClouisleError::new(ErrorKind::Vmm, format!("firecracker PATCH {path}: {e}"))
+            })?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = read_body(resp).await;
+            return Err(ClouisleError::new(
+                ErrorKind::Vmm,
+                format!("firecracker PATCH {path} => {status}: {body}"),
+            ));
+        }
+        Ok(())
+    }
+
     /// GET 请求并返回 JSON 值。
     async fn fc_get(&self, handle: &VmHandle, path: &str) -> Result<Value> {
         let client = self.fc_client();
@@ -328,7 +592,10 @@ impl FirecrackerVmm {
     fn spawn_firecracker(
         &self,
         sandbox_id: &str,
+        subnet: Option<(u16, u16)>,
     ) -> Result<(VmHandle, PathBuf, tokio::process::Child)> {
+        // 残留的 vsock socket 会让 FC 绑定失败（Address in use）。
+        let _ = std::fs::remove_file(format!("/tmp/clouisle-{sandbox_id}.vsock"));
         let id = sandbox_id.to_string();
         let sock_path = self.config.api_sock_dir.join(format!("{id}.sock"));
         std::fs::create_dir_all(&self.config.api_sock_dir)
@@ -361,10 +628,12 @@ impl FirecrackerVmm {
         let handle = VmHandle {
             id,
             backend: "firecracker".into(),
+            owner_id: None,
             pid: child.id().map(|pid| pid as u64),
             api_socket: Some(sock_path.to_string_lossy().into_owned()),
             vsock_socket: Some(format!("/tmp/clouisle-{sandbox_id}.vsock")),
             vsock_cid: Some(self.next_cid()),
+            subnet,
         };
         Ok((handle, sock_path, child))
     }
@@ -385,137 +654,16 @@ async fn read_body(resp: hyper::Response<Incoming>) -> String {
 #[async_trait]
 impl Vmm for FirecrackerVmm {
     async fn create(&self, sandbox_id: &str, spec: &SandboxSpec) -> Result<VmHandle> {
-        self.check_environment()?;
+        self.create_inner(sandbox_id, spec, None).await
+    }
 
-        let id = sandbox_id.to_string();
-        let (handle, sock_path, child) = self.spawn_firecracker(&id)?;
-        // TAP device is created by FirewallManager before VMM creation.
-        let host_dev = "tap0";
-
-        let mut vms = self.vms.lock().await;
-        vms.insert(
-            id.clone(),
-            FcProcess {
-                handle: handle.clone(),
-                child: Some(child),
-            },
-        );
-        drop(vms);
-
-        let configured: Result<()> = async {
-            // 等待 API socket 就绪
-            self.wait_for_socket(&sock_path).await?;
-
-            #[derive(Serialize)]
-            struct MachineConfig {
-                vcpu_count: u16,
-                mem_size_mib: u32,
-                smt: bool,
-                track_dirty_pages: bool,
-            }
-            self.fc_put(
-                &handle,
-                "/machine-config",
-                &MachineConfig {
-                    vcpu_count: spec.resources.vcpu,
-                    mem_size_mib: spec.resources.memory_mb,
-                    smt: false,
-                    track_dirty_pages: false,
-                },
-            )
-            .await?;
-
-            #[derive(Serialize)]
-            struct BootSource<'a> {
-                kernel_image_path: &'a str,
-                boot_args: &'a str,
-            }
-            let kernel_path = self.config.kernel_path.to_string_lossy().into_owned();
-            let boot_args = self.boot_args(&id, spec);
-            self.fc_put(
-                &handle,
-                "/boot-source",
-                &BootSource {
-                    kernel_image_path: &kernel_path,
-                    boot_args: &boot_args,
-                },
-            )
-            .await?;
-
-            #[derive(Serialize)]
-            struct DriveAdd<'a> {
-                drive_id: &'a str,
-                path_on_host: &'a str,
-                is_root_device: bool,
-                is_read_only: bool,
-            }
-            let rootfs = self
-                .resolve_rootfs(spec)
-                .await?
-                .to_string_lossy()
-                .into_owned();
-            info!(rootfs = %rootfs, "configuring rootfs drive");
-            self.fc_put(
-                &handle,
-                "/drives/rootfs",
-                &DriveAdd {
-                    drive_id: "rootfs",
-                    path_on_host: &rootfs,
-                    is_root_device: true,
-                    is_read_only: false,
-                },
-            )
-            .await?;
-
-            #[derive(Serialize)]
-            struct VsockConfig<'a> {
-                guest_cid: u64,
-                uds_path: &'a str,
-            }
-            let cid = handle
-                .vsock_cid
-                .ok_or_else(|| ClouisleError::invalid_state("missing guest CID"))?;
-            let vsock_path = handle
-                .vsock_socket
-                .as_deref()
-                .ok_or_else(|| ClouisleError::invalid_state("missing vsock socket path"))?;
-            self.fc_put(
-                &handle,
-                "/vsock",
-                &VsockConfig {
-                    guest_cid: cid,
-                    uds_path: vsock_path,
-                },
-            )
-            .await?;
-
-            // 管理面 TCP agent 依赖 eth0；network.enabled=false 仍需该接口，
-            // 其出站能力由 nftables 以空 allowlist 拒绝。
-            #[derive(Serialize)]
-            struct NetIface<'a> {
-                iface_id: &'a str,
-                host_dev_name: &'a str,
-            }
-            self.fc_put(
-                &handle,
-                "/network-interfaces/eth0",
-                &NetIface {
-                    iface_id: "eth0",
-                    host_dev_name: host_dev,
-                },
-            )
-            .await?;
-            Ok(())
-        }
-        .await;
-
-        if let Err(error) = configured {
-            let _ = self.stop(&handle, StopMode::Force).await;
-            return Err(error);
-        }
-
-        info!(id = %id, pid = ?handle.pid, cid = ?handle.vsock_cid, "firecracker VM configured");
-        Ok(handle)
+    async fn create_in_subnet(
+        &self,
+        sandbox_id: &str,
+        spec: &SandboxSpec,
+        subnet: (u16, u16),
+    ) -> Result<VmHandle> {
+        self.create_inner(sandbox_id, spec, Some(subnet)).await
     }
 
     async fn image_cache_hit(&self, spec: &SandboxSpec) -> Result<bool> {
@@ -560,6 +708,61 @@ impl Vmm for FirecrackerVmm {
         Ok(self.fc_get(handle, "/vm/config").await.is_ok())
     }
 
+    async fn discover(&self) -> Result<Vec<VmHandle>> {
+        let socket_dir = self.config.api_sock_dir.clone();
+        let candidates = tokio::task::spawn_blocking(move || {
+            let mut handles = Vec::new();
+            let Ok(entries) = std::fs::read_dir(&socket_dir) else {
+                return handles;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|value| value.to_str()) != Some("sock") {
+                    continue;
+                }
+                let Some(id) = path.file_stem().and_then(|value| value.to_str()) else {
+                    continue;
+                };
+                let pid = std::fs::read_dir("/proc").ok().and_then(|processes| {
+                    processes.flatten().find_map(|process| {
+                        let name = process.file_name().to_string_lossy().parse::<u64>().ok()?;
+                        let cmdline = std::fs::read(process.path().join("cmdline")).ok()?;
+                        let args = cmdline
+                            .split(|byte| *byte == 0)
+                            .filter(|arg| !arg.is_empty())
+                            .collect::<Vec<_>>();
+                        args.windows(2)
+                            .any(|pair| {
+                                pair[0] == b"--api-sock"
+                                    && pair[1] == path.as_os_str().as_encoded_bytes()
+                            })
+                            .then_some(name)
+                    })
+                });
+                handles.push(VmHandle {
+                    id: id.to_string(),
+                    backend: "firecracker".into(),
+                    owner_id: None,
+                    pid,
+                    api_socket: Some(path.to_string_lossy().into_owned()),
+                    vsock_socket: Some(format!("/tmp/clouisle-{id}.vsock")),
+                    vsock_cid: None,
+                    subnet: None,
+                });
+            }
+            handles
+        })
+        .await
+        .map_err(|error| ClouisleError::io(format!("discover Firecracker runtimes: {error}")))?;
+        let mut live = Vec::new();
+        for handle in candidates {
+            if self.probe(&handle).await.unwrap_or(false) {
+                live.push(handle);
+            }
+        }
+        Ok(live)
+    }
+
     async fn start(&self, h: &VmHandle) -> Result<()> {
         #[derive(Serialize)]
         struct Action<'a> {
@@ -579,34 +782,21 @@ impl Vmm for FirecrackerVmm {
 
     async fn pause(&self, h: &VmHandle) -> Result<()> {
         #[derive(Serialize)]
-        struct Action<'a> {
-            action_type: &'a str,
+        struct VmStatePatch<'a> {
+            state: &'a str,
         }
-        self.fc_post(
-            h,
-            "/actions",
-            &Action {
-                action_type: "Pause",
-            },
-        )
-        .await?;
+        self.fc_patch(h, "/vm", &VmStatePatch { state: "Paused" })
+            .await?;
         info!(id = %h.id, "firecracker VM paused");
         Ok(())
     }
-
     async fn resume(&self, h: &VmHandle) -> Result<()> {
         #[derive(Serialize)]
-        struct Action<'a> {
-            action_type: &'a str,
+        struct VmStatePatch<'a> {
+            state: &'a str,
         }
-        self.fc_post(
-            h,
-            "/actions",
-            &Action {
-                action_type: "Resume",
-            },
-        )
-        .await?;
+        self.fc_patch(h, "/vm", &VmStatePatch { state: "Resumed" })
+            .await?;
         info!(id = %h.id, "firecracker VM resumed");
         Ok(())
     }
@@ -622,7 +812,7 @@ impl Vmm for FirecrackerVmm {
             mem_file_path: &'a str,
             snapshot_path: &'a str,
         }
-        self.fc_post(
+        self.fc_put(
             h,
             "/snapshot/create",
             &SnapshotReq {
@@ -651,7 +841,7 @@ impl Vmm for FirecrackerVmm {
         }
         self.check_environment()?;
 
-        let (handle, socket, child) = self.spawn_firecracker(sandbox_id)?;
+        let (handle, socket, child) = self.spawn_firecracker(sandbox_id, None)?;
         self.vms.lock().await.insert(
             handle.id.clone(),
             FcProcess {
@@ -669,6 +859,9 @@ impl Vmm for FirecrackerVmm {
         }
         let loaded = async {
             self.wait_for_socket(&socket).await?;
+            // FC v1.10 不允许在 load 前配置任何设备（vsock/network 均触发
+            // boot_path）；恢复时 FC 用快照内设备配置——network 依赖当前
+            // netns 中的同名 tap0（官方 clone 方案），预热快照不含 vsock。
             self.fc_put(
                 &handle,
                 "/snapshot/load",
@@ -757,6 +950,14 @@ impl Vmm for FirecrackerVmm {
                 warn!(id = %h.id, socket, %error, "failed to remove VM socket");
             }
         }
+        // 清理每沙盒独立 rootfs 副本与 io 限制 cgroup。
+        remove_io_limit(&h.id);
+        let rootfs = self.config.rootfs_work_dir.join(format!("{}.ext4", h.id));
+        if let Err(error) = std::fs::remove_file(&rootfs)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            warn!(id = %h.id, %error, "failed to remove per-sandbox rootfs");
+        }
         info!(id = %h.id, "firecracker VM stopped");
         Ok(())
     }
@@ -772,6 +973,13 @@ impl Vmm for FirecrackerVmm {
             rx_bytes: None,
             tx_bytes: None,
         })
+    }
+
+    fn supports_detached_warm_pool(&self) -> bool {
+        // Firecracker is launched inside an ID-derived netns and its guest IP
+        // is part of the boot command line, so a pre-created VM cannot safely
+        // be reassigned to another sandbox identity.
+        false
     }
 
     fn capabilities(&self) -> VmmCapabilities {
@@ -890,10 +1098,12 @@ mod tests {
             &VmHandle {
                 id: "cleanup-test".into(),
                 backend: "firecracker".into(),
+                owner_id: None,
                 pid: None,
                 api_socket: Some(api_socket.to_string_lossy().into_owned()),
                 vsock_socket: Some(vsock_socket.to_string_lossy().into_owned()),
                 vsock_cid: None,
+                subnet: None,
             },
             StopMode::Force,
         )

@@ -13,6 +13,7 @@
 //!   宿主路由:              10.{a}.{b}.0/30 dev vh-<hash>
 
 use std::process::Command;
+use std::sync::Arc;
 
 use clouisle_core::ClouisleError;
 
@@ -67,7 +68,12 @@ pub type Result<T> = std::result::Result<T, ClouisleError>;
 /// 注意：**不预建 tap0**。tap0 由 Firecracker 在 VMM.create 时创建
 /// （host_dev_name="tap0"），随后由 [`attach_tap`] 加入 br0。
 pub fn create_netns(sandbox_id: &str) -> Result<NetInfo> {
-    let (a, b) = sandbox_subnet(sandbox_id);
+    create_netns_in_subnet(sandbox_id, None)
+}
+
+/// 用显式子网创建 netns（快照预热继承路径）；None = 按 sandbox_id 派生。
+pub fn create_netns_in_subnet(sandbox_id: &str, explicit: Option<(u16, u16)>) -> Result<NetInfo> {
+    let (a, b) = explicit.unwrap_or_else(|| sandbox_subnet(sandbox_id));
     let info = NetInfo {
         ns_name: ns_name(sandbox_id),
         veth_host: short_name(sandbox_id, "vh"),
@@ -165,28 +171,25 @@ pub fn attach_tap(sandbox_id: &str) -> Result<()> {
 }
 
 /// 删除沙盒 netns（自动清理 veth/tap/路由不自动删，需手动删路由）。
-pub fn delete_netns(sandbox_id: &str) -> Result<()> {
+pub fn delete_netns(sandbox_id: &str, explicit: Option<(u16, u16)>) -> Result<()> {
+    let (a, b) = explicit.unwrap_or_else(|| sandbox_subnet(sandbox_id));
     let info = NetInfo {
         ns_name: ns_name(sandbox_id),
         veth_host: short_name(sandbox_id, "vh"),
         veth_ns: short_name(sandbox_id, "vn"),
-        subnet: String::new(),
+        subnet: format!("10.{a}.{b}.0/30"),
         gateway: String::new(),
         guest_ip: String::new(),
     };
-    // 删宿主路由
+    // 删宿主路由（继承子网时非 id 派生；路由可能不存在 → 忽略）。
     let _ = run(
         "ip",
-        &[
-            "route",
-            "del",
-            &sandbox_subnet_str(sandbox_id),
-            "dev",
-            &info.veth_host,
-        ],
+        &["route", "del", &info.subnet, "dev", &info.veth_host],
     );
-    // 删 netns（自动移除内部设备）
+    // 删 netns（自动移除 netns 内设备）。
     let _ = run("ip", &["netns", "del", &info.ns_name]);
+    // 删宿主侧 veth peer（netns 删除后 vn 消失，vh 成孤儿设备必须显式删除）。
+    let _ = run("ip", &["link", "del", &info.veth_host]);
     Ok(())
 }
 
@@ -212,6 +215,44 @@ pub(crate) fn run_nft_in_ns(ns: &str, args: &[&str]) -> Result<String> {
     run("ip", &full)
 }
 
+/// 对沙盒出站流量施加带宽上限（netns 内 vn egress 上 tbf）。
+/// mbps = 0/None 表示不限速。幂等：已存在 qdisc 时先删除再重建。
+pub fn apply_bandwidth_limit(sandbox_id: &str, mbps: Option<u32>) -> Result<()> {
+    let Some(rate) = mbps.filter(|r| *r > 0) else {
+        return Ok(());
+    };
+    let ns = ns_name(sandbox_id);
+    let veth_ns = short_name(sandbox_id, "vn");
+    let _ = run_tc_in_ns(&ns, &["qdisc", "del", "dev", &veth_ns, "root"]);
+    let burst_kbit = 32u32.max(rate.saturating_mul(8)); // burst = 1 RTT 量级
+    run_tc_in_ns(
+        &ns,
+        &[
+            "qdisc",
+            "add",
+            "dev",
+            &veth_ns,
+            "root",
+            "handle",
+            "1:",
+            "tbf",
+            "rate",
+            &format!("{rate}mbit"),
+            "burst",
+            &format!("{burst_kbit}kbit"),
+            "latency",
+            "50ms",
+        ],
+    )?;
+    Ok(())
+}
+
+pub(crate) fn run_tc_in_ns(ns: &str, args: &[&str]) -> Result<String> {
+    let mut full = vec!["netns", "exec", ns, "tc"];
+    full.extend_from_slice(args);
+    run("ip", &full)
+}
+
 /// 沙盒 guest IP（10.{a}.{b}.2）。
 pub fn guest_ip(sandbox_id: &str) -> String {
     let (a, b) = sandbox_subnet(sandbox_id);
@@ -230,8 +271,34 @@ pub fn subnet(sandbox_id: &str) -> String {
     format!("10.{a}.{b}.0/30")
 }
 
-fn sandbox_subnet_str(sandbox_id: &str) -> String {
-    subnet(sandbox_id)
+/// 顺序子网分配器：快照预热等"需要固定子网、跨沙盒身份复用"的场景使用。
+/// 顺序递增 `10.{a}.{b}.0/30`（a 从 10、b 从 10），每次分配唯一，无需释放
+/// 回收（200×200 空间足够）。与 `sandbox_subnet`（id 哈希）互不干扰。
+#[derive(Debug, Default, Clone)]
+pub struct SubnetAllocator {
+    next: Arc<std::sync::Mutex<(u16, u16)>>,
+}
+
+impl SubnetAllocator {
+    pub fn new() -> Self {
+        Self {
+            next: Arc::new(std::sync::Mutex::new((10, 10))),
+        }
+    }
+
+    pub fn allocate(&self) -> (u16, u16) {
+        let mut next = self.next.lock().unwrap();
+        let current = *next;
+        next.1 += 1;
+        if next.1 > 200 {
+            next.1 = 10;
+            next.0 += 1;
+        }
+        if next.0 > 200 {
+            next.0 = 10;
+        }
+        current
+    }
 }
 
 /// 执行系统命令并检查结果。
@@ -253,6 +320,26 @@ fn run(cmd: &str, args: &[&str]) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn allocator_sequences_unique() {
+        let alloc = SubnetAllocator::new();
+        let a = alloc.allocate();
+        let b = alloc.allocate();
+        assert_ne!(a, b);
+        assert_eq!(a, (10, 10));
+        assert_eq!(b, (10, 11));
+    }
+
+    #[test]
+    fn allocator_wraps_b_column() {
+        let alloc = SubnetAllocator::new();
+        *alloc.next.lock().unwrap() = (10, 200);
+        let a = alloc.allocate();
+        let b = alloc.allocate();
+        assert_eq!(a, (10, 200));
+        assert_eq!(b, (11, 10));
+    }
 
     #[test]
     fn short_name_length() {

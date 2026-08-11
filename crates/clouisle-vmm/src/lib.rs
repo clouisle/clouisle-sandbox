@@ -10,19 +10,27 @@ use serde::{Deserialize, Serialize};
 
 use clouisle_core::{Result, SandboxSpec};
 
+#[cfg(target_os = "linux")]
+pub mod docker_dev;
+#[cfg(target_os = "linux")]
+pub mod docker_engine;
 pub mod error;
 #[cfg(target_os = "linux")]
 pub mod firecracker;
 
 #[cfg(target_os = "linux")]
+pub use docker_dev::{DockerDevConfig, DockerDevVmm};
+#[cfg(target_os = "linux")]
 pub use firecracker::{FirecrackerConfig, FirecrackerVmm};
 
-/// Vmm 句柄：一个已创建 VMM 的引用。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VmHandle {
     pub id: String,
     /// VMM 后端类型
     pub backend: String,
+    /// Stable node owner for remote runtimes.
+    #[serde(default)]
+    pub owner_id: Option<String>,
     /// 进程 PID
     pub pid: Option<u64>,
     /// API socket 路径
@@ -31,6 +39,9 @@ pub struct VmHandle {
     pub vsock_socket: Option<String>,
     /// Firecracker 分配的 guest CID
     pub vsock_cid: Option<u64>,
+    /// 显式网段（快照预热继承路径）；None = 按 sandbox_id 派生。
+    #[serde(default)]
+    pub subnet: Option<(u16, u16)>,
 }
 
 /// 停止模式。
@@ -84,6 +95,17 @@ pub trait Vmm: Send + Sync {
     /// `sandbox_id` 由控制平面统一生成（用于 netns 名、设备名一致性）。
     async fn create(&self, sandbox_id: &str, spec: &SandboxSpec) -> Result<VmHandle>;
 
+    /// 用显式子网创建 VM（快照预热等需要固定网段的场景）。
+    /// 默认委托 [`Vmm::create`]（id 派生网段）。
+    async fn create_in_subnet(
+        &self,
+        sandbox_id: &str,
+        spec: &SandboxSpec,
+        _subnet: (u16, u16),
+    ) -> Result<VmHandle> {
+        self.create(sandbox_id, spec).await
+    }
+
     /// Return whether the image is already usable without registry I/O.
     async fn image_cache_hit(&self, _spec: &SandboxSpec) -> Result<bool> {
         Ok(true)
@@ -97,6 +119,25 @@ pub trait Vmm: Send + Sync {
     /// Probe a persisted runtime after a control-plane restart.
     async fn probe(&self, _handle: &VmHandle) -> Result<bool> {
         Ok(true)
+    }
+
+    /// Discover runtimes that survived a controller restart. Implementations
+    /// return only handles they can safely probe and stop.
+    async fn discover(&self) -> Result<Vec<VmHandle>> {
+        Ok(Vec::new())
+    }
+
+    /// Whether a VM created before its final sandbox ID can safely be leased
+    /// later. Backends whose network namespace and guest identity are tied to
+    /// `sandbox_id` must return false and use image-cache warming instead.
+    fn supports_detached_warm_pool(&self) -> bool {
+        true
+    }
+
+    /// Whether the backend has a guest agent that must answer before the
+    /// control plane can report a running sandbox.
+    fn requires_guest_agent(&self) -> bool {
+        true
     }
 
     /// 启动 guest（InstanceStart）。

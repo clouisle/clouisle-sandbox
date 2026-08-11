@@ -20,6 +20,7 @@ spec:
       automountServiceAccountToken: false
       # hostNetwork: 需要访问宿主网络（netns / nftables）
       hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
       hostPID: true
       containers:
         - name: clouisled
@@ -27,12 +28,28 @@ spec:
           command: ["clouisled"]
           args:
             - --addr=0.0.0.0:9090
-            - --db=/data/clouisled.db
+            - --db=$(POSTGRES_DSN)
             - --node-id=$(NODE_NAME)
+            - --control-plane=http://apiserver:8080
+            - --control-plane-api-key=$(CLOUISLE_NODE_API_KEY)
+            - --advertised-endpoint=http://$(NODE_IP):9090
           env:
             - name: NODE_NAME
               valueFrom:
                 fieldRef: { fieldPath: spec.nodeName }
+            - name: NODE_IP
+              valueFrom:
+                fieldRef: { fieldPath: status.hostIP }
+            - name: CLOUISLE_NODE_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: clouisle-api-keys
+                  key: node-key
+            - name: POSTGRES_DSN
+              valueFrom:
+                secretKeyRef:
+                  name: clouisle-db
+                  key: dsn
           securityContext:
             privileged: true
             capabilities:

@@ -32,13 +32,17 @@ services:
 
   # ============ 数据平面：clouisled ==========
   clouisled:
+    profiles: ["multinode"]
     image: registry.cn-shanghai.aliyuncs.com/clouisle/clouisle-sandbox:v0.1.5
     container_name: clouisle-node
     entrypoint: ["clouisled"]
     command:
       - --addr=0.0.0.0:9090
-      - --db=/data/clouisled.db
+      - --db=postgres://clouisle:changeme@127.0.0.1:55433/clouisle
       - --node-id=local
+      - --control-plane=http://127.0.0.1:8080
+      - --control-plane-api-key=local-development-key
+      - --advertised-endpoint=http://127.0.0.1:9090
     privileged: true
     network_mode: host
     environment:

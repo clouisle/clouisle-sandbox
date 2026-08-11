@@ -137,10 +137,12 @@ mod tests {
             Ok(VmHandle {
                 id: uuid::Uuid::now_v7().to_string(),
                 backend: "test".into(),
+                owner_id: None,
                 pid: None,
                 api_socket: None,
                 vsock_socket: None,
                 vsock_cid: None,
+                subnet: None,
             })
         }
         async fn start(&self, _: &VmHandle) -> clouisle_core::Result<()> {
@@ -169,10 +171,12 @@ mod tests {
             Ok(VmHandle {
                 id: uuid::Uuid::now_v7().to_string(),
                 backend: "test".into(),
+                owner_id: None,
                 pid: None,
                 api_socket: None,
                 vsock_socket: None,
                 vsock_cid: None,
+                subnet: None,
             })
         }
         async fn stop(&self, _: &VmHandle, _m: StopMode) -> clouisle_core::Result<()> {

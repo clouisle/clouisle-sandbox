@@ -1,7 +1,8 @@
-# Control plane: apiserver Deployment + Service
+# Control plane: all-in-one apiserver Deployment + Service
 #
-# 无状态：不持有 VMM 引用，通过 gRPC 转发到 clouisled。
-# 通过 PostgreSQL 共享状态（HA 前提）。
+# 默认 Pod 直接拥有本节点 Firecracker、镜像缓存和网络隔离；多节点 profile
+# 通过 Kustomize patch 显式切换到 ScheduledNodeVmm。
+## PostgreSQL 是共享的唯一外部状态依赖。
 
 apiVersion: apps/v1
 kind: Deployment
@@ -9,7 +10,7 @@ metadata:
   name: apiserver
   namespace: clouisle
 spec:
-  replicas: 2
+  replicas: 1
   selector:
     matchLabels: { app: apiserver }
   template:
@@ -18,6 +19,9 @@ spec:
     spec:
       serviceAccountName: apiserver
       automountServiceAccountToken: false
+      hostNetwork: true
+      hostPID: true
+      dnsPolicy: ClusterFirstWithHostNet
       containers:
         - name: apiserver
           image: registry.cn-shanghai.aliyuncs.com/clouisle/clouisle-sandbox:v0.1.5
@@ -30,11 +34,28 @@ spec:
                 secretKeyRef:
                   name: clouisle-db
                   key: dsn
+            - name: CLOUISLE_WARM_POOL_MIN_IDLE
+              value: "0"
             - name: CLOUISLE_API_KEYS
               valueFrom:
                 secretKeyRef:
                   name: clouisle-api-keys
                   key: keys
+          volumeMounts:
+            - name: kvm
+              mountPath: /dev/kvm
+            - name: vmlinux
+              mountPath: /opt/clouisle/vmlinux
+              readOnly: true
+            - name: rootfs
+              mountPath: /opt/clouisle/rootfs
+              readOnly: true
+            - name: image-cache
+              mountPath: /opt/clouisle/images
+            - name: firecracker
+              mountPath: /run/clouisle
+            - name: control-plane-data
+              mountPath: /data
           ports:
             - containerPort: 8080
           # 优雅关闭：SIGTERM → /health/ready 返回 503 → LB 摘流 → 等 30s → 退出
@@ -51,8 +72,32 @@ spec:
             initialDelaySeconds: 10
             periodSeconds: 15
           securityContext:
-            runAsNonRoot: true
-            runAsUser: 10001
+            privileged: true
+            capabilities:
+              add: ["SYS_ADMIN", "NET_ADMIN", "SYS_PTRACE"]
+      volumes:
+        - name: kvm
+          hostPath: { path: /dev/kvm }
+        - name: vmlinux
+          hostPath:
+            path: /opt/clouisle/vmlinux
+            type: File
+        - name: rootfs
+          hostPath:
+            path: /opt/clouisle/rootfs
+            type: Directory
+        - name: image-cache
+          hostPath:
+            path: /opt/clouisle/images
+            type: DirectoryOrCreate
+        - name: firecracker
+          hostPath:
+            path: /run/clouisle
+            type: DirectoryOrCreate
+        - name: control-plane-data
+          hostPath:
+            path: /var/lib/clouisle/control-plane
+            type: DirectoryOrCreate
 ---
 apiVersion: v1
 kind: Service
@@ -84,3 +129,5 @@ type: Opaque
 stringData:
   # Replace before deployment. Format: key:tenant:read|full, comma-separated.
   keys: "replace-before-deploy:default:full"
+  # Raw full-scope key consumed by the optional clouisled profile.
+  node-key: "replace-before-deploy"

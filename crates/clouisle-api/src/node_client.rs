@@ -84,11 +84,23 @@ impl Vmm for GrpcNodeVmm {
         Ok(VmHandle {
             id: response.sandbox_id,
             backend: response.backend,
+            owner_id: None,
             pid: (response.pid != 0).then_some(response.pid),
             api_socket: (!response.api_socket.is_empty()).then_some(response.api_socket),
             vsock_socket: (!response.vsock_socket.is_empty()).then_some(response.vsock_socket),
             vsock_cid: None,
+            subnet: None,
         })
+    }
+    async fn image_cache_hit(&self, _spec: &SandboxSpec) -> Result<bool> {
+        Ok(false)
+    }
+
+    async fn probe(&self, _handle: &VmHandle) -> Result<bool> {
+        Ok(self.client().await.is_ok())
+    }
+    fn supports_detached_warm_pool(&self) -> bool {
+        false
     }
 
     /// `CreateSandbox` starts the guest atomically on the owning node.
@@ -277,8 +289,24 @@ impl Vmm for ScheduledNodeVmm {
         let endpoint = normalize_grpc_endpoint(&node.endpoint);
         let mut handle = GrpcNodeVmm::new(&endpoint).create(sandbox_id, spec).await?;
         handle.backend = format!("grpc:{endpoint}");
+        handle.owner_id = Some(node.info.node_id);
         Ok(handle)
     }
+    async fn image_cache_hit(&self, _spec: &SandboxSpec) -> Result<bool> {
+        // Remote node cache state is not part of the gRPC create contract;
+        // keep registry work out of the HTTP request.
+        Ok(false)
+    }
+    async fn probe(&self, handle: &VmHandle) -> Result<bool> {
+        let Some(endpoint) = handle.backend.strip_prefix("grpc:") else {
+            return Ok(false);
+        };
+        GrpcNodeVmm::new(endpoint).probe(handle).await
+    }
+    fn supports_detached_warm_pool(&self) -> bool {
+        false
+    }
+
     async fn start(&self, _: &VmHandle) -> Result<()> {
         Ok(())
     }
@@ -351,6 +379,7 @@ impl AgentConnector for GrpcAgentConnector {
         Ok(Box::new(GrpcAgentConnection {
             endpoint,
             sandbox_id: sandbox_id.to_string(),
+            session: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
         }))
     }
 }
@@ -358,6 +387,15 @@ impl AgentConnector for GrpcAgentConnector {
 struct GrpcAgentConnection {
     endpoint: String,
     sandbox_id: String,
+    /// 活动交互式进程会话（一个连接一次一个进程）。
+    session: std::sync::Arc<tokio::sync::Mutex<Option<GrpcActiveProcess>>>,
+}
+
+/// 交互式进程的 gRPC 双向流状态。
+struct GrpcActiveProcess {
+    frame_id: String,
+    tx: tokio::sync::mpsc::Sender<clouisled::server::proto::ExecStream>,
+    stream: Option<tonic::Streaming<clouisled::server::proto::ExecStream>>,
 }
 
 #[async_trait]
@@ -415,7 +453,17 @@ impl AgentConnection for GrpcAgentConnection {
                 Some(exec_stream::Msg::ExecStdout(output)) => stdout.extend(output.data),
                 Some(exec_stream::Msg::ExecStderr(output)) => stderr.extend(output.data),
                 Some(exec_stream::Msg::ExecExit(exit)) => break exit.exit_code,
-                Some(exec_stream::Msg::ExecReq(_)) | None => {
+                Some(
+                    exec_stream::Msg::ExecReq(_)
+                    | exec_stream::Msg::ProcessStart(_)
+                    | exec_stream::Msg::ProcessStarted(_)
+                    | exec_stream::Msg::ProcessInput(_)
+                    | exec_stream::Msg::ProcessEof(_)
+                    | exec_stream::Msg::ProcessSignal(_)
+                    | exec_stream::Msg::ProcessResize(_)
+                    | exec_stream::Msg::ProcessOk(_),
+                )
+                | None => {
                     return Err(ClouisleError::invalid_state(
                         "unexpected node exec response",
                     ));
@@ -479,7 +527,17 @@ impl AgentConnection for GrpcAgentConnection {
                         .await;
                     return Ok(());
                 }
-                Some(exec_stream::Msg::ExecReq(_)) | None => {
+                Some(
+                    exec_stream::Msg::ExecReq(_)
+                    | exec_stream::Msg::ProcessStart(_)
+                    | exec_stream::Msg::ProcessStarted(_)
+                    | exec_stream::Msg::ProcessInput(_)
+                    | exec_stream::Msg::ProcessEof(_)
+                    | exec_stream::Msg::ProcessSignal(_)
+                    | exec_stream::Msg::ProcessResize(_)
+                    | exec_stream::Msg::ProcessOk(_),
+                )
+                | None => {
                     return Err(ClouisleError::invalid_state(
                         "unexpected node exec response",
                     ));
@@ -590,5 +648,238 @@ impl AgentConnection for GrpcAgentConnection {
             .await
             .map(|_| ())
             .map_err(|error| ClouisleError::new(ErrorKind::Vmm, format!("connect node: {error}")))
+    }
+
+    async fn apply_limits(&self, _pids_max: Option<u32>) -> Result<()> {
+        // 远程节点 gRPC 路径暂未暴露 ApplyLimits RPC；由节点本地 provision 施加。
+        Ok(())
+    }
+
+    async fn start_process(
+        &self,
+        argv: Vec<String>,
+        env: HashMap<String, String>,
+        cwd: Option<String>,
+        timeout_ms: u64,
+        stdin: bool,
+        pty: Option<clouisle_proto::PtyConfig>,
+    ) -> Result<String> {
+        use clouisled::server::proto::{ExecStream, exec_stream};
+        use tokio_stream::wrappers::ReceiverStream;
+
+        if argv.is_empty() {
+            return Err(clouisle_core::ClouisleError::validation("argv empty"));
+        }
+        let frame_id = uuid::Uuid::now_v7().to_string();
+        let mut client = NodeServiceClient::connect(self.endpoint.clone())
+            .await
+            .map_err(|error| {
+                ClouisleError::new(ErrorKind::Vmm, format!("connect node: {error}"))
+            })?;
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        tx.send(ExecStream {
+            msg: Some(exec_stream::Msg::ProcessStart(
+                clouisled::server::proto::ProcessStart {
+                    sandbox_id: self.sandbox_id.clone(),
+                    frame_id: frame_id.clone(),
+                    argv,
+                    env,
+                    cwd: cwd.unwrap_or_default(),
+                    timeout_ms,
+                    stdin,
+                    pty: pty.map(|pty| clouisled::server::proto::PtyConfig {
+                        cols: pty.cols as u32,
+                        rows: pty.rows as u32,
+                    }),
+                },
+            )),
+        })
+        .await
+        .map_err(|error| ClouisleError::io(format!("queue node process start: {error}")))?;
+        let mut stream = client
+            .exec(tonic::Request::new(ReceiverStream::new(rx)))
+            .await
+            .map_err(|error| {
+                ClouisleError::new(ErrorKind::Vmm, format!("node process start: {error}"))
+            })?
+            .into_inner();
+        // 跳过先到的输出帧，等待 ProcessStarted ack。
+        loop {
+            let message = stream
+                .message()
+                .await
+                .map_err(|error| {
+                    ClouisleError::new(ErrorKind::Vmm, format!("read node process start: {error}"))
+                })?
+                .ok_or_else(|| ClouisleError::io("node process start stream ended before ack"))?;
+            match message.msg {
+                Some(exec_stream::Msg::ProcessStarted(ack)) if ack.frame_id == frame_id => {
+                    *self.session.lock().await = Some(GrpcActiveProcess {
+                        frame_id: frame_id.clone(),
+                        tx,
+                        stream: Some(stream),
+                    });
+                    return Ok(frame_id);
+                }
+                _ => continue,
+            }
+        }
+    }
+
+    async fn stream_process_events(
+        &self,
+        process_id: &str,
+        events: tokio::sync::mpsc::Sender<crate::agent::ExecStreamEvent>,
+    ) -> Result<()> {
+        use clouisled::server::proto::exec_stream;
+        let mut session = self.session.lock().await;
+        let active = session
+            .as_mut()
+            .ok_or_else(|| ClouisleError::not_found(format!("process {process_id}")))?;
+        if active.frame_id != process_id {
+            return Err(ClouisleError::not_found(format!("process {process_id}")));
+        }
+        let Some(mut stream) = active.stream.take() else {
+            return Err(ClouisleError::invalid_state(
+                "process stream already consumed",
+            ));
+        };
+        loop {
+            let message = stream
+                .message()
+                .await
+                .map_err(|error| {
+                    ClouisleError::new(ErrorKind::Vmm, format!("read node process output: {error}"))
+                })?
+                .ok_or_else(|| ClouisleError::io("node process stream ended before exit"))?;
+            match message.msg {
+                Some(exec_stream::Msg::ExecStdout(output)) if output.frame_id == process_id => {
+                    if events
+                        .send(crate::agent::ExecStreamEvent::Stdout(Bytes::from(
+                            output.data,
+                        )))
+                        .await
+                        .is_err()
+                    {
+                        return Ok(());
+                    }
+                }
+                Some(exec_stream::Msg::ExecStderr(output)) if output.frame_id == process_id => {
+                    if events
+                        .send(crate::agent::ExecStreamEvent::Stderr(Bytes::from(
+                            output.data,
+                        )))
+                        .await
+                        .is_err()
+                    {
+                        return Ok(());
+                    }
+                }
+                Some(exec_stream::Msg::ExecExit(exit)) if exit.frame_id == process_id => {
+                    let _ = events
+                        .send(crate::agent::ExecStreamEvent::Exit(exit.exit_code))
+                        .await;
+                    return Ok(());
+                }
+                Some(exec_stream::Msg::ProcessOk(ack)) if ack.frame_id == process_id => continue,
+                _ => continue,
+            }
+        }
+    }
+
+    async fn send_stdin(&self, process_id: &str, chunk: Bytes) -> Result<()> {
+        use clouisled::server::proto::{ExecStream, exec_stream};
+        let session = self.session.lock().await;
+        let active = session
+            .as_ref()
+            .ok_or_else(|| ClouisleError::not_found(format!("process {process_id}")))?;
+        if active.frame_id != process_id {
+            return Err(ClouisleError::not_found(format!("process {process_id}")));
+        }
+        active
+            .tx
+            .send(ExecStream {
+                msg: Some(exec_stream::Msg::ProcessInput(
+                    clouisled::server::proto::ProcessInput {
+                        frame_id: process_id.to_string(),
+                        data: chunk.to_vec(),
+                    },
+                )),
+            })
+            .await
+            .map_err(|error| ClouisleError::io(format!("queue node stdin: {error}")))
+    }
+
+    async fn close_stdin(&self, process_id: &str) -> Result<()> {
+        use clouisled::server::proto::{ExecStream, exec_stream};
+        let session = self.session.lock().await;
+        let active = session
+            .as_ref()
+            .ok_or_else(|| ClouisleError::not_found(format!("process {process_id}")))?;
+        if active.frame_id != process_id {
+            return Err(ClouisleError::not_found(format!("process {process_id}")));
+        }
+        active
+            .tx
+            .send(ExecStream {
+                msg: Some(exec_stream::Msg::ProcessEof(
+                    clouisled::server::proto::ProcessEof {
+                        frame_id: process_id.to_string(),
+                    },
+                )),
+            })
+            .await
+            .map_err(|error| ClouisleError::io(format!("queue node stdin eof: {error}")))
+    }
+
+    async fn send_signal(
+        &self,
+        process_id: &str,
+        signal: clouisle_proto::ProcessSignal,
+    ) -> Result<()> {
+        use clouisled::server::proto::{ExecStream, exec_stream};
+        let session = self.session.lock().await;
+        let active = session
+            .as_ref()
+            .ok_or_else(|| ClouisleError::not_found(format!("process {process_id}")))?;
+        if active.frame_id != process_id {
+            return Err(ClouisleError::not_found(format!("process {process_id}")));
+        }
+        active
+            .tx
+            .send(ExecStream {
+                msg: Some(exec_stream::Msg::ProcessSignal(
+                    clouisled::server::proto::ProcessSignal {
+                        frame_id: process_id.to_string(),
+                        signal: signal.as_i32(),
+                    },
+                )),
+            })
+            .await
+            .map_err(|error| ClouisleError::io(format!("queue node signal: {error}")))
+    }
+
+    async fn resize_pty(&self, process_id: &str, cols: u16, rows: u16) -> Result<()> {
+        use clouisled::server::proto::{ExecStream, exec_stream};
+        let session = self.session.lock().await;
+        let active = session
+            .as_ref()
+            .ok_or_else(|| ClouisleError::not_found(format!("process {process_id}")))?;
+        if active.frame_id != process_id {
+            return Err(ClouisleError::not_found(format!("process {process_id}")));
+        }
+        active
+            .tx
+            .send(ExecStream {
+                msg: Some(exec_stream::Msg::ProcessResize(
+                    clouisled::server::proto::ProcessResize {
+                        frame_id: process_id.to_string(),
+                        cols: cols as u32,
+                        rows: rows as u32,
+                    },
+                )),
+            })
+            .await
+            .map_err(|error| ClouisleError::io(format!("queue node resize: {error}")))
     }
 }

@@ -12,6 +12,9 @@ use crate::sandbox::state::{SandboxEvent, SandboxStatus};
 pub struct VmmMeta {
     /// 后端类型（mock / firecracker / docker）
     pub backend: String,
+    /// Stable node owner for remote runtimes.
+    #[serde(default)]
+    pub owner_id: Option<String>,
     /// 进程 PID（若适用）
     pub pid: Option<u64>,
     /// API socket 路径（Firecracker UDS）
@@ -26,6 +29,15 @@ pub struct VmmMeta {
     /// 额外 JSON 元数据
     #[serde(default)]
     pub extra: std::collections::HashMap<String, String>,
+}
+
+impl VmmMeta {
+    /// 从 `extra["subnet"]`（"a.b"）恢复快照继承子网；无则 None。
+    pub fn inherited_subnet(&self) -> Option<(u16, u16)> {
+        let value = self.extra.get("subnet")?;
+        let (a, b) = value.split_once('.')?;
+        Some((a.parse().ok()?, b.parse().ok()?))
+    }
 }
 
 /// 沙盒聚合。

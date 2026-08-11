@@ -1,6 +1,8 @@
 //! Agent 连接抽象：连接 guest agent 并等待 Hello（Stage 0.6 的 host 侧语义）。
 
 use async_trait::async_trait;
+#[cfg(any(test, feature = "test-utils"))]
+use std::sync::Arc;
 
 #[cfg(any(test, feature = "test-utils", target_os = "linux"))]
 use clouisle_core::ClouisleError;
@@ -64,6 +66,8 @@ pub trait AgentConnection: Send + Sync {
 
     /// 写文件（FR-07）。
     async fn write_file(&self, path: &str, content: bytes::Bytes, mode: u32) -> Result<()>;
+    /// 施加 guest 内资源限制（cgroup v2 pids.max）。None 不修改。
+    async fn apply_limits(&self, pids_max: Option<u32>) -> Result<()>;
 
     /// 读文件（FR-07），返回内容。
     async fn read_file(&self, path: &str) -> Result<bytes::Bytes>;
@@ -73,6 +77,58 @@ pub trait AgentConnection: Send + Sync {
 
     /// 心跳 ping。
     async fn ping(&self) -> Result<()>;
+
+    /// 启动长生命周期进程（可选 stdin/PTY），握手完成后立即返回 guest 帧 id
+    /// （供 send_stdin/send_signal/resize_pty 寻址）。输出随后经
+    /// [`AgentConnection::stream_process_events`] 转发。
+    async fn start_process(
+        &self,
+        argv: Vec<String>,
+        env: std::collections::HashMap<String, String>,
+        cwd: Option<String>,
+        timeout_ms: u64,
+        stdin: bool,
+        pty: Option<clouisle_proto::PtyConfig>,
+    ) -> Result<String>;
+
+    /// 在同一连接上把运行中进程的输出泵成事件，直到 Exited。
+    async fn stream_process_events(
+        &self,
+        process_id: &str,
+        events: tokio::sync::mpsc::Sender<ExecStreamEvent>,
+    ) -> Result<()>;
+
+    /// 向运行中进程的 stdin 写入数据。
+    async fn send_stdin(&self, process_id: &str, chunk: bytes::Bytes) -> Result<()>;
+
+    /// 关闭运行中进程的 stdin（EOF）。
+    async fn close_stdin(&self, process_id: &str) -> Result<()>;
+
+    /// 向运行中进程的进程组投递信号。
+    async fn send_signal(
+        &self,
+        process_id: &str,
+        signal: clouisle_proto::ProcessSignal,
+    ) -> Result<()>;
+
+    /// 调整运行中进程的 PTY 尺寸。
+    async fn resize_pty(&self, process_id: &str, cols: u16, rows: u16) -> Result<()>;
+}
+
+/// guest 文件系统错误的 API 侧映射：ENOENT 类错误映射 404，其余映射 VMM 错误。
+fn guest_fs_error(op: &str, path: &str, message: &str) -> ClouisleError {
+    let lower = message.to_ascii_lowercase();
+    if lower.contains("no such file")
+        || lower.contains("not found")
+        || lower.contains("no such directory")
+    {
+        ClouisleError::not_found(format!("guest {op} {path}: {message}"))
+    } else {
+        ClouisleError::new(
+            clouisle_core::ErrorKind::Vmm,
+            format!("guest {op} {path}: {message}"),
+        )
+    }
 }
 
 /// Mock 连接器：测试用，仅在 test 或 test-utils feature 下编译。
@@ -98,6 +154,24 @@ impl AgentConnector for MockAgentConnector {
 /// Mock 连接：用宿主机本地进程执行命令（模拟 guest exec）。
 pub struct MockAgentConnection {
     sandbox_id: String,
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+struct MockRunningProcess {
+    pid: u32,
+    pty: bool,
+    stdin: Arc<tokio::sync::Mutex<Option<tokio::process::ChildStdin>>>,
+    child: tokio::sync::Mutex<Option<tokio::process::Child>>,
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+fn mock_processes()
+-> &'static parking_lot::Mutex<std::collections::HashMap<String, Arc<MockRunningProcess>>> {
+    use std::sync::OnceLock;
+    static PROCESSES: OnceLock<
+        parking_lot::Mutex<std::collections::HashMap<String, Arc<MockRunningProcess>>>,
+    > = OnceLock::new();
+    PROCESSES.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()))
 }
 
 #[cfg(any(test, feature = "test-utils"))]
@@ -170,13 +244,200 @@ impl AgentConnection for MockAgentConnection {
         Ok(())
     }
 
+    async fn apply_limits(&self, _pids_max: Option<u32>) -> Result<()> {
+        Ok(())
+    }
+
+    async fn start_process(
+        &self,
+        argv: Vec<String>,
+        env: std::collections::HashMap<String, String>,
+        cwd: Option<String>,
+        _timeout_ms: u64,
+        stdin: bool,
+        pty: Option<clouisle_proto::PtyConfig>,
+    ) -> Result<String> {
+        if argv.is_empty() {
+            return Err(clouisle_core::ClouisleError::validation("argv empty"));
+        }
+        let id = uuid::Uuid::now_v7().to_string();
+        let mut cmd = tokio::process::Command::new(&argv[0]);
+        cmd.args(&argv[1..]).envs(env);
+        if stdin {
+            cmd.stdin(std::process::Stdio::piped());
+        } else {
+            cmd.stdin(std::process::Stdio::null());
+        }
+        cmd.stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        if let Some(c) = cwd {
+            cmd.current_dir(c);
+        }
+        #[cfg(unix)]
+        cmd.process_group(0);
+        let mut child = cmd.spawn().map_err(|e| {
+            clouisle_core::ClouisleError::new(
+                clouisle_core::ErrorKind::Vmm,
+                format!("spawn {argv:?}: {e}"),
+            )
+        })?;
+        let pid = child.id().unwrap_or(0);
+        let stdin_handle = child
+            .stdin
+            .take()
+            .map(|stdin| Arc::new(tokio::sync::Mutex::new(Some(stdin))));
+        mock_processes().lock().insert(
+            id.clone(),
+            Arc::new(MockRunningProcess {
+                pid,
+                pty: pty.is_some(),
+                stdin: stdin_handle.unwrap_or_else(|| Arc::new(tokio::sync::Mutex::new(None))),
+                child: tokio::sync::Mutex::new(Some(child)),
+            }),
+        );
+        Ok(id)
+    }
+
+    async fn stream_process_events(
+        &self,
+        process_id: &str,
+        events: tokio::sync::mpsc::Sender<ExecStreamEvent>,
+    ) -> Result<()> {
+        let process = mock_processes()
+            .lock()
+            .get(process_id)
+            .cloned()
+            .ok_or_else(|| ClouisleError::not_found(format!("process {process_id}")))?;
+        let mut child = process
+            .child
+            .lock()
+            .await
+            .take()
+            .ok_or_else(|| ClouisleError::invalid_state("process already reaped"))?;
+        let mut stdout = child.stdout.take().expect("stdout piped");
+        let mut stderr = child.stderr.take().expect("stderr piped");
+        let id_out = process_id.to_string();
+        let timeout_ms = 0u64;
+        let _ = timeout_ms;
+        tokio::spawn(async move {
+            use tokio::io::AsyncReadExt;
+            let events_out = events.clone();
+            let events_err = events.clone();
+            let stdout_task = tokio::spawn(async move {
+                let mut buf = [0u8; 8192];
+                loop {
+                    match stdout.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            if events_out
+                                .send(ExecStreamEvent::Stdout(bytes::Bytes::copy_from_slice(
+                                    &buf[..n],
+                                )))
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                    }
+                }
+            });
+            let stderr_task = tokio::spawn(async move {
+                let mut buf = [0u8; 8192];
+                loop {
+                    match stderr.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            if events_err
+                                .send(ExecStreamEvent::Stderr(bytes::Bytes::copy_from_slice(
+                                    &buf[..n],
+                                )))
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                    }
+                }
+            });
+            let _ = stdout_task.await;
+            let _ = stderr_task.await;
+            let code = child
+                .wait()
+                .await
+                .map(|status| status.code().unwrap_or(-1))
+                .unwrap_or(-1);
+            mock_processes().lock().remove(&id_out);
+            let _ = events.send(ExecStreamEvent::Exit(code)).await;
+        });
+        Ok(())
+    }
+
+    async fn send_stdin(&self, process_id: &str, chunk: bytes::Bytes) -> Result<()> {
+        use tokio::io::AsyncWriteExt;
+        let process = mock_processes()
+            .lock()
+            .get(process_id)
+            .cloned()
+            .ok_or_else(|| ClouisleError::not_found(format!("process {process_id}")))?;
+        let mut guard = process.stdin.lock().await;
+        let Some(writer) = guard.as_mut() else {
+            return Err(ClouisleError::invalid_state("stdin is closed"));
+        };
+        writer
+            .write_all(&chunk)
+            .await
+            .map_err(|e| ClouisleError::io(format!("mock stdin write: {e}")))
+    }
+
+    async fn close_stdin(&self, process_id: &str) -> Result<()> {
+        let process = mock_processes()
+            .lock()
+            .get(process_id)
+            .cloned()
+            .ok_or_else(|| ClouisleError::not_found(format!("process {process_id}")))?;
+        *process.stdin.lock().await = None;
+        Ok(())
+    }
+
+    async fn send_signal(
+        &self,
+        process_id: &str,
+        signal: clouisle_proto::ProcessSignal,
+    ) -> Result<()> {
+        let process = mock_processes()
+            .lock()
+            .get(process_id)
+            .cloned()
+            .ok_or_else(|| ClouisleError::not_found(format!("process {process_id}")))?;
+        #[cfg(unix)]
+        unsafe {
+            libc::kill(-(process.pid as i32), signal.as_i32());
+        }
+        Ok(())
+    }
+
+    async fn resize_pty(&self, process_id: &str, _cols: u16, _rows: u16) -> Result<()> {
+        let process = mock_processes()
+            .lock()
+            .get(process_id)
+            .cloned()
+            .ok_or_else(|| ClouisleError::not_found(format!("process {process_id}")))?;
+        if !process.pty {
+            return Err(ClouisleError::invalid_state(format!(
+                "process {process_id} has no pty"
+            )));
+        }
+        Ok(())
+    }
+
     async fn write_file(&self, path: &str, content: bytes::Bytes, mode: u32) -> Result<()> {
         // Mock 模式：写入宿主机临时文件，模拟 guest 文件写入
         let dir = std::env::temp_dir()
             .join("clouisle-mock-fs")
             .join(&self.sandbox_id);
-        std::fs::create_dir_all(&dir).ok();
-        // 路径穿越防护
+        std::fs::create_dir_all(&dir).ok(); // 路径穿越防护
         let path = path.trim_start_matches('/');
         if path.split('/').any(|seg| seg == "..") {
             return Err(ClouisleError::validation(format!(
@@ -247,8 +508,8 @@ impl AgentConnection for MockAgentConnection {
 }
 
 #[cfg(any(test, feature = "test-utils"))]
-/// 独立的文件系统后端（Mock 用宿主机本地文件系统模拟 guest 文件系统）。
-/// 每个沙盒映射到 `<tmpdir>/clouisle-mock-fs/<sandbox_id>/`。
+// 独立的文件系统后端（Mock 用宿主机本地文件系统模拟 guest 文件系统）。
+// 每个沙盒映射到 `<tmpdir>/clouisle-mock-fs/<sandbox_id>/`。
 #[derive(Debug, Clone, Default)]
 pub struct MockFsBackend;
 
@@ -303,6 +564,58 @@ impl AgentConnection for MockFsConnection {
     ) -> Result<clouisle_core::execution::ExecutionResult> {
         Err(ClouisleError::invalid_state(
             "exec not supported on fs-only connection",
+        ))
+    }
+
+    async fn start_process(
+        &self,
+        _argv: Vec<String>,
+        _env: std::collections::HashMap<String, String>,
+        _cwd: Option<String>,
+        _timeout_ms: u64,
+        _stdin: bool,
+        _pty: Option<clouisle_proto::PtyConfig>,
+    ) -> Result<String> {
+        Err(ClouisleError::invalid_state(
+            "process streaming not supported on fs-only connection",
+        ))
+    }
+
+    async fn stream_process_events(
+        &self,
+        _process_id: &str,
+        _events: tokio::sync::mpsc::Sender<ExecStreamEvent>,
+    ) -> Result<()> {
+        Err(ClouisleError::invalid_state(
+            "process streaming not supported on fs-only connection",
+        ))
+    }
+
+    async fn send_stdin(&self, _process_id: &str, _chunk: bytes::Bytes) -> Result<()> {
+        Err(ClouisleError::invalid_state(
+            "process control not supported on fs-only connection",
+        ))
+    }
+
+    async fn close_stdin(&self, _process_id: &str) -> Result<()> {
+        Err(ClouisleError::invalid_state(
+            "process control not supported on fs-only connection",
+        ))
+    }
+
+    async fn send_signal(
+        &self,
+        _process_id: &str,
+        _signal: clouisle_proto::ProcessSignal,
+    ) -> Result<()> {
+        Err(ClouisleError::invalid_state(
+            "process control not supported on fs-only connection",
+        ))
+    }
+
+    async fn resize_pty(&self, _process_id: &str, _cols: u16, _rows: u16) -> Result<()> {
+        Err(ClouisleError::invalid_state(
+            "process control not supported on fs-only connection",
         ))
     }
 
@@ -373,6 +686,10 @@ impl AgentConnection for MockFsConnection {
     async fn ping(&self) -> Result<()> {
         Ok(())
     }
+
+    async fn apply_limits(&self, _pids_max: Option<u32>) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// guest agent 监听的 vsock 端口（与 clouisle-agent 约定）。
@@ -401,7 +718,7 @@ impl Default for VsockAgentConnector {
 impl AgentConnector for VsockAgentConnector {
     async fn connect_and_hello(
         &self,
-        _handle: &VmHandle,
+        handle: &VmHandle,
         sandbox_id: &str,
     ) -> Result<Box<dyn AgentConnection>> {
         use clouisle_proto::Frame;
@@ -409,7 +726,11 @@ impl AgentConnector for VsockAgentConnector {
 
         // 通过 guest 的 TAP 网络 IP (每沙盒独立网段 10.{a}.{b}.2) 进行 TCP 通信。
         // 不使用 vsock（需要 guest 内核驱动），TCP 隧道经 veth pair 跨 netns。
-        let guest_ip = clouisle_net::netns::guest_ip(sandbox_id);
+        // 快照预热继承路径用显式子网；否则按 sandbox_id 派生。
+        let guest_ip = match handle.subnet {
+            Some((a, b)) => format!("10.{a}.{b}.2"),
+            None => clouisle_net::netns::guest_ip(sandbox_id),
+        };
         let guest_addr = format!("{guest_ip}:5201")
             .parse::<std::net::SocketAddr>()
             .map_err(|e| ClouisleError::io(format!("invalid guest addr {guest_ip}:5201: {e}")))?;
@@ -458,6 +779,97 @@ impl AgentConnector for VsockAgentConnector {
                 ));
             }
             tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        }
+    }
+}
+
+/// Docker 开发后端连接器：经 `clouisle-dev-mgmt` 网络 TCP 连接容器名:5201，
+/// 复用帧协议与 Hello 握手。容器名即 handle.id（DockerDevVmm 设置）。
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone)]
+pub struct DockerDevAgentConnector {
+    pub connect_timeout: std::time::Duration,
+}
+
+#[cfg(target_os = "linux")]
+impl Default for DockerDevAgentConnector {
+    fn default() -> Self {
+        Self {
+            connect_timeout: std::time::Duration::from_secs(15),
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[async_trait]
+impl AgentConnector for DockerDevAgentConnector {
+    async fn connect_and_hello(
+        &self,
+        handle: &VmHandle,
+        sandbox_id: &str,
+    ) -> Result<Box<dyn AgentConnection>> {
+        use clouisle_proto::Frame;
+        use clouisle_proto::codec::{read_frame, write_frame};
+
+        // mgmt 网络内 Docker DNS 解析容器名（ToSocketAddrs 支持 hostname）。
+        use std::net::ToSocketAddrs;
+        let mut addrs = (handle.id.as_str(), 5201u16)
+            .to_socket_addrs()
+            .map_err(|e| {
+                ClouisleError::io(format!("resolve dev container {}:5201: {e}", handle.id))
+            })?;
+        let guest_addr = addrs.next().ok_or_else(|| {
+            ClouisleError::io(format!("no address for dev container {}:5201", handle.id))
+        })?;
+        let deadline = tokio::time::Instant::now() + self.connect_timeout;
+        loop {
+            let last_err = match tokio::time::timeout(
+                std::time::Duration::from_millis(500),
+                tokio::net::TcpStream::connect(guest_addr),
+            )
+            .await
+            {
+                Ok(Ok(stream)) => {
+                    let conn = VsockFrameConnection {
+                        sandbox_id: sandbox_id.to_string(),
+                        stream: tokio::sync::Mutex::new(tokio::io::BufStream::new(stream)),
+                    };
+                    write_frame(
+                        &mut *conn.stream.lock().await,
+                        &Frame::Hello {
+                            agent_version: env!("CARGO_PKG_VERSION").to_string(),
+                        },
+                    )
+                    .await
+                    .map_err(|e| ClouisleError::io(format!("write Hello to dev container: {e}")))?;
+                    let resp = read_frame(&mut *conn.stream.lock().await)
+                        .await
+                        .map_err(|e| {
+                            ClouisleError::io(format!("read Hello from dev container: {e}"))
+                        })?;
+                    if !matches!(resp, Frame::Hello { .. }) {
+                        return Err(ClouisleError::invalid_state(
+                            "expected Hello from dev container agent",
+                        ));
+                    }
+                    return Ok(Box::new(conn));
+                }
+                Ok(Err(e)) => e,
+                Err(_) => {
+                    return Err(ClouisleError::timeout(format!(
+                        "docker-dev agent hello timeout after {}s",
+                        self.connect_timeout.as_secs()
+                    )));
+                }
+            };
+            if tokio::time::Instant::now() >= deadline {
+                return Err(ClouisleError::timeout(format!(
+                    "docker-dev agent hello timeout after {}s",
+                    self.connect_timeout.as_secs()
+                )));
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            let _ = last_err;
         }
     }
 }
@@ -614,10 +1026,7 @@ impl AgentConnection for VsockFrameConnection {
             .map_err(|e| ClouisleError::io(format!("read ReadFile response: {e}")))?;
         match resp {
             Frame::ReadFileResult { content, .. } => Ok(content),
-            Frame::Error { message, .. } => Err(ClouisleError::new(
-                clouisle_core::ErrorKind::Vmm,
-                format!("guest read_file {path}: {message}"),
-            )),
+            Frame::Error { message, .. } => Err(guest_fs_error("read_file", path, &message)),
             other => Err(ClouisleError::invalid_state(format!(
                 "unexpected frame for ReadFile: {other:?}"
             ))),
@@ -651,10 +1060,7 @@ impl AgentConnection for VsockFrameConnection {
                     is_dir: e.is_dir,
                 })
                 .collect()),
-            Frame::Error { message, .. } => Err(ClouisleError::new(
-                clouisle_core::ErrorKind::Vmm,
-                format!("guest list_dir {path}: {message}"),
-            )),
+            Frame::Error { message, .. } => Err(guest_fs_error("list_dir", path, &message)),
             other => Err(ClouisleError::invalid_state(format!(
                 "unexpected frame for ListDir: {other:?}"
             ))),
@@ -679,6 +1085,230 @@ impl AgentConnection for VsockFrameConnection {
             )),
             other => Err(ClouisleError::invalid_state(format!(
                 "unexpected frame for Ping: {other:?}"
+            ))),
+        }
+    }
+
+    async fn apply_limits(&self, pids_max: Option<u32>) -> Result<()> {
+        use clouisle_proto::Frame;
+        use clouisle_proto::codec::{read_frame, write_frame};
+
+        write_frame(
+            &mut *self.stream.lock().await,
+            &Frame::ApplyLimits {
+                pids_max,
+                bandwidth_mbps: None,
+            },
+        )
+        .await
+        .map_err(|e| ClouisleError::io(format!("send ApplyLimits: {e}")))?;
+        let resp = read_frame(&mut *self.stream.lock().await)
+            .await
+            .map_err(|e| ClouisleError::io(format!("read ApplyLimits response: {e}")))?;
+        match resp {
+            Frame::ControlOk => Ok(()),
+            Frame::Error { message, .. } => Err(ClouisleError::new(
+                clouisle_core::ErrorKind::Vmm,
+                format!("guest apply_limits: {message}"),
+            )),
+            other => Err(ClouisleError::invalid_state(format!(
+                "unexpected frame for ApplyLimits: {other:?}"
+            ))),
+        }
+    }
+
+    async fn start_process(
+        &self,
+        argv: Vec<String>,
+        env: std::collections::HashMap<String, String>,
+        cwd: Option<String>,
+        timeout_ms: u64,
+        stdin: bool,
+        pty: Option<clouisle_proto::PtyConfig>,
+    ) -> Result<String> {
+        use clouisle_proto::Frame;
+        use clouisle_proto::codec::{read_frame, write_frame};
+        let id = uuid::Uuid::now_v7().to_string();
+        write_frame(
+            &mut *self.stream.lock().await,
+            &Frame::ProcessStart {
+                id: id.clone(),
+                argv,
+                env,
+                cwd,
+                timeout_ms,
+                stdin,
+                pty,
+            },
+        )
+        .await
+        .map_err(|error| ClouisleError::io(format!("send ProcessStart: {error}")))?;
+        let started = read_frame(&mut *self.stream.lock().await)
+            .await
+            .map_err(|error| ClouisleError::io(format!("read ProcessStarted: {error}")))?;
+        match started {
+            Frame::ProcessStarted { id: got, pid: _pid } if got == id => Ok(id),
+            Frame::Error { message, .. } => Err(ClouisleError::new(ErrorKind::Vmm, message)),
+            other => Err(ClouisleError::invalid_state(format!(
+                "unexpected frame for ProcessStart: {other:?}"
+            ))),
+        }
+    }
+
+    async fn stream_process_events(
+        &self,
+        process_id: &str,
+        events: tokio::sync::mpsc::Sender<ExecStreamEvent>,
+    ) -> Result<()> {
+        use clouisle_proto::Frame;
+        use clouisle_proto::codec::read_frame;
+        loop {
+            let frame = read_frame(&mut *self.stream.lock().await)
+                .await
+                .map_err(|error| {
+                    ClouisleError::io(format!("read interactive process output: {error}"))
+                })?;
+            match frame {
+                Frame::Stdout {
+                    id: frame_id,
+                    chunk,
+                } if frame_id == process_id => {
+                    if events.send(ExecStreamEvent::Stdout(chunk)).await.is_err() {
+                        return Err(ClouisleError::invalid_state("process stream closed"));
+                    }
+                }
+                Frame::Stderr {
+                    id: frame_id,
+                    chunk,
+                } if frame_id == process_id => {
+                    if events.send(ExecStreamEvent::Stderr(chunk)).await.is_err() {
+                        return Err(ClouisleError::invalid_state("process stream closed"));
+                    }
+                }
+                Frame::Exited { id: frame_id, code } if frame_id == process_id => {
+                    let _ = events.send(ExecStreamEvent::Exit(code)).await;
+                    return Ok(());
+                }
+                Frame::Error { message, .. } => {
+                    return Err(ClouisleError::new(ErrorKind::Vmm, message));
+                }
+                other => {
+                    return Err(ClouisleError::invalid_state(format!(
+                        "unexpected interactive frame: {other:?}"
+                    )));
+                }
+            }
+        }
+    }
+
+    async fn send_stdin(&self, process_id: &str, chunk: bytes::Bytes) -> Result<()> {
+        use clouisle_proto::Frame;
+        use clouisle_proto::codec::{read_frame, write_frame};
+        write_frame(
+            &mut *self.stream.lock().await,
+            &Frame::Stdin {
+                id: process_id.to_string(),
+                chunk,
+            },
+        )
+        .await
+        .map_err(|e| ClouisleError::io(format!("send Stdin: {e}")))?;
+        match read_frame(&mut *self.stream.lock().await)
+            .await
+            .map_err(|e| ClouisleError::io(format!("read Stdin ack: {e}")))?
+        {
+            Frame::ControlOk => Ok(()),
+            Frame::Error { message, .. } => Err(ClouisleError::new(
+                ErrorKind::Vmm,
+                format!("guest stdin: {message}"),
+            )),
+            other => Err(ClouisleError::invalid_state(format!(
+                "unexpected frame for Stdin: {other:?}"
+            ))),
+        }
+    }
+
+    async fn close_stdin(&self, process_id: &str) -> Result<()> {
+        use clouisle_proto::Frame;
+        use clouisle_proto::codec::{read_frame, write_frame};
+        write_frame(
+            &mut *self.stream.lock().await,
+            &Frame::StdinEof {
+                id: process_id.to_string(),
+            },
+        )
+        .await
+        .map_err(|e| ClouisleError::io(format!("send StdinEof: {e}")))?;
+        match read_frame(&mut *self.stream.lock().await)
+            .await
+            .map_err(|e| ClouisleError::io(format!("read StdinEof ack: {e}")))?
+        {
+            Frame::ControlOk => Ok(()),
+            Frame::Error { message, .. } => Err(ClouisleError::new(
+                ErrorKind::Vmm,
+                format!("guest stdin eof: {message}"),
+            )),
+            other => Err(ClouisleError::invalid_state(format!(
+                "unexpected frame for StdinEof: {other:?}"
+            ))),
+        }
+    }
+
+    async fn send_signal(
+        &self,
+        process_id: &str,
+        signal: clouisle_proto::ProcessSignal,
+    ) -> Result<()> {
+        use clouisle_proto::Frame;
+        use clouisle_proto::codec::{read_frame, write_frame};
+        write_frame(
+            &mut *self.stream.lock().await,
+            &Frame::Signal {
+                id: process_id.to_string(),
+                signal,
+            },
+        )
+        .await
+        .map_err(|e| ClouisleError::io(format!("send Signal: {e}")))?;
+        match read_frame(&mut *self.stream.lock().await)
+            .await
+            .map_err(|e| ClouisleError::io(format!("read Signal ack: {e}")))?
+        {
+            Frame::ControlOk => Ok(()),
+            Frame::Error { message, .. } => Err(ClouisleError::new(
+                ErrorKind::Vmm,
+                format!("guest signal: {message}"),
+            )),
+            other => Err(ClouisleError::invalid_state(format!(
+                "unexpected frame for Signal: {other:?}"
+            ))),
+        }
+    }
+
+    async fn resize_pty(&self, process_id: &str, cols: u16, rows: u16) -> Result<()> {
+        use clouisle_proto::Frame;
+        use clouisle_proto::codec::{read_frame, write_frame};
+        write_frame(
+            &mut *self.stream.lock().await,
+            &Frame::Resize {
+                id: process_id.to_string(),
+                cols,
+                rows,
+            },
+        )
+        .await
+        .map_err(|e| ClouisleError::io(format!("send Resize: {e}")))?;
+        match read_frame(&mut *self.stream.lock().await)
+            .await
+            .map_err(|e| ClouisleError::io(format!("read Resize ack: {e}")))?
+        {
+            Frame::ControlOk => Ok(()),
+            Frame::Error { message, .. } => Err(ClouisleError::new(
+                ErrorKind::Vmm,
+                format!("guest resize: {message}"),
+            )),
+            other => Err(ClouisleError::invalid_state(format!(
+                "unexpected frame for Resize: {other:?}"
             ))),
         }
     }
@@ -808,10 +1438,12 @@ mod tests {
         let handle = clouisle_vmm::VmHandle {
             id: "x".into(),
             backend: "mock".into(),
+            owner_id: None,
             pid: None,
             api_socket: None,
             vsock_socket: None,
             vsock_cid: None,
+            subnet: None,
         };
         let c = conn.connect_and_hello(&handle, "test-sbx").await.unwrap();
         assert!(c.ping().await.is_ok());

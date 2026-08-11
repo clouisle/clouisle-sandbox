@@ -14,8 +14,8 @@ tracing.workspace = true
 uuid.workspace = true
 futures.workspace = true
 bytes.workspace = true
-hickory-resolver = "0.24"
-hickory-proto = "0.24"
+hickory-resolver = { version = "0.26", features = ["tokio"] }
+hickory-proto = "0.26"
 socket2 = { version = "0.5", features = ["all"] }
 sha2.workspace = true
 hex.workspace = true

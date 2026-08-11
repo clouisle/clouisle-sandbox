@@ -60,6 +60,16 @@ pub enum NodeExecEvent {
     Exit(i32),
 }
 
+/// 交互式进程控制操作（gRPC → guest 帧）。
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone)]
+pub enum ProcessControlOp {
+    Stdin(bytes::Bytes),
+    StdinEof,
+    Signal(clouisle_proto::ProcessSignal),
+    Resize { cols: u16, rows: u16 },
+}
+
 /// 节点代理。持有本机所有沙盒 handle 与资源池。
 #[derive(Clone)]
 pub struct NodeAgent {
@@ -141,40 +151,33 @@ impl NodeAgent {
         if id.is_empty() {
             return Err(ClouisleError::validation("sandbox id is required"));
         }
+        spec.validate().map_err(|errors| {
+            ClouisleError::validation(format!("invalid sandbox spec: {errors:?}"))
+        })?;
         let reservation = self.pool.admit(&spec).await?;
         let mut sandbox = Sandbox::new(id.clone(), spec);
         sandbox.node_id = Some(self.config.node_id.clone());
         sandbox.transition(SandboxEvent::Start)?;
-
         store.create_sandbox(&sandbox).await?;
+
         #[cfg(target_os = "linux")]
         if let Some(firewall) = &self.firewall
             && let Err(error) = firewall.create_network(&id).await
         {
-            store
-                .update_sandbox_status(&id, &SandboxStatus::Error)
-                .await
-                .ok();
+            self.fail_creation(store, &id, &error, None).await;
             return Err(error);
         }
 
         let handle = match self.vmm.create(&id, &sandbox.spec).await {
             Ok(handle) => handle,
             Err(error) => {
-                sandbox.transition(SandboxEvent::Failed).ok();
-                store
-                    .update_sandbox_status(&id, &SandboxStatus::Error)
-                    .await
-                    .ok();
-                #[cfg(target_os = "linux")]
-                if let Some(firewall) = &self.firewall {
-                    let _ = firewall.teardown_sandbox_network(&id).await;
-                }
+                self.fail_creation(store, &id, &error, None).await;
                 return Err(error);
             }
         };
         sandbox.vmm_meta = clouisle_core::VmmMeta {
             backend: handle.backend.clone(),
+            owner_id: handle.owner_id.clone(),
             pid: handle.pid,
             api_socket: handle.api_socket.clone(),
             vsock_socket: handle.vsock_socket.clone(),
@@ -182,18 +185,14 @@ impl NodeAgent {
             vmm_id: Some(handle.id.clone()),
             extra: Default::default(),
         };
+        if let Err(error) = store.update_sandbox_vmm_meta(&id, &sandbox.vmm_meta).await {
+            let error: ClouisleError = error.into();
+            self.fail_creation(store, &id, &error, Some(&handle)).await;
+            return Err(error);
+        }
 
         if let Err(error) = self.vmm.start(&handle).await {
-            sandbox.transition(SandboxEvent::Failed).ok();
-            store
-                .update_sandbox_status(&id, &SandboxStatus::Error)
-                .await
-                .ok();
-            let _ = self.vmm.stop(&handle, StopMode::Force).await;
-            #[cfg(target_os = "linux")]
-            if let Some(firewall) = &self.firewall {
-                let _ = firewall.teardown_sandbox_network(&id).await;
-            }
+            self.fail_creation(store, &id, &error, Some(&handle)).await;
             return Err(error);
         }
 
@@ -205,29 +204,135 @@ impl NodeAgent {
             } else {
                 Vec::new()
             };
-            if let Err(error) = firewall.setup_sandbox_network(&id, &gateway, &allow).await {
-                sandbox.transition(SandboxEvent::Failed).ok();
-                store
-                    .update_sandbox_status(&id, &SandboxStatus::Error)
-                    .await
-                    .ok();
-                let _ = self.vmm.stop(&handle, StopMode::Force).await;
-                let _ = firewall.teardown_sandbox_network(&id).await;
+            if let Err(error) = firewall
+                .setup_sandbox_network(
+                    &id,
+                    &gateway,
+                    &allow,
+                    &sandbox.spec.network.deny_egress,
+                    sandbox.spec.resources.bandwidth_mbps,
+                )
+                .await
+            {
+                self.fail_creation(store, &id, &error, Some(&handle)).await;
                 return Err(error);
             }
         }
-        sandbox.transition(SandboxEvent::AgentHello)?;
-        store
-            .update_sandbox_status(&id, &SandboxStatus::Running)
-            .await?;
-        store.update_sandbox_expiry(&id, sandbox.expires_at).await?;
 
-        self.sandboxes
-            .write()
+        // The guest must answer before the node exposes it as running. Keep a
+        // provisional local record so all agent I/O remains guest-scoped.
+        let mut provisional = sandbox.clone();
+        provisional.status = SandboxStatus::Running;
+        self.sandboxes.write().await.insert(id.clone(), provisional);
+        self.reservations
+            .lock()
             .await
-            .insert(id.clone(), sandbox.clone());
-        self.reservations.lock().await.insert(id, reservation);
+            .insert(id.clone(), reservation);
+
+        #[cfg(target_os = "linux")]
+        if self.vmm.requires_guest_agent() {
+            use clouisle_proto::Frame;
+
+            let ready = match self.file_op(&id, Frame::Ping).await {
+                Ok(Frame::Pong) => Ok(()),
+                Ok(_) => Err(ClouisleError::invalid_state(
+                    "guest ping returned an unexpected frame",
+                )),
+                Err(error) => Err(error),
+            };
+            if let Err(error) = ready {
+                self.fail_creation(store, &id, &error, Some(&handle)).await;
+                return Err(error);
+            }
+            for secret in &sandbox.spec.secrets {
+                if let Err(error) = self
+                    .file_op(
+                        &id,
+                        Frame::WriteFile {
+                            path: format!("/run/secrets/{}", secret.name),
+                            mode: 0o600,
+                            content: bytes::Bytes::copy_from_slice(secret.value.as_bytes()),
+                        },
+                    )
+                    .await
+                {
+                    self.fail_creation(store, &id, &error, Some(&handle)).await;
+                    return Err(error);
+                }
+            }
+            if !sandbox.spec.init_command.is_empty() {
+                let mut init_env = sandbox.spec.env.clone();
+                init_env.extend(sandbox.spec.init_env.clone());
+                match self
+                    .exec_command(
+                        &id,
+                        sandbox.spec.init_command.clone(),
+                        init_env,
+                        sandbox.spec.init_cwd.clone(),
+                        sandbox.spec.init_timeout_ms,
+                    )
+                    .await
+                {
+                    Ok(result) if result.exit_code == 0 => {}
+                    Ok(result) => {
+                        let error = ClouisleError::new(
+                            ErrorKind::Vmm,
+                            format!(
+                                "initialization command exited with code {}",
+                                result.exit_code
+                            ),
+                        );
+                        self.fail_creation(store, &id, &error, Some(&handle)).await;
+                        return Err(error);
+                    }
+                    Err(error) => {
+                        self.fail_creation(store, &id, &error, Some(&handle)).await;
+                        return Err(error);
+                    }
+                }
+            }
+        }
+
+        sandbox.transition(SandboxEvent::AgentHello)?;
+        if let Err(error) = store
+            .update_sandbox_status_message(&id, &SandboxStatus::Running, None)
+            .await
+        {
+            let error: ClouisleError = error.into();
+            self.fail_creation(store, &id, &error, Some(&handle)).await;
+            return Err(error);
+        }
+        if let Err(error) = store.update_sandbox_expiry(&id, sandbox.expires_at).await {
+            let error: ClouisleError = error.into();
+            self.fail_creation(store, &id, &error, Some(&handle)).await;
+            return Err(error);
+        }
+        self.sandboxes.write().await.insert(id, sandbox.clone());
         Ok(sandbox)
+    }
+
+    async fn fail_creation(
+        &self,
+        store: &dyn Store,
+        id: &str,
+        error: &ClouisleError,
+        handle: Option<&VmHandle>,
+    ) {
+        if let Err(store_error) = store
+            .update_sandbox_status_message(id, &SandboxStatus::Error, Some(&error.message))
+            .await
+        {
+            tracing::error!(sandbox_id = id, %store_error, "cannot persist node provisioning failure");
+        }
+        if let Some(handle) = handle {
+            let _ = self.vmm.stop(handle, StopMode::Force).await;
+        }
+        #[cfg(target_os = "linux")]
+        if let Some(firewall) = &self.firewall {
+            let _ = firewall.teardown_sandbox_network(id, None).await;
+        }
+        self.sandboxes.write().await.remove(id);
+        self.reservations.lock().await.remove(id);
     }
 
     /// 停止并删除本机沙盒。
@@ -250,10 +355,12 @@ impl NodeAgent {
                 .clone()
                 .unwrap_or_else(|| id.to_string()),
             backend: sandbox.vmm_meta.backend.clone(),
+            owner_id: sandbox.vmm_meta.owner_id.clone(),
             pid: sandbox.vmm_meta.pid,
             api_socket: sandbox.vmm_meta.api_socket.clone(),
             vsock_socket: sandbox.vmm_meta.vsock_socket.clone(),
             vsock_cid: sandbox.vmm_meta.vsock_cid,
+            subnet: None,
         };
         self.vmm.stop(&handle, StopMode::Force).await?;
 
@@ -262,7 +369,7 @@ impl NodeAgent {
         self.reservations.lock().await.remove(id);
         #[cfg(target_os = "linux")]
         if let Some(firewall) = &self.firewall
-            && let Err(error) = firewall.teardown_sandbox_network(id).await
+            && let Err(error) = firewall.teardown_sandbox_network(id, None).await
         {
             tracing::warn!(sandbox_id = id, error = %error, "network teardown failed");
         }
@@ -558,29 +665,321 @@ impl NodeAgent {
         ))
     }
 
+    /// 在 guest 启动长生命周期进程（可选 stdin/PTY），返回 guest pid 与输出
+    /// 事件接收端。帧 id 由调用方生成，供后续 `process_control` 寻址。
+    #[cfg(target_os = "linux")]
+    #[allow(clippy::too_many_arguments)]
+    pub async fn process_start_stream(
+        &self,
+        sandbox_id: &str,
+        frame_id: &str,
+        argv: Vec<String>,
+        env: std::collections::HashMap<String, String>,
+        cwd: Option<String>,
+        timeout_ms: u64,
+        stdin: bool,
+        pty: Option<clouisle_proto::PtyConfig>,
+    ) -> Result<
+        (
+            u32,
+            tokio::sync::mpsc::Receiver<std::result::Result<NodeExecEvent, tonic::Status>>,
+        ),
+        ClouisleError,
+    > {
+        use clouisle_proto::Frame;
+        use clouisle_proto::codec::{read_frame, write_frame};
+        if argv.is_empty() {
+            return Err(ClouisleError::validation("argv empty"));
+        }
+        let mut stream = self.guest_frame_connection(sandbox_id).await?;
+        write_frame(
+            &mut stream,
+            &Frame::ProcessStart {
+                id: frame_id.to_string(),
+                argv,
+                env,
+                cwd,
+                timeout_ms,
+                stdin,
+                pty,
+            },
+        )
+        .await
+        .map_err(|error| ClouisleError::io(format!("send guest ProcessStart: {error}")))?;
+        let started = read_frame(&mut stream)
+            .await
+            .map_err(|error| ClouisleError::io(format!("read guest ProcessStarted: {error}")))?;
+        let pid = match started {
+            Frame::ProcessStarted { id, pid } if id == frame_id => pid,
+            Frame::Error { message, .. } => {
+                return Err(ClouisleError::new(ErrorKind::Vmm, message));
+            }
+            other => {
+                return Err(ClouisleError::invalid_state(format!(
+                    "unexpected frame for ProcessStart: {other:?}"
+                )));
+            }
+        };
+        let (event_tx, event_rx) = tokio::sync::mpsc::channel(32);
+        let id = frame_id.to_string();
+        tokio::spawn(async move {
+            loop {
+                match read_frame(&mut stream).await {
+                    Ok(Frame::Stdout { id: frame, chunk }) if frame == id => {
+                        if event_tx
+                            .send(Ok(NodeExecEvent::Stdout(chunk)))
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                    Ok(Frame::Stderr { id: frame, chunk }) if frame == id => {
+                        if event_tx
+                            .send(Ok(NodeExecEvent::Stderr(chunk)))
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                    Ok(Frame::Exited { id: frame, code }) if frame == id => {
+                        let _ = event_tx.send(Ok(NodeExecEvent::Exit(code))).await;
+                        return;
+                    }
+                    Ok(Frame::Error { message, .. }) => {
+                        let _ = event_tx.send(Err(tonic::Status::internal(message))).await;
+                        return;
+                    }
+                    Ok(_) | Err(_) => return,
+                }
+            }
+        });
+        Ok((pid, event_rx))
+    }
+
+    /// 对运行中进程执行单发控制（stdin/EOF/信号/PTY resize）。
+    #[cfg(target_os = "linux")]
+    pub async fn process_control(
+        &self,
+        sandbox_id: &str,
+        frame_id: &str,
+        op: ProcessControlOp,
+    ) -> Result<(), ClouisleError> {
+        use clouisle_proto::Frame;
+        use clouisle_proto::codec::{read_frame, write_frame};
+        let mut stream = self.guest_frame_connection(sandbox_id).await?;
+        let frame = match op {
+            ProcessControlOp::Stdin(chunk) => Frame::Stdin {
+                id: frame_id.to_string(),
+                chunk,
+            },
+            ProcessControlOp::StdinEof => Frame::StdinEof {
+                id: frame_id.to_string(),
+            },
+            ProcessControlOp::Signal(signal) => Frame::Signal {
+                id: frame_id.to_string(),
+                signal,
+            },
+            ProcessControlOp::Resize { cols, rows } => Frame::Resize {
+                id: frame_id.to_string(),
+                cols,
+                rows,
+            },
+        };
+        write_frame(&mut stream, &frame)
+            .await
+            .map_err(|error| ClouisleError::io(format!("send guest control frame: {error}")))?;
+        match read_frame(&mut stream)
+            .await
+            .map_err(|error| ClouisleError::io(format!("read guest control ack: {error}")))?
+        {
+            Frame::ControlOk => Ok(()),
+            Frame::Error { message, .. } => Err(ClouisleError::new(ErrorKind::Vmm, message)),
+            other => Err(ClouisleError::invalid_state(format!(
+                "unexpected frame for process control: {other:?}"
+            ))),
+        }
+    }
+
+    /// 建立到 guest agent 的帧连接并完成 Hello 握手。
+    #[cfg(target_os = "linux")]
+    async fn guest_frame_connection(
+        &self,
+        sandbox_id: &str,
+    ) -> Result<tokio::io::BufStream<tokio::net::TcpStream>, ClouisleError> {
+        use clouisle_proto::Frame;
+        use clouisle_proto::codec::{read_frame, write_frame};
+        let sandbox = self
+            .sandboxes
+            .read()
+            .await
+            .get(sandbox_id)
+            .cloned()
+            .ok_or_else(|| {
+                ClouisleError::not_found(format!("sandbox {sandbox_id} not on this node"))
+            })?;
+        if !sandbox.is_executable() {
+            return Err(ClouisleError::invalid_state(format!(
+                "sandbox {sandbox_id} is not running (status={})",
+                sandbox.status
+            )));
+        }
+        let address = format!("{}:5201", clouisle_net::netns::guest_ip(sandbox_id))
+            .parse::<std::net::SocketAddr>()
+            .map_err(|error| ClouisleError::io(format!("invalid guest address: {error}")))?;
+        let stream = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            tokio::net::TcpStream::connect(address),
+        )
+        .await
+        .map_err(|_| ClouisleError::timeout("guest agent connect timed out"))?
+        .map_err(|error| ClouisleError::io(format!("connect guest agent: {error}")))?;
+        let mut stream = tokio::io::BufStream::new(stream);
+        write_frame(
+            &mut stream,
+            &Frame::Hello {
+                agent_version: env!("CARGO_PKG_VERSION").to_string(),
+            },
+        )
+        .await
+        .map_err(|error| ClouisleError::io(format!("send guest hello: {error}")))?;
+        if !matches!(
+            read_frame(&mut stream)
+                .await
+                .map_err(|error| ClouisleError::io(format!("read guest hello: {error}")))?,
+            Frame::Hello { .. }
+        ) {
+            return Err(ClouisleError::invalid_state("guest did not return Hello"));
+        }
+        Ok(stream)
+    }
+
     /// 恢复：从 store 加载本节点沙盒（重启后接管）。
+    /// Restore only runtimes that still answer their persisted VMM probe.
     pub async fn reconcile_from_store(&self, store: &dyn Store) -> usize {
         let all = store.list_sandboxes(None).await.unwrap_or_default();
-        let mine: Vec<Sandbox> = all
+        let known_runtime_ids = all
+            .iter()
+            .filter(|sandbox| {
+                sandbox.status.is_active()
+                    && (sandbox.node_id.as_deref() == Some(self.config.node_id.as_str())
+                        // 本地 API 直连沙盒（node_id 未指派）也由本机 VMM 管理，
+                        // 共享 socket 目录时不得作为孤儿回收。
+                        || sandbox.node_id.is_none())
+            })
+            .map(|sandbox| {
+                sandbox
+                    .vmm_meta
+                    .vmm_id
+                    .clone()
+                    .unwrap_or_else(|| sandbox.id.clone())
+            })
+            .collect::<std::collections::HashSet<_>>();
+        for runtime in self.vmm.discover().await.unwrap_or_default() {
+            if !known_runtime_ids.contains(&runtime.id) {
+                tracing::warn!(runtime_id = %runtime.id, "stopping orphan runtime discovered during node recovery");
+                let _ = self.vmm.stop(&runtime, StopMode::Force).await;
+            }
+        }
+        let mine = all
             .into_iter()
-            .filter(|s| s.node_id.as_deref() == Some(self.config.node_id.as_str()))
-            .filter(|s| s.status.is_active())
-            .collect();
-        let count = mine.len();
-        let mut reservations = self.reservations.lock().await;
-        let mut sandboxes = self.sandboxes.write().await;
+            .filter(|sandbox| sandbox.node_id.as_deref() == Some(self.config.node_id.as_str()))
+            .filter(|sandbox| sandbox.status.is_active())
+            .collect::<Vec<_>>();
+        let mut restored = 0usize;
         for sandbox in mine {
+            let handle = VmHandle {
+                id: sandbox
+                    .vmm_meta
+                    .vmm_id
+                    .clone()
+                    .unwrap_or_else(|| sandbox.id.clone()),
+                backend: sandbox.vmm_meta.backend.clone(),
+                owner_id: sandbox.vmm_meta.owner_id.clone(),
+                pid: sandbox.vmm_meta.pid,
+                api_socket: sandbox.vmm_meta.api_socket.clone(),
+                vsock_socket: sandbox.vmm_meta.vsock_socket.clone(),
+                vsock_cid: sandbox.vmm_meta.vsock_cid,
+                subnet: None,
+            };
+            let alive = self.vmm.probe(&handle).await.unwrap_or(false);
+            if !alive {
+                let message = "runtime probe failed during node recovery";
+                if let Err(error) = store
+                    .update_sandbox_status_message(
+                        &sandbox.id,
+                        &SandboxStatus::Error,
+                        Some(message),
+                    )
+                    .await
+                {
+                    tracing::error!(sandbox_id = %sandbox.id, %error, "cannot persist recovery failure");
+                }
+                self.reservations.lock().await.remove(&sandbox.id);
+                self.sandboxes.write().await.remove(&sandbox.id);
+                continue;
+            }
+            if self.sandboxes.read().await.contains_key(&sandbox.id) {
+                continue;
+            }
             match self.pool.admit(&sandbox.spec).await {
                 Ok(reservation) => {
-                    reservations.insert(sandbox.id.clone(), reservation);
-                    sandboxes.insert(sandbox.id.clone(), sandbox);
+                    self.reservations
+                        .lock()
+                        .await
+                        .insert(sandbox.id.clone(), reservation);
+                    let mut adopted = sandbox.clone();
+                    #[cfg(target_os = "linux")]
+                    if sandbox.status == SandboxStatus::Starting {
+                        adopted.status = SandboxStatus::Running;
+                    }
+                    self.sandboxes
+                        .write()
+                        .await
+                        .insert(sandbox.id.clone(), adopted);
+                    #[cfg(target_os = "linux")]
+                    if self.vmm.requires_guest_agent()
+                        && sandbox.status != SandboxStatus::Paused
+                        && let Err(error) = self
+                            .file_op(&sandbox.id, clouisle_proto::Frame::Ping)
+                            .await
+                            .and_then(|frame| match frame {
+                                clouisle_proto::Frame::Pong => Ok(()),
+                                _ => Err(ClouisleError::invalid_state(
+                                    "guest ping returned an unexpected frame",
+                                )),
+                            })
+                    {
+                        let message = format!("guest probe failed during node adoption: {error}");
+                        let _ = store
+                            .update_sandbox_status_message(
+                                &sandbox.id,
+                                &SandboxStatus::Error,
+                                Some(&message),
+                            )
+                            .await;
+                        self.sandboxes.write().await.remove(&sandbox.id);
+                        self.reservations.lock().await.remove(&sandbox.id);
+                        continue;
+                    }
+                    if sandbox.status == SandboxStatus::Starting {
+                        let _ = store
+                            .update_sandbox_status_message(
+                                &sandbox.id,
+                                &SandboxStatus::Running,
+                                None,
+                            )
+                            .await;
+                    }
+                    restored += 1;
                 }
                 Err(error) => {
-                    tracing::error!(sandbox_id = %sandbox.id, %error, "cannot restore sandbox reservation")
+                    tracing::error!(sandbox_id = %sandbox.id, %error, "cannot restore sandbox reservation");
                 }
             }
         }
-        count
+        restored
     }
 }
 
@@ -614,10 +1013,12 @@ mod tests {
             Ok(VmHandle {
                 id: uuid::Uuid::now_v7().to_string(),
                 backend: "test".into(),
+                owner_id: None,
                 pid: None,
                 api_socket: None,
                 vsock_socket: None,
                 vsock_cid: None,
+                subnet: None,
             })
         }
         async fn probe(&self, _: &VmHandle) -> clouisle_core::Result<bool> {
@@ -649,10 +1050,12 @@ mod tests {
             Ok(VmHandle {
                 id: uuid::Uuid::now_v7().to_string(),
                 backend: "test".into(),
+                owner_id: None,
                 pid: None,
                 api_socket: None,
                 vsock_socket: None,
                 vsock_cid: None,
+                subnet: None,
             })
         }
         async fn stop(&self, _: &VmHandle, _m: StopMode) -> clouisle_core::Result<()> {
@@ -661,6 +1064,10 @@ mod tests {
         async fn stats(&self, _: &VmHandle) -> clouisle_core::Result<VmStats> {
             Ok(VmStats::default())
         }
+        fn requires_guest_agent(&self) -> bool {
+            false
+        }
+
         fn capabilities(&self) -> VmmCapabilities {
             VmmCapabilities {
                 snapshot: true,
@@ -764,16 +1171,27 @@ mod tests {
             .await
             .unwrap();
 
-        let restarted = NodeAgent::new(
-            config(),
-            Arc::new(TestVmm {
-                probe_alive: false,
-            }),
-        );
+        let restarted = NodeAgent::new(config(), Arc::new(TestVmm { probe_alive: false }));
         assert_eq!(restarted.reconcile_from_store(&store).await, 0);
         let persisted = store.get_sandbox(&sandbox.id).await.unwrap();
         assert_eq!(persisted.status, SandboxStatus::Error);
         assert!(persisted.terminal_message.is_some());
     }
-}
 
+    #[tokio::test]
+    async fn repeated_reconciliation_does_not_duplicate_reservations() {
+        let store = InMemoryStore::new();
+        let creator = NodeAgent::new(config(), Arc::new(TestVmm::default()));
+        creator
+            .create_sandbox(SandboxSpec::default(), &store)
+            .await
+            .unwrap();
+
+        let restarted = NodeAgent::new(config(), Arc::new(TestVmm::default()));
+        assert_eq!(restarted.reconcile_from_store(&store).await, 1);
+        assert_eq!(restarted.reconcile_from_store(&store).await, 0);
+        let heartbeat = restarted.heartbeat().await;
+        assert_eq!(heartbeat.running_sandboxes.len(), 1);
+        assert_eq!(heartbeat.allocated_vcpu, 1);
+    }
+}

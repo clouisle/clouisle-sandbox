@@ -56,12 +56,43 @@ fn host_table_name(sandbox_id: &str) -> String {
 ///
 /// TAP 到 veth 的二层转发不会稳定经过 guest netns 的 IP forward hook；宿主 veth
 /// 是该流量进入三层转发的可靠边界。
+/// Configure host egress with no additional deny rules.
 pub fn setup_host_egress(sandbox_id: &str) -> Result<()> {
+    setup_host_egress_with_policy(sandbox_id, &[], &[])
+}
+
+/// Configure host egress with validated IPv4 allow and deny rules.
+pub fn setup_host_egress_with_deny(sandbox_id: &str, deny_egress: &[String]) -> Result<()> {
+    setup_host_egress_with_policy(sandbox_id, &[], deny_egress)
+}
+
+pub fn setup_host_egress_with_policy(
+    sandbox_id: &str,
+    allow_egress: &[String],
+    deny_egress: &[String],
+) -> Result<()> {
     use std::io::Write;
     use std::process::Stdio;
 
     let table = host_table_name(sandbox_id);
     let veth = crate::netns::short_name(sandbox_id, "vh");
+    let mut allow_rules = String::new();
+    for rule in allow_egress.iter().filter(|rule| is_valid_ipv4_cidr(rule)) {
+        allow_rules.push_str(&format!(
+            "        iifname \"{veth}\" ip daddr {rule} accept\n"
+        ));
+    }
+    let mut deny_rules = String::new();
+    for rule in deny_egress {
+        if !is_valid_ipv4_cidr(rule) {
+            return Err(ClouisleError::validation(format!(
+                "deny egress rule is not a valid IPv4 address or CIDR: {rule}"
+            )));
+        }
+        deny_rules.push_str(&format!(
+            "        iifname \"{veth}\" ip daddr {rule} drop\n"
+        ));
+    }
     let ruleset = format!(
         r#"
 table ip {table} {{
@@ -70,7 +101,7 @@ table ip {table} {{
         iifname "{veth}" ip daddr 10.0.0.0/8 accept
         iifname "{veth}" ip daddr 127.0.0.0/8 accept
         iifname "{veth}" ct state established,related accept
-        iifname "{veth}" drop
+{deny_rules}{allow_rules}        iifname "{veth}" drop
     }}
 }}
 "#
@@ -103,6 +134,16 @@ table ip {table} {{
             ),
         ))
     }
+}
+
+fn is_valid_ipv4_cidr(rule: &str) -> bool {
+    let (address, prefix) = rule
+        .split_once('/')
+        .map_or((rule, None), |(a, p)| (a, Some(p)));
+    if address.parse::<std::net::Ipv4Addr>().is_err() {
+        return false;
+    }
+    prefix.is_none_or(|value| value.parse::<u8>().is_ok_and(|bits| bits <= 32))
 }
 
 /// 在宿主 veth 策略中动态放行 DNS 白名单解析出的 IP。

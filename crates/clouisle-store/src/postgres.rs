@@ -5,7 +5,7 @@
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use clouisle_core::{ExecutionRecord, ExecutionSpec, Sandbox, SandboxStatus, VmmMeta};
+use clouisle_core::{ExecutionRecord, ExecutionSpec, Sandbox, SandboxSpec, SandboxStatus, VmmMeta};
 use tokio_postgres::{Client, NoTls, Row};
 
 use super::store_trait::{Store, StoreError, StoreResult};
@@ -45,10 +45,20 @@ CREATE TABLE IF NOT EXISTS nodes (
     last_heartbeat_ms BIGINT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_nodes_ready ON nodes(status, last_heartbeat_ms);
-";
+ALTER TABLE sandboxes ADD COLUMN IF NOT EXISTS ready_at BIGINT;
+ALTER TABLE sandboxes ADD COLUMN IF NOT EXISTS expires_at BIGINT;
+ALTER TABLE sandboxes ADD COLUMN IF NOT EXISTS terminal_message TEXT;
+ALTER TABLE sandboxes ADD COLUMN IF NOT EXISTS node_id TEXT;
+ALTER TABLE executions ADD COLUMN IF NOT EXISTS timed_out BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE executions ADD COLUMN IF NOT EXISTS stdout_truncated BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE executions ADD COLUMN IF NOT EXISTS stderr_truncated BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE executions ADD COLUMN IF NOT EXISTS node_id TEXT;
+ALTER TABLE nodes ADD COLUMN IF NOT EXISTS last_heartbeat_ms BIGINT NOT NULL DEFAULT 0;
+ ";
 
 /// PostgreSQL 存储。
 pub struct PostgresStore {
+    conn_string: String,
     client: std::sync::Arc<tokio::sync::Mutex<Client>>,
 }
 
@@ -70,8 +80,27 @@ impl PostgresStore {
             .await
             .map_err(|e| StoreError::Internal(format!("postgres schema: {e}")))?;
         Ok(Self {
+            conn_string: conn_string.to_string(),
             client: std::sync::Arc::new(tokio::sync::Mutex::new(client)),
         })
+    }
+
+    /// 取 client；连接已断（`is_closed`）时自动重连（HA 断库恢复）。
+    async fn ensure_client(&self) -> StoreResult<tokio::sync::MutexGuard<'_, Client>> {
+        let mut guard = self.client.lock().await;
+        if guard.is_closed() {
+            let (client, connection) = tokio_postgres::connect(&self.conn_string, NoTls)
+                .await
+                .map_err(|e| StoreError::Internal(format!("postgres reconnect: {e}")))?;
+            tokio::spawn(async move {
+                if let Err(e) = connection.await {
+                    tracing::warn!("postgres connection lost: {e}");
+                }
+            });
+            tracing::info!("postgres reconnected");
+            *guard = client;
+        }
+        Ok(guard)
     }
 
     pub async fn connect_from_env() -> Option<Self> {
@@ -170,7 +199,7 @@ fn exec_from_row(row: &Row) -> StoreResult<ExecutionRecord> {
 #[async_trait]
 impl Store for PostgresStore {
     async fn create_sandbox(&self, sandbox: &Sandbox) -> StoreResult<()> {
-        let client = self.client.lock().await;
+        let client = self.ensure_client().await?;
         let spec_json = serde_json::to_string(&sandbox.spec)
             .map_err(|e| StoreError::Internal(e.to_string()))?;
         let vmm_json = serde_json::to_string(&sandbox.vmm_meta)
@@ -194,29 +223,47 @@ impl Store for PostgresStore {
     }
 
     async fn get_sandbox(&self, id: &str) -> StoreResult<Sandbox> {
-        let client = self.client.lock().await;
-        let row = client.query_opt(
-            "SELECT id,spec_json,status,vmm_meta_json,created_at,updated_at,ready_at,expires_at,terminal_message,node_id FROM sandboxes WHERE id=$1",
-            &[&id],
-        ).await.map_err(|e| StoreError::Internal(e.to_string()))?;
+        let client = self.ensure_client().await?;
+        let row = client
+            .query_opt(
+                "SELECT id,spec_json,status,vmm_meta_json,created_at,updated_at,ready_at,expires_at,terminal_message,node_id FROM sandboxes WHERE id=$1",
+                &[&id],
+            )
+            .await
+            .map_err(|e| StoreError::Internal(e.to_string()))?;
         let row = row.ok_or_else(|| StoreError::NotFound(format!("sandbox {id}")))?;
         row_to_sandbox(&row)
     }
 
     async fn update_sandbox_status(&self, id: &str, status: &SandboxStatus) -> StoreResult<()> {
-        let client = self.client.lock().await;
+        let client = self.ensure_client().await?;
+        let now = Utc::now().timestamp_millis();
+        let ready_at = (*status == SandboxStatus::Running).then_some(now);
         let n = client
             .execute(
-                "UPDATE sandboxes SET status=$1, updated_at=$2 WHERE id=$3",
-                &[
-                    &status.as_str().to_string(),
-                    &Utc::now().timestamp_millis(),
-                    &id,
-                ],
+                "UPDATE sandboxes SET status=$1, ready_at=COALESCE(ready_at,$2), updated_at=$3 WHERE id=$4",
+                &[&status.as_str().to_string(), &ready_at, &now, &id],
             )
             .await
             .map_err(|e| StoreError::Internal(e.to_string()))?;
         if n == 0 {
+            return Err(StoreError::NotFound(format!("sandbox {id}")));
+        }
+        Ok(())
+    }
+
+    async fn update_sandbox_spec(&self, id: &str, spec: &SandboxSpec) -> StoreResult<()> {
+        let client = self.ensure_client().await?;
+        let spec_json =
+            serde_json::to_string(spec).map_err(|error| StoreError::Internal(error.to_string()))?;
+        let updated = client
+            .execute(
+                "UPDATE sandboxes SET spec_json=$1, updated_at=$2 WHERE id=$3",
+                &[&spec_json, &Utc::now().timestamp_millis(), &id],
+            )
+            .await
+            .map_err(|error| StoreError::Internal(error.to_string()))?;
+        if updated == 0 {
             return Err(StoreError::NotFound(format!("sandbox {id}")));
         }
         Ok(())
@@ -228,16 +275,13 @@ impl Store for PostgresStore {
         status: &SandboxStatus,
         message: Option<&str>,
     ) -> StoreResult<()> {
-        let client = self.client.lock().await;
+        let client = self.ensure_client().await?;
+        let now = Utc::now().timestamp_millis();
+        let ready_at = (*status == SandboxStatus::Running).then_some(now);
         let updated = client
             .execute(
-                "UPDATE sandboxes SET status=$1, terminal_message=$2, updated_at=$3 WHERE id=$4",
-                &[
-                    &status.as_str().to_string(),
-                    &message,
-                    &Utc::now().timestamp_millis(),
-                    &id,
-                ],
+                "UPDATE sandboxes SET status=$1, terminal_message=$2, ready_at=COALESCE(ready_at,$3), updated_at=$4 WHERE id=$5",
+                &[&status.as_str().to_string(), &message, &ready_at, &now, &id],
             )
             .await
             .map_err(|error| StoreError::Internal(error.to_string()))?;
@@ -248,7 +292,7 @@ impl Store for PostgresStore {
     }
 
     async fn update_sandbox_node(&self, id: &str, node_id: Option<&str>) -> StoreResult<()> {
-        let client = self.client.lock().await;
+        let client = self.ensure_client().await?;
         let updated = client
             .execute(
                 "UPDATE sandboxes SET node_id=$1, updated_at=$2 WHERE id=$3",
@@ -263,7 +307,7 @@ impl Store for PostgresStore {
     }
 
     async fn update_sandbox_vmm_meta(&self, id: &str, vmm_meta: &VmmMeta) -> StoreResult<()> {
-        let client = self.client.lock().await;
+        let client = self.ensure_client().await?;
         let vmm_json =
             serde_json::to_string(vmm_meta).map_err(|e| StoreError::Internal(e.to_string()))?;
         let n = client
@@ -284,7 +328,7 @@ impl Store for PostgresStore {
         id: &str,
         expires_at: Option<chrono::DateTime<chrono::Utc>>,
     ) -> StoreResult<()> {
-        let client = self.client.lock().await;
+        let client = self.ensure_client().await?;
         let updated = client
             .execute(
                 "UPDATE sandboxes SET expires_at=$1, updated_at=$2 WHERE id=$3",
@@ -303,7 +347,7 @@ impl Store for PostgresStore {
     }
 
     async fn list_sandboxes(&self, status: Option<SandboxStatus>) -> StoreResult<Vec<Sandbox>> {
-        let client = self.client.lock().await;
+        let client = self.ensure_client().await?;
         let query = "SELECT id,spec_json,status,vmm_meta_json,created_at,updated_at,ready_at,expires_at,terminal_message,node_id FROM sandboxes";
         let rows = match status {
             Some(s) => {
@@ -321,7 +365,7 @@ impl Store for PostgresStore {
     }
 
     async fn delete_sandbox(&self, id: &str) -> StoreResult<()> {
-        let client = self.client.lock().await;
+        let client = self.ensure_client().await?;
         let n = client
             .execute("DELETE FROM sandboxes WHERE id=$1", &[&id])
             .await
@@ -368,7 +412,7 @@ impl Store for PostgresStore {
     }
 
     async fn save_execution(&self, record: &ExecutionRecord) -> StoreResult<()> {
-        let client = self.client.lock().await;
+        let client = self.ensure_client().await?;
         let spec_json =
             serde_json::to_string(&record.spec).map_err(|e| StoreError::Internal(e.to_string()))?;
         client.execute(
@@ -383,7 +427,7 @@ impl Store for PostgresStore {
     }
 
     async fn get_execution(&self, id: &str) -> StoreResult<ExecutionRecord> {
-        let client = self.client.lock().await;
+        let client = self.ensure_client().await?;
         let row = client.query_opt(
             "SELECT id,sandbox_id,spec_json,exit_code,stdout,stderr,started_at,finished_at,timed_out,stdout_truncated,stderr_truncated,node_id FROM executions WHERE id=$1",
             &[&id],
@@ -393,7 +437,7 @@ impl Store for PostgresStore {
     }
 
     async fn list_executions(&self, sandbox_id: &str) -> StoreResult<Vec<ExecutionRecord>> {
-        let client = self.client.lock().await;
+        let client = self.ensure_client().await?;
         let rows = client.query(
             "SELECT id,sandbox_id,spec_json,exit_code,stdout,stderr,started_at,finished_at,timed_out,stdout_truncated,stderr_truncated,node_id FROM executions WHERE sandbox_id=$1 ORDER BY started_at DESC",
             &[&sandbox_id],

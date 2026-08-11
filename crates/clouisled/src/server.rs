@@ -23,6 +23,7 @@ use proto::{
 };
 
 /// 将 ClouisleError 转为 tonic Status。
+#[allow(clippy::result_large_err)]
 fn to_status(e: ClouisleError) -> Status {
     let code = match e.kind {
         ErrorKind::NotFound => tonic::Code::NotFound,
@@ -32,6 +33,24 @@ fn to_status(e: ClouisleError) -> Status {
         _ => tonic::Code::Internal,
     };
     Status::new(code, e.message)
+}
+
+/// 交互式控制结果 → gRPC ack 帧（成功）或 Status（失败）。
+#[allow(clippy::result_large_err)]
+fn control_response(
+    frame_id: &str,
+    result: std::result::Result<(), ClouisleError>,
+) -> std::result::Result<ExecStream, Status> {
+    match result {
+        Ok(()) => Ok(ExecStream {
+            msg: Some(proto::exec_stream::Msg::ProcessOk(
+                proto::ProcessControlOk {
+                    frame_id: frame_id.to_string(),
+                },
+            )),
+        }),
+        Err(error) => Err(to_status(error)),
+    }
 }
 
 /// NodeService gRPC 实现。
@@ -163,83 +182,239 @@ impl NodeService for NodeServiceImpl {
         request: Request<Streaming<ExecStream>>,
     ) -> Result<Response<Self::ExecStream>, Status> {
         let mut stream = request.into_inner();
-        let mut exec_req: Option<ExecRequest> = None;
-
-        while let Some(msg) = stream
-            .message()
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?
-        {
-            if let Some(ExecStream {
-                msg: Some(proto::exec_stream::Msg::ExecReq(req)),
-            }) = Some(msg)
-            {
-                exec_req = Some(req);
-                break;
-            }
-        }
-
-        let req = match exec_req {
-            Some(r) => r,
-            None => return Err(Status::invalid_argument("no exec request in stream")),
-        };
 
         #[cfg(not(target_os = "linux"))]
         {
-            let _ = req;
             return Err(Status::unimplemented("guest execution requires Linux"));
         }
 
         #[cfg(target_os = "linux")]
         {
-            use crate::agent::NodeExecEvent;
-            use tokio_stream::StreamExt;
+            use crate::agent::{NodeExecEvent, ProcessControlOp};
 
-            let sandbox_id = req.sandbox_id;
-            let task_sandbox_id = sandbox_id.clone();
-            let agent = self.agent.clone();
             let (tx, rx) = tokio::sync::mpsc::channel(32);
-            tokio::spawn(async move {
-                let result = agent
-                    .exec_command_stream(
-                        &task_sandbox_id,
-                        req.argv,
-                        req.env,
-                        if req.cwd.is_empty() {
-                            None
-                        } else {
-                            Some(req.cwd)
-                        },
-                        req.timeout_ms,
-                        tx.clone(),
-                    )
-                    .await;
-                if let Err(error) = result {
-                    let _ = tx.send(Err(to_status(error))).await;
+            let mut sandbox_id = String::new();
+            let mut legacy_exec: Option<ExecRequest> = None;
+
+            // 交互式进程：一个 gRPC 双向流服务一个进程会话。ProcessStart 建立
+            // 会话并启动输出泵；控制消息（stdin/EOF/信号/resize）同步执行并回 ack。
+            let agent = self.agent.clone();
+            let mut started_any = false;
+            while let Some(msg) = stream
+                .message()
+                .await
+                .map_err(|e| Status::internal(e.to_string()))?
+            {
+                match msg.msg {
+                    Some(proto::exec_stream::Msg::ExecReq(req)) => {
+                        sandbox_id = req.sandbox_id.clone();
+                        legacy_exec = Some(req);
+                        break;
+                    }
+                    Some(proto::exec_stream::Msg::ProcessStart(req)) => {
+                        sandbox_id = req.sandbox_id.clone();
+                        let frame_id = req.frame_id.clone();
+                        let result = agent
+                            .process_start_stream(
+                                &sandbox_id,
+                                &frame_id,
+                                req.argv,
+                                req.env,
+                                if req.cwd.is_empty() {
+                                    None
+                                } else {
+                                    Some(req.cwd)
+                                },
+                                req.timeout_ms,
+                                req.stdin,
+                                req.pty.map(|pty| clouisle_proto::PtyConfig {
+                                    cols: pty.cols as u16,
+                                    rows: pty.rows as u16,
+                                }),
+                            )
+                            .await;
+                        match result {
+                            Ok((pid, mut event_rx)) => {
+                                // ack 必须先于任何输出：输出转接任务在 ack 之后启动。
+                                tx.send(Ok(ExecStream {
+                                    msg: Some(proto::exec_stream::Msg::ProcessStarted(
+                                        proto::ProcessStarted {
+                                            frame_id: frame_id.clone(),
+                                            pid,
+                                        },
+                                    )),
+                                }))
+                                .await
+                                .map_err(|e| Status::internal(e.to_string()))?;
+                                let forward_tx = tx.clone();
+                                let forward_sandbox = sandbox_id.clone();
+                                tokio::spawn(async move {
+                                    while let Some(event) = event_rx.recv().await {
+                                        let msg = event.map(|event| match event {
+                                            NodeExecEvent::Stdout(data) => ExecStream {
+                                                msg: Some(proto::exec_stream::Msg::ExecStdout(
+                                                    proto::ExecOutput {
+                                                        sandbox_id: forward_sandbox.clone(),
+                                                        data: data.to_vec(),
+                                                        frame_id: frame_id.clone(),
+                                                    },
+                                                )),
+                                            },
+                                            NodeExecEvent::Stderr(data) => ExecStream {
+                                                msg: Some(proto::exec_stream::Msg::ExecStderr(
+                                                    proto::ExecOutput {
+                                                        sandbox_id: forward_sandbox.clone(),
+                                                        data: data.to_vec(),
+                                                        frame_id: frame_id.clone(),
+                                                    },
+                                                )),
+                                            },
+                                            NodeExecEvent::Exit(exit_code) => ExecStream {
+                                                msg: Some(proto::exec_stream::Msg::ExecExit(
+                                                    proto::ExecExit {
+                                                        sandbox_id: forward_sandbox.clone(),
+                                                        exit_code,
+                                                        frame_id: frame_id.clone(),
+                                                    },
+                                                )),
+                                            },
+                                        });
+                                        if forward_tx.send(msg).await.is_err() {
+                                            break;
+                                        }
+                                    }
+                                });
+                            }
+                            Err(error) => {
+                                tx.send(Err(to_status(error)))
+                                    .await
+                                    .map_err(|e| Status::internal(e.to_string()))?;
+                            }
+                        }
+                        started_any = true;
+                    }
+                    Some(proto::exec_stream::Msg::ProcessInput(req)) => {
+                        let result = agent
+                            .process_control(
+                                &sandbox_id,
+                                &req.frame_id,
+                                ProcessControlOp::Stdin(bytes::Bytes::from(req.data)),
+                            )
+                            .await;
+                        tx.send(control_response(&req.frame_id, result))
+                            .await
+                            .map_err(|e| Status::internal(e.to_string()))?;
+                    }
+                    Some(proto::exec_stream::Msg::ProcessEof(req)) => {
+                        let result = agent
+                            .process_control(&sandbox_id, &req.frame_id, ProcessControlOp::StdinEof)
+                            .await;
+                        tx.send(control_response(&req.frame_id, result))
+                            .await
+                            .map_err(|e| Status::internal(e.to_string()))?;
+                    }
+                    Some(proto::exec_stream::Msg::ProcessSignal(req)) => {
+                        let signal = match clouisle_proto::ProcessSignal::try_from(req.signal as u8)
+                        {
+                            Ok(signal) => signal,
+                            Err(_) => {
+                                let _ = tx
+                                    .send(Err(Status::invalid_argument("unsupported signal")))
+                                    .await;
+                                continue;
+                            }
+                        };
+                        let result = agent
+                            .process_control(
+                                &sandbox_id,
+                                &req.frame_id,
+                                ProcessControlOp::Signal(signal),
+                            )
+                            .await;
+                        tx.send(control_response(&req.frame_id, result))
+                            .await
+                            .map_err(|e| Status::internal(e.to_string()))?;
+                    }
+                    Some(proto::exec_stream::Msg::ProcessResize(req)) => {
+                        let result = agent
+                            .process_control(
+                                &sandbox_id,
+                                &req.frame_id,
+                                ProcessControlOp::Resize {
+                                    cols: req.cols as u16,
+                                    rows: req.rows as u16,
+                                },
+                            )
+                            .await;
+                        tx.send(control_response(&req.frame_id, result))
+                            .await
+                            .map_err(|e| Status::internal(e.to_string()))?;
+                    }
+                    Some(_) | None => continue,
                 }
-            });
-            let stream = tokio_stream::wrappers::ReceiverStream::new(rx).map(move |event| {
-                event.map(|event| match event {
-                    NodeExecEvent::Stdout(data) => ExecStream {
-                        msg: Some(proto::exec_stream::Msg::ExecStdout(proto::ExecOutput {
-                            sandbox_id: sandbox_id.clone(),
-                            data: data.to_vec(),
-                        })),
-                    },
-                    NodeExecEvent::Stderr(data) => ExecStream {
-                        msg: Some(proto::exec_stream::Msg::ExecStderr(proto::ExecOutput {
-                            sandbox_id: sandbox_id.clone(),
-                            data: data.to_vec(),
-                        })),
-                    },
-                    NodeExecEvent::Exit(exit_code) => ExecStream {
-                        msg: Some(proto::exec_stream::Msg::ExecExit(proto::ExecExit {
-                            sandbox_id: sandbox_id.clone(),
-                            exit_code,
-                        })),
-                    },
-                })
-            });
+            }
+
+            if !started_any {
+                let req = match legacy_exec {
+                    Some(r) => r,
+                    None => return Err(Status::invalid_argument("no exec request in stream")),
+                };
+                let task_sandbox_id = req.sandbox_id.clone();
+                let agent = self.agent.clone();
+                let forward_tx = tx.clone();
+                let forward_sandbox = sandbox_id.clone();
+                tokio::spawn(async move {
+                    let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(32);
+                    let pump = tokio::spawn(async move {
+                        agent
+                            .exec_command_stream(
+                                &task_sandbox_id,
+                                req.argv,
+                                req.env,
+                                if req.cwd.is_empty() {
+                                    None
+                                } else {
+                                    Some(req.cwd)
+                                },
+                                req.timeout_ms,
+                                event_tx,
+                            )
+                            .await
+                    });
+                    while let Some(event) = event_rx.recv().await {
+                        let msg = event.map(|event| match event {
+                            NodeExecEvent::Stdout(data) => ExecStream {
+                                msg: Some(proto::exec_stream::Msg::ExecStdout(proto::ExecOutput {
+                                    sandbox_id: forward_sandbox.clone(),
+                                    data: data.to_vec(),
+                                    frame_id: String::new(),
+                                })),
+                            },
+                            NodeExecEvent::Stderr(data) => ExecStream {
+                                msg: Some(proto::exec_stream::Msg::ExecStderr(proto::ExecOutput {
+                                    sandbox_id: forward_sandbox.clone(),
+                                    data: data.to_vec(),
+                                    frame_id: String::new(),
+                                })),
+                            },
+                            NodeExecEvent::Exit(exit_code) => ExecStream {
+                                msg: Some(proto::exec_stream::Msg::ExecExit(proto::ExecExit {
+                                    sandbox_id: forward_sandbox.clone(),
+                                    exit_code,
+                                    frame_id: String::new(),
+                                })),
+                            },
+                        });
+                        if forward_tx.send(msg).await.is_err() {
+                            break;
+                        }
+                    }
+                    if let Ok(Err(error)) = pump.await {
+                        let _ = forward_tx.send(Err(to_status(error))).await;
+                    }
+                });
+            }
+            let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
             Ok(Response::new(Box::pin(stream)))
         }
     }
@@ -305,5 +480,195 @@ impl NodeService for NodeServiceImpl {
                 result: Some(result),
             }))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_trait::async_trait;
+    use clouisle_vmm::{
+        SnapshotKind, SnapshotPaths, StopMode, VmHandle, VmStats, Vmm, VmmCapabilities,
+    };
+    use proto::node_service_client::NodeServiceClient;
+    use tokio_stream::wrappers::ReceiverStream;
+
+    #[derive(Clone)]
+    struct TestVmm;
+
+    #[async_trait]
+    impl Vmm for TestVmm {
+        async fn create(
+            &self,
+            _: &str,
+            _: &clouisle_core::SandboxSpec,
+        ) -> Result<VmHandle, clouisle_core::ClouisleError> {
+            Ok(VmHandle {
+                id: "vm-1".into(),
+                backend: "test".into(),
+                owner_id: None,
+                pid: None,
+                api_socket: None,
+                vsock_socket: None,
+                vsock_cid: None,
+                subnet: None,
+            })
+        }
+        async fn image_cache_hit(
+            &self,
+            _: &clouisle_core::SandboxSpec,
+        ) -> Result<bool, clouisle_core::ClouisleError> {
+            Ok(true)
+        }
+        async fn prefetch_image(
+            &self,
+            _: &clouisle_core::SandboxSpec,
+        ) -> Result<(), clouisle_core::ClouisleError> {
+            Ok(())
+        }
+        async fn probe(&self, _: &VmHandle) -> Result<bool, clouisle_core::ClouisleError> {
+            Ok(true)
+        }
+        async fn start(&self, _: &VmHandle) -> Result<(), clouisle_core::ClouisleError> {
+            Ok(())
+        }
+        async fn pause(&self, _: &VmHandle) -> Result<(), clouisle_core::ClouisleError> {
+            Ok(())
+        }
+        async fn resume(&self, _: &VmHandle) -> Result<(), clouisle_core::ClouisleError> {
+            Ok(())
+        }
+        async fn snapshot(
+            &self,
+            _: &VmHandle,
+            _: SnapshotKind,
+            _: &SnapshotPaths,
+        ) -> Result<(), clouisle_core::ClouisleError> {
+            Ok(())
+        }
+        async fn restore(
+            &self,
+            _: &str,
+            _: &clouisle_core::SandboxSpec,
+            _: &SnapshotPaths,
+        ) -> Result<VmHandle, clouisle_core::ClouisleError> {
+            Ok(VmHandle {
+                id: "vm-1".into(),
+                backend: "test".into(),
+                owner_id: None,
+                pid: None,
+                api_socket: None,
+                vsock_socket: None,
+                vsock_cid: None,
+                subnet: None,
+            })
+        }
+        async fn stop(
+            &self,
+            _: &VmHandle,
+            _: StopMode,
+        ) -> Result<(), clouisle_core::ClouisleError> {
+            Ok(())
+        }
+        async fn stats(&self, _: &VmHandle) -> Result<VmStats, clouisle_core::ClouisleError> {
+            Ok(VmStats::default())
+        }
+        fn capabilities(&self) -> VmmCapabilities {
+            VmmCapabilities {
+                snapshot: false,
+                vsock: true,
+                balloon: false,
+            }
+        }
+    }
+
+    fn test_service() -> NodeServiceImpl {
+        use std::collections::HashMap;
+        let config = crate::agent::NodeAgentConfig {
+            node_id: "node-1".into(),
+            hostname: "node-1".into(),
+            total_vcpu: 8,
+            total_memory_mb: 16384,
+            total_disk_mb: 102400,
+            kvm_available: true,
+            kernel_version: "6.1".into(),
+            firecracker_version: "1.4".into(),
+            labels: HashMap::new(),
+            manage_network: false,
+            heartbeat_secs: 3,
+        };
+        let agent = crate::agent::NodeAgent::new(config, Arc::new(TestVmm));
+        NodeServiceImpl::new(agent, Arc::new(clouisle_store::InMemoryStore::new()))
+    }
+
+    async fn spawn_service() -> String {
+        let service = test_service();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(NodeServiceServer::new(service))
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
+                .await
+        });
+        format!("http://{addr}")
+    }
+
+    /// gRPC 双向流对交互式消息的分发：ProcessStart 对未知沙盒返回错误，
+    /// 验证 oneof 识别、分发与错误传播路径。
+    #[tokio::test]
+    async fn exec_stream_dispatches_process_start_error() {
+        let endpoint = spawn_service().await;
+        let mut client = NodeServiceClient::connect(endpoint).await.unwrap();
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        tx.send(proto::ExecStream {
+            msg: Some(proto::exec_stream::Msg::ProcessStart(proto::ProcessStart {
+                sandbox_id: "missing-sandbox".into(),
+                frame_id: "frame-1".into(),
+                argv: vec!["echo".into(), "hi".into()],
+                env: Default::default(),
+                cwd: String::new(),
+                timeout_ms: 5000,
+                stdin: false,
+                pty: None,
+            })),
+        })
+        .await
+        .unwrap();
+        drop(tx);
+        let response = client
+            .exec(tonic::Request::new(ReceiverStream::new(rx)))
+            .await
+            .unwrap();
+        let mut stream = response.into_inner();
+        let status = match stream.message().await {
+            Ok(Some(msg)) => panic!("expected NotFound error, got message {msg:?}"),
+            Ok(None) => panic!("stream ended without error"),
+            Err(status) => status,
+        };
+        assert_eq!(status.code(), tonic::Code::NotFound);
+    }
+
+    /// 控制消息（stdin）对未知进程返回错误帧。
+    #[tokio::test]
+    async fn exec_stream_dispatches_process_control_error() {
+        let endpoint = spawn_service().await;
+        let mut client = NodeServiceClient::connect(endpoint).await.unwrap();
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        tx.send(proto::ExecStream {
+            msg: Some(proto::exec_stream::Msg::ProcessInput(proto::ProcessInput {
+                frame_id: "frame-1".into(),
+                data: b"hello".to_vec(),
+            })),
+        })
+        .await
+        .unwrap();
+        drop(tx);
+        // 孤立控制帧（无先行的 ProcessStart 会话）在握手阶段被拒绝。
+        let error = client
+            .exec(tonic::Request::new(ReceiverStream::new(rx)))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
     }
 }

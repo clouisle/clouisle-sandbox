@@ -7,10 +7,14 @@ use serde::Serialize;
 
 use clouisle_core::{ClouisleError, ErrorKind};
 
-/// 统一错误响应体。
+/// 统一错误响应体：嵌套 `error` 供自定义 API 客户端，顶层 `code`/`message`
+/// 供官方 E2B SDK（其 Error schema 在顶层读取）。
 #[derive(Serialize)]
 pub struct ErrorResponse {
     pub error: ErrorBody,
+    pub code: String,
+    pub message: String,
+    pub details: serde_json::Value,
 }
 
 #[derive(Serialize)]
@@ -32,10 +36,15 @@ pub fn into_error_response(e: ClouisleError) -> (StatusCode, Json<ErrorResponse>
         ErrorKind::QuotaExceeded => StatusCode::TOO_MANY_REQUESTS,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     };
+    let code = e.kind.to_string();
+    let message = e.message;
     let body = ErrorResponse {
+        code: code.clone(),
+        message: message.clone(),
+        details: serde_json::Value::Null,
         error: ErrorBody {
-            code: e.kind.to_string(),
-            message: e.message,
+            code,
+            message,
             details: serde_json::Value::Null,
         },
     };
@@ -56,6 +65,9 @@ pub fn validation_errors(errors: &[clouisle_core::ValidationError]) -> Response 
             message: "request validation failed".to_string(),
             details: serde_json::json!({ "errors": errors }),
         },
+        code: "VALIDATION".into(),
+        message: "request validation failed".to_string(),
+        details: serde_json::json!({ "errors": errors }),
     };
     (StatusCode::BAD_REQUEST, Json(body)).into_response()
 }
@@ -72,6 +84,23 @@ impl From<ClouisleError> for ApiError {
 impl From<clouisle_store::StoreError> for ApiError {
     fn from(e: clouisle_store::StoreError) -> Self {
         ApiError(ClouisleError::from(e))
+    }
+}
+
+impl From<crate::e2b_cloud::ControlPlaneError> for ApiError {
+    fn from(error: crate::e2b_cloud::ControlPlaneError) -> Self {
+        use crate::e2b_cloud::ControlPlaneError;
+        let mapped = match error {
+            ControlPlaneError::NotFound(message) => ClouisleError::not_found(message),
+            ControlPlaneError::Conflict(message) => ClouisleError::invalid_state(message),
+            ControlPlaneError::Validation(message) => ClouisleError::validation(message),
+            ControlPlaneError::Persistence(message) => ClouisleError::with_source(
+                ErrorKind::Store,
+                message,
+                std::io::Error::other("E2B control-plane persistence failure"),
+            ),
+        };
+        ApiError(mapped)
     }
 }
 

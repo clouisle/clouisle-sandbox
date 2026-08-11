@@ -3,7 +3,9 @@
 use serde::{Deserialize, Serialize};
 
 use crate::resources::{Resources, ValidationError};
-use crate::sandbox::{ImageRef, MountSpec, NetworkConfig, RestartPolicy, SecretSpec};
+use crate::sandbox::{
+    ImageRef, MountSpec, NetworkConfig, RestartPolicy, SecretSpec, VolumeMountSpec,
+};
 
 /// 创建沙盒的规格。对应 `POST /api/v1/sandboxes` 的请求体。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -15,6 +17,8 @@ pub struct SandboxSpec {
     pub network: NetworkConfig,
     #[serde(default)]
     pub mounts: Vec<MountSpec>,
+    #[serde(default)]
+    pub volume_mounts: Vec<VolumeMountSpec>,
     #[serde(default)]
     pub secrets: Vec<SecretSpec>,
     /// 沙盒租期（秒），到期强制销毁。None = 永不过期。
@@ -30,6 +34,12 @@ pub struct SandboxSpec {
     /// sandbox is exposed as running.
     #[serde(default)]
     pub init_command: Vec<String>,
+    /// Environment variables applied only to the initialization command.
+    #[serde(default)]
+    pub init_env: std::collections::HashMap<String, String>,
+    /// Guest working directory for the initialization command.
+    #[serde(default)]
+    pub init_cwd: Option<String>,
     /// Maximum time allowed for the initialization command.
     #[serde(default = "default_init_timeout_ms")]
     pub init_timeout_ms: u64,
@@ -39,6 +49,9 @@ pub struct SandboxSpec {
     /// Pause instead of destroy when the TTL expires.
     #[serde(default)]
     pub auto_pause: bool,
+    /// Whether auto-pause should release guest memory (E2B autoPauseMemory).
+    #[serde(default = "default_true")]
+    pub auto_pause_memory: bool,
     /// Resume a paused sandbox when an execution/file request arrives.
     #[serde(default)]
     pub auto_resume: bool,
@@ -58,6 +71,9 @@ fn default_start_timeout() -> u64 {
 fn default_init_timeout_ms() -> u64 {
     30_000
 }
+fn default_true() -> bool {
+    true
+}
 
 impl Default for SandboxSpec {
     fn default() -> Self {
@@ -66,14 +82,18 @@ impl Default for SandboxSpec {
             resources: Resources::default(),
             network: NetworkConfig::default(),
             mounts: Vec::new(),
+            volume_mounts: Vec::new(),
             secrets: Vec::new(),
             ttl_secs: None,
             start_timeout_secs: 10,
             env: std::collections::HashMap::new(),
             init_command: Vec::new(),
+            init_env: std::collections::HashMap::new(),
+            init_cwd: None,
             init_timeout_ms: default_init_timeout_ms(),
             metadata: std::collections::HashMap::new(),
             auto_pause: false,
+            auto_pause_memory: true,
             auto_resume: false,
             node_selector: std::collections::HashMap::new(),
             restart_policy: RestartPolicy::default(),
@@ -89,6 +109,16 @@ impl SandboxSpec {
 
         if self.image.reference.trim().is_empty() {
             errors.push(ValidationError::new("image", "image is required"));
+        } else if self
+            .image
+            .reference
+            .chars()
+            .any(|c| c == '\0' || c.is_control())
+        {
+            errors.push(ValidationError::new(
+                "image",
+                "image reference must not contain control characters",
+            ));
         }
 
         if let Err(mut resource_errors) = self.resources.validate() {
@@ -106,6 +136,23 @@ impl SandboxSpec {
             errors.push(ValidationError::new(
                 "init_command",
                 "init_command entries must not be empty",
+            ));
+        }
+        if self.init_command.is_empty() && (!self.init_env.is_empty() || self.init_cwd.is_some()) {
+            errors.push(ValidationError::new(
+                "init_command",
+                "init_env and init_cwd require init_command",
+            ));
+        }
+        if self.init_cwd.as_ref().is_some_and(|cwd| {
+            cwd.is_empty()
+                || !cwd.starts_with('/')
+                || cwd.contains('\0')
+                || cwd.split('/').any(|part| part == "..")
+        }) {
+            errors.push(ValidationError::new(
+                "init_cwd",
+                "init_cwd must be an absolute guest path without traversal",
             ));
         }
         if self.init_command.is_empty() && self.init_timeout_ms != default_init_timeout_ms() {
@@ -128,6 +175,35 @@ impl SandboxSpec {
             ));
         }
 
+        for mount in &self.mounts {
+            if mount.source.trim().is_empty()
+                || mount.target.trim().is_empty()
+                || !mount.target.starts_with('/')
+                || mount.source.contains('\0')
+                || mount.target.contains('\0')
+                || mount.source.split('/').any(|part| part == "..")
+                || mount.target.split('/').any(|part| part == "..")
+            {
+                errors.push(ValidationError::new(
+                    "mounts",
+                    "mount source/target must be non-empty and must not escape its root",
+                ));
+            }
+        }
+        for mount in &self.volume_mounts {
+            if mount.name.trim().is_empty()
+                || mount.name.contains(['/', '\\', '\0'])
+                || mount.target.trim().is_empty()
+                || !mount.target.starts_with('/')
+                || mount.target.contains('\0')
+                || mount.target.split('/').any(|part| part == "..")
+            {
+                errors.push(ValidationError::new(
+                    "volume_mounts",
+                    "volume name must be a simple name and target must be an absolute guest path",
+                ));
+            }
+        }
         let mut secret_names = std::collections::HashSet::new();
         for secret in &self.secrets {
             if secret.name.is_empty()
@@ -241,5 +317,49 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    #[test]
+    fn rejects_mount_traversal_and_relative_targets() {
+        let mut spec = valid_spec();
+        spec.mounts = vec![
+            MountSpec {
+                source: "/data/../secrets".into(),
+                target: "/work/secrets".into(),
+                readonly: true,
+            },
+            MountSpec {
+                source: "/data/volume".into(),
+                target: "relative".into(),
+                readonly: false,
+            },
+        ];
+        let errors = spec.validate().unwrap_err();
+        assert_eq!(
+            errors
+                .iter()
+                .filter(|error| error.field == "mounts")
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn missing_auto_pause_memory_defaults_true() {
+        let spec: SandboxSpec =
+            serde_json::from_str(r#"{"image":{"reference":"alpine:latest"}}"#).unwrap();
+        assert!(spec.auto_pause_memory);
+    }
+
+    #[test]
+    fn rejects_control_characters_in_image_reference() {
+        let mut spec = valid_spec();
+        spec.image.reference = "alpine:latest\u{0}bad".into();
+        let errors = spec.validate().unwrap_err();
+        assert!(errors.iter().any(|error| error.field == "image"));
+        // 空串仍被拒绝（回归）。
+        let mut spec = valid_spec();
+        spec.image.reference = "   ".into();
+        assert!(spec.validate().is_err());
     }
 }

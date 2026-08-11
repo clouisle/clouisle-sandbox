@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use clouisle_core::{ExecutionRecord, ExecutionSpec, Sandbox, SandboxStatus, VmmMeta};
+use clouisle_core::{ExecutionRecord, ExecutionSpec, Sandbox, SandboxSpec, SandboxStatus, VmmMeta};
 use rusqlite::{Connection, Row};
 use tokio::sync::Mutex;
 
@@ -59,6 +59,29 @@ CREATE TABLE IF NOT EXISTS nodes (
 CREATE INDEX IF NOT EXISTS idx_nodes_ready ON nodes(status, last_heartbeat_ms);
 ";
 
+fn add_column_if_missing(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+    definition: &str,
+) -> StoreResult<()> {
+    let mut statement = conn
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .map_err(|error| StoreError::Sqlite(error.to_string()))?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(|error| StoreError::Sqlite(error.to_string()))?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|error| StoreError::Sqlite(error.to_string()))?;
+    if !columns.iter().any(|existing| existing == column) {
+        conn.execute_batch(&format!(
+            "ALTER TABLE {table} ADD COLUMN {column} {definition}"
+        ))
+        .map_err(|error| StoreError::Sqlite(error.to_string()))?;
+    }
+    Ok(())
+}
+
 struct RowData {
     id: String,
     spec_json: String,
@@ -95,6 +118,41 @@ impl SqliteStore {
             .map_err(|e| StoreError::Sqlite(e.to_string()))?;
         conn.execute_batch(SCHEMA)
             .map_err(|e| StoreError::Sqlite(e.to_string()))?;
+        add_column_if_missing(
+            &conn,
+            "sandboxes",
+            "vmm_meta_json",
+            "TEXT NOT NULL DEFAULT '{}'",
+        )?;
+        add_column_if_missing(&conn, "sandboxes", "ready_at", "INTEGER")?;
+        add_column_if_missing(&conn, "sandboxes", "expires_at", "INTEGER")?;
+        add_column_if_missing(&conn, "sandboxes", "terminal_message", "TEXT")?;
+        add_column_if_missing(&conn, "sandboxes", "node_id", "TEXT")?;
+        add_column_if_missing(
+            &conn,
+            "executions",
+            "timed_out",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
+        add_column_if_missing(
+            &conn,
+            "executions",
+            "stdout_truncated",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
+        add_column_if_missing(
+            &conn,
+            "executions",
+            "stderr_truncated",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
+        add_column_if_missing(&conn, "executions", "node_id", "TEXT")?;
+        add_column_if_missing(
+            &conn,
+            "nodes",
+            "last_heartbeat_ms",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
         Ok(SqliteStore {
             conn: Arc::new(Mutex::new(conn)),
         })
@@ -196,13 +254,30 @@ impl Store for SqliteStore {
     async fn update_sandbox_status(&self, id: &str, status: &SandboxStatus) -> StoreResult<()> {
         let conn = self.conn.lock().await;
         let now = Utc::now().timestamp_millis();
+        let ready_at = (*status == SandboxStatus::Running).then_some(now);
         let n = conn
             .execute(
-                "UPDATE sandboxes SET status=?1, updated_at=?2 WHERE id=?3",
-                rusqlite::params![status.as_str(), now, id],
+                "UPDATE sandboxes SET status=?1, ready_at=COALESCE(ready_at,?2), updated_at=?3 WHERE id=?4",
+                rusqlite::params![status.as_str(), ready_at, now, id],
             )
             .map_err(|e| StoreError::Sqlite(e.to_string()))?;
         if n == 0 {
+            return Err(StoreError::NotFound(format!("sandbox {id}")));
+        }
+        Ok(())
+    }
+
+    async fn update_sandbox_spec(&self, id: &str, spec: &SandboxSpec) -> StoreResult<()> {
+        let conn = self.conn.lock().await;
+        let spec_json =
+            serde_json::to_string(spec).map_err(|error| StoreError::Internal(error.to_string()))?;
+        let updated = conn
+            .execute(
+                "UPDATE sandboxes SET spec_json=?1, updated_at=?2 WHERE id=?3",
+                rusqlite::params![spec_json, Utc::now().timestamp_millis(), id],
+            )
+            .map_err(|error| StoreError::Sqlite(error.to_string()))?;
+        if updated == 0 {
             return Err(StoreError::NotFound(format!("sandbox {id}")));
         }
         Ok(())
@@ -215,10 +290,12 @@ impl Store for SqliteStore {
         message: Option<&str>,
     ) -> StoreResult<()> {
         let conn = self.conn.lock().await;
+        let now = Utc::now().timestamp_millis();
+        let ready_at = (*status == SandboxStatus::Running).then_some(now);
         let updated = conn
             .execute(
-                "UPDATE sandboxes SET status=?1, terminal_message=?2, updated_at=?3 WHERE id=?4",
-                rusqlite::params![status.as_str(), message, Utc::now().timestamp_millis(), id],
+                "UPDATE sandboxes SET status=?1, terminal_message=?2, ready_at=COALESCE(ready_at,?3), updated_at=?4 WHERE id=?5",
+                rusqlite::params![status.as_str(), message, ready_at, now, id],
             )
             .map_err(|error| StoreError::Sqlite(error.to_string()))?;
         if updated == 0 {
@@ -526,6 +603,33 @@ mod tests {
         assert_eq!(running.len(), 2);
         let all = s.list_sandboxes(None).await.unwrap();
         assert_eq!(all.len(), 5);
+    }
+
+    #[tokio::test]
+    async fn running_status_sets_and_retains_ready_at() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        store
+            .create_sandbox(&make_sandbox("ready-sbx"))
+            .await
+            .unwrap();
+        store
+            .update_sandbox_status("ready-sbx", &SandboxStatus::Running)
+            .await
+            .unwrap();
+        let ready_at = store.get_sandbox("ready-sbx").await.unwrap().ready_at;
+        assert!(ready_at.is_some());
+        store
+            .update_sandbox_status_message(
+                "ready-sbx",
+                &SandboxStatus::Error,
+                Some("failed after start"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            store.get_sandbox("ready-sbx").await.unwrap().ready_at,
+            ready_at
+        );
     }
 
     #[tokio::test]

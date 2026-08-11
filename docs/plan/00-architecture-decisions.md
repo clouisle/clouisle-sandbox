@@ -20,10 +20,16 @@
 
 ### 决策
 
-1. 全部 VMM 交互抽象为 `Vmm` trait（见 ADR-004），提供三个后端：
-   - `MockVmm`——纯内存状态机，macOS 可跑，用于控制平面单元/组件测试
-   - `FirecrackerVmm`——生产后端，Linux only，`#[cfg(target_os = "linux")]`
-   - `DockerVmm`——PRD §8 要求的 fallback，Linux/macOS 均可跑（隔离性弱，仅供无 KVM 环境降级）
+> **2026-08-11 修订（ADR-DEV-01）**：历史 `DockerVmm`/`MockVmm` 生产/降级后端描述已废弃。
+> 生产唯一后端为 `FirecrackerVmm`（无自动降级）；开发后端为显式
+> `DockerDevVmm`（`--backend docker-dev`，仅本地开发、Docker socket 等价宿主权限、
+> 明确不支持快照/iops/带宽/allowlist）；`MockVmm` 仅测试门控。详见
+> `docs/plan/cross-platform-docker-dev-vmm.md`。
+
+1. 全部 VMM 交互抽象为 `Vmm` trait（见 ADR-004），提供后端：
+   - `FirecrackerVmm`——生产唯一后端，Linux only，`#[cfg(target_os = "linux")]`
+   - `DockerDevVmm`——开发后端（`--backend docker-dev`），容器内注入静态 agent 复用帧协议
+   - `MockVmm`——测试用状态机（test/test-utils 门控）
 2. CI 分两条流水线：
    - `ci-portable`：macOS + Linux runner，跑 `cargo test`（含 `mock-vmm` feature）
    - `ci-kvm`：**self-hosted Linux 裸金属或支持嵌套虚拟化的云主机**，跑 `--features kvm-integration`

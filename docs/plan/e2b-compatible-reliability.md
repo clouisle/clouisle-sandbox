@@ -37,7 +37,7 @@
 
 ### 兼容性边界
 
-E2B compatibility layer 以 E2B public OpenAPI 的 sandbox platform endpoints（create/list/get/connect/delete/pause/resume/timeout/refresh/network）和 envd 的 Filesystem/Process Connect endpoints 为协议目标。`templateID` 映射到 OCI image reference；E2B metadata/envVars/network/timeout 映射到现有 `SandboxSpec`。无需引入 E2B 云端域名或控制面依赖。高级模板构建、团队、计费和云卷管理不属于本地 Firecracker runtime protocol，不伪造云端资源；本地相应能力通过镜像预拉取、sandbox snapshot 和 mount 语义提供。
+E2B compatibility layer 以 E2B public OpenAPI 的 sandbox platform endpoints（create/list/get/connect/delete/pause/resume/timeout/refresh/network）和 envd 的 Filesystem/Process Connect endpoints 为协议目标。`templateID` 映射到 OCI image reference；E2B metadata/envVars/network/timeout 映射到现有 `SandboxSpec`。无需引入 E2B 云端域名或控制面依赖。高级模板构建、团队、计费、云卷管理和需要透明 HTTP/TLS 代理的 header transform rules 不属于本地 Firecracker runtime protocol；本地相应能力通过镜像预拉取、sandbox snapshot、mount 语义和 typed validation error 提供，不伪造云端资源或安全策略。
 
 ## Implementation Plan
 
@@ -68,8 +68,8 @@ E2B compatibility layer 以 E2B public OpenAPI 的 sandbox platform endpoints（
 ### Stage 5: E2B platform 与 envd 协议兼容
 
 - **Files modified**: `crates/clouisle-api/src/e2b.rs`, `crates/clouisle-api/src/handlers/e2b.rs`, `crates/clouisle-api/src/handlers/files.rs`, `crates/clouisle-api/src/handlers/exec.rs`, `crates/clouisle-api/src/router.rs`, `README.zh-CN.md`, `README.md`。
-- **Specific logic**: 注册 E2B `/sandboxes`、`/v2/sandboxes`、connect/delete/pause/resume/timeout/refresh/network、`/files` 和 `/filesystem.Filesystem/*`、`/process.Process/*` 路由；实现 `X-API-Key`、`X-Access-Token`、`E2b-Sandbox-Id`/port 和 Connect JSON/SSE 内容协商；统一 E2B camelCase schema、HTTP code 和 error body；E2B `cmd`、`envs`、`cwd` 映射到 exec/init；缺失模板按 OCI reference 明确返回 validation error，不返回假成功。
-- **Validation**: contract tests compare method/path/status/header/body against pinned E2B OpenAPI examples; Python/TypeScript E2B SDK smoke covers create→connect→exec stream→files→pause/resume→kill。
+- **Specific logic**: 注册 E2B `/sandboxes`、`/v2/sandboxes`、connect/delete/pause/resume/timeout/refresh/network、`/files` 和 `/filesystem.Filesystem/*`、`/process.Process/*` 路由；实现 `X-API-Key`、`X-Access-Token`、`E2b-Sandbox-Id`/port 和 Connect JSON/SSE 内容协商；统一 E2B camelCase schema、HTTP code 和 error body；E2B `cmd`、`envs`、`cwd` 映射到 exec/init；缺失模板按 OCI reference 明确返回 validation error，不返回假成功。network 更新持久化 `allowOut`/`denyOut`/`allowInternetAccess`，并实时替换 DNS allowlist 与 host-veth IPv4/CIDR 规则；HTTP header transform rules 无法由本地透明防火墙安全模拟时返回 typed validation error。
+- **Validation**: contract tests compare method/path/status/header/body against pinned E2B OpenAPI examples; Python/TypeScript E2B SDK smoke covers create→connect→exec stream→files→pause/resume→kill; lifecycle tests cover live network allow/deny updates。
 
 ### Stage 6: 故障恢复与自动状态收敛
 

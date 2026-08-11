@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use tokio::sync::RwLock;
 
 use super::store_trait::{Store, StoreError, StoreResult};
-use clouisle_core::{ExecutionRecord, RegisteredNode, Sandbox, SandboxStatus};
+use clouisle_core::{ExecutionRecord, RegisteredNode, Sandbox, SandboxSpec, SandboxStatus};
 
 #[derive(Debug, Clone, Default)]
 pub struct InMemoryStore {
@@ -53,6 +53,16 @@ impl Store for InMemoryStore {
         if *status == SandboxStatus::Running {
             sb.ready_at = Some(sb.updated_at);
         }
+        Ok(())
+    }
+
+    async fn update_sandbox_spec(&self, id: &str, spec: &SandboxSpec) -> StoreResult<()> {
+        let mut map = self.sandboxes.write().await;
+        let sb = map
+            .get_mut(id)
+            .ok_or_else(|| StoreError::NotFound(format!("sandbox {id} not found")))?;
+        sb.spec = spec.clone();
+        sb.updated_at = chrono::Utc::now();
         Ok(())
     }
 

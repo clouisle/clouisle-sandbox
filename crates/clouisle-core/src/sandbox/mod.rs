@@ -45,6 +45,9 @@ pub struct NetworkConfig {
     pub enabled: bool,
     /// 出站域名白名单。空 = 拒绝全部出站。
     pub allow_egress: Vec<String>,
+    /// 出站 IP/CIDR deny rules; allow rules take precedence at the firewall.
+    #[serde(default)]
+    pub deny_egress: Vec<String>,
 }
 
 impl Default for NetworkConfig {
@@ -52,6 +55,7 @@ impl Default for NetworkConfig {
         Self {
             enabled: true,
             allow_egress: Vec::new(),
+            deny_egress: Vec::new(),
         }
     }
 }
@@ -65,6 +69,15 @@ pub struct MountSpec {
     pub target: String,
     /// 是否只读
     pub readonly: bool,
+}
+
+/// E2B control-plane volume mounted at a guest path.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VolumeMountSpec {
+    /// Volume name in the owning tenant.
+    pub name: String,
+    /// Absolute guest destination path.
+    pub target: String,
 }
 
 /// 密钥注入（SR-06）。

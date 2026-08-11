@@ -2,7 +2,9 @@
 
 use async_trait::async_trait;
 
-use clouisle_core::{ClouisleError, ErrorKind, ExecutionRecord, Sandbox, SandboxStatus};
+use clouisle_core::{
+    ClouisleError, ErrorKind, ExecutionRecord, Sandbox, SandboxSpec, SandboxStatus,
+};
 
 pub type StoreResult<T> = std::result::Result<T, StoreError>;
 
@@ -36,6 +38,8 @@ pub trait Store: Send + Sync {
     async fn create_sandbox(&self, sandbox: &Sandbox) -> StoreResult<()>;
     async fn get_sandbox(&self, id: &str) -> StoreResult<Sandbox>;
     async fn update_sandbox_status(&self, id: &str, status: &SandboxStatus) -> StoreResult<()>;
+    /// Replace the persisted network policy for a live sandbox.
+    async fn update_sandbox_spec(&self, id: &str, spec: &SandboxSpec) -> StoreResult<()>;
 
     /// Update lifecycle state and persist a human-readable failure/recovery reason.
     async fn update_sandbox_status_message(

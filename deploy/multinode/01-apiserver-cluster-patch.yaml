@@ -1,0 +1,15 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: apiserver
+  namespace: clouisle
+spec:
+  replicas: 2
+  template:
+    spec:
+      containers:
+        - name: apiserver
+          args:
+            - --addr=0.0.0.0:8080
+            - --db=$(POSTGRES_DSN)
+            - --cluster-scheduling

@@ -58,7 +58,6 @@ pub enum ImageError {
     UnsupportedPlatform(String),
 }
 
-
 impl Default for ImageManager {
     fn default() -> Self {
         Self::new()
@@ -123,7 +122,6 @@ impl ImageManager {
         self
     }
 
-
     /// Pull an OCI image and build an ext4 rootfs, returning its `.ext4` path.
     ///
     /// Concurrent requests for the same tag/digest share one registry/build
@@ -177,24 +175,54 @@ impl ImageManager {
             .map_err(|e| ImageError::InvalidReference(spec.reference.clone(), e.to_string()))?;
 
         debug!(reference = %spec.reference, "pulling platform image manifest");
-        let (manifest, digest) = self
-            .client
-            .pull_image_manifest(&reference, &self.auth)
+        let mut manifest_result = None;
+        for attempt in 0..3 {
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(60),
+                self.client.pull_image_manifest(&reference, &self.auth),
+            )
             .await
+            {
+                Ok(Ok(value)) => {
+                    manifest_result = Some(Ok(value));
+                    break;
+                }
+                Ok(Err(error)) => {
+                    manifest_result = Some(Err(error.to_string()));
+                }
+                Err(_) => {
+                    manifest_result = Some(Err("manifest request timed out".into()));
+                }
+            }
+            if attempt < 2 {
+                tokio::time::sleep(std::time::Duration::from_millis(200 * (attempt + 1))).await;
+            }
+        }
+        let (manifest, digest) = manifest_result
+            .ok_or_else(|| ImageError::Registry("manifest request produced no result".into()))?
             .map_err(|error| {
                 ImageError::Registry(format!("pull platform image manifest: {error}"))
             })?;
 
+        if let Some(expected) = spec.digest.as_deref()
+            && expected != digest
+        {
+            return Err(ImageError::Registry(format!(
+                "requested digest {expected} does not match registry manifest {digest}"
+            )));
+        }
         let image_digest = spec.digest.as_deref().unwrap_or(&digest);
         let key = self.cache_key_for_image(image_digest)?;
         if let Some(path) = self.cached(&key).await {
-            self.write_reference_alias(&spec.reference, image_digest).await?;
+            self.write_reference_alias(&spec.reference, image_digest)
+                .await?;
             return Ok(path);
         }
 
         info!(key = %key, reference = %spec.reference, "building ext4 rootfs");
         let path = self.build(&reference, manifest, &key).await?;
-        self.write_reference_alias(&spec.reference, image_digest).await?;
+        self.write_reference_alias(&spec.reference, image_digest)
+            .await?;
         Ok(path)
     }
 
@@ -232,11 +260,7 @@ impl ImageManager {
         Ok(format!("{image_digest}-agent-{fingerprint}"))
     }
 
-    async fn write_reference_alias(
-        &self,
-        reference: &str,
-        digest: &str,
-    ) -> Result<(), ImageError> {
+    async fn write_reference_alias(&self, reference: &str, digest: &str) -> Result<(), ImageError> {
         tokio::fs::create_dir_all(&self.cache_dir).await?;
         let path = reference_alias_path(&self.cache_dir, reference);
         let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
@@ -277,11 +301,32 @@ impl ImageManager {
             self.inject_agent(agent_path, &rootfs).await?;
         }
 
-        // 生成 ext4。
+        // Generate into a process-unique temporary file, then publish one
+        // complete image atomically. A reader never observes a partial ext4.
         tokio::fs::create_dir_all(&self.cache_dir).await?;
         let ext4_path = cache_path(&self.cache_dir, key);
         let ext4_str = ext4_path.to_string_lossy().into_owned();
-        self.build_ext4(&rootfs, &ext4_path)?;
+        let tmp_path = ext4_path.with_extension(format!(
+            "ext4.tmp-{}-{}",
+            std::process::id(),
+            uuid::Uuid::now_v7()
+        ));
+        let builder = self.clone();
+        let rootfs_for_build = rootfs.clone();
+        let tmp_for_build = tmp_path.clone();
+        if let Err(error) = tokio::task::spawn_blocking(move || {
+            builder.build_ext4(&rootfs_for_build, &tmp_for_build)
+        })
+        .await
+        .map_err(|error| ImageError::FsBuild(format!("ext4 build task failed: {error}")))?
+        {
+            let _ = tokio::fs::remove_file(&tmp_path).await;
+            return Err(error);
+        }
+        if let Err(error) = tokio::fs::rename(&tmp_path, &ext4_path).await {
+            let _ = tokio::fs::remove_file(&tmp_path).await;
+            return Err(ImageError::Io(error));
+        }
 
         // 记入缓存并返回。
         let mut cache = self.cache.write().await;
@@ -300,14 +345,35 @@ impl ImageManager {
     ) -> Result<(), ImageError> {
         let layer_path = work_dir.join(format!("layer-{}", layer.digest.replace(':', "_")));
 
-        // 流式下载 blob 到临时文件。
-        let mut file = tokio::fs::File::create(&layer_path).await?;
-        self.client
-            .pull_blob(reference, layer, &mut file)
+        // Stream each blob into a fresh file for every retry so failed partial
+        // downloads cannot be unpacked as a valid layer.
+        let mut blob_error = None;
+        for attempt in 0..3 {
+            let mut file = tokio::fs::File::create(&layer_path).await?;
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(120),
+                self.client.pull_blob(reference, layer, &mut file),
+            )
             .await
-            .map_err(|e| ImageError::Registry(format!("pull blob {}: {e}", layer.digest)))?;
-        file.flush().await?;
-        drop(file);
+            {
+                Ok(Ok(())) => {
+                    file.flush().await?;
+                    blob_error = None;
+                    break;
+                }
+                Ok(Err(error)) => blob_error = Some(error.to_string()),
+                Err(_) => blob_error = Some("blob request timed out".into()),
+            }
+            if attempt < 2 {
+                tokio::time::sleep(std::time::Duration::from_millis(200 * (attempt + 1))).await;
+            }
+        }
+        if let Some(error) = blob_error {
+            return Err(ImageError::Registry(format!(
+                "pull blob {}: {error}",
+                layer.digest
+            )));
+        }
 
         // 解压 + 展开 tar（CPU/IO 密集，放阻塞线程池）。
         let layer_path = layer_path.to_path_buf();
@@ -467,6 +533,58 @@ fn fingerprint_file(path: &Path) -> Result<String, std::io::Error> {
 }
 
 /// 按 media type 解压并展开 tar 归档到 dst。
+/// Normalize a tar link target against the extraction root. Absolute targets
+/// are anchored at the root (alpine ships `/bin/sh -> /bin/busybox`); relative
+/// targets resolve against the link's parent. A target that pops past the root
+/// is rejected.
+fn normalize_link_target(link: &Path, parent: &Path) -> Result<(), String> {
+    use std::path::Component;
+    let anchored: std::borrow::Cow<'_, Path> = if link.is_absolute() {
+        std::borrow::Cow::Borrowed(link.strip_prefix("/").unwrap_or(link))
+    } else {
+        std::borrow::Cow::Owned(parent.join(link))
+    };
+    let mut depth = 0usize;
+    for component in anchored.components() {
+        match component {
+            Component::CurDir => {}
+            Component::Normal(_) => depth += 1,
+            Component::ParentDir => {
+                if depth == 0 {
+                    return Err(link.display().to_string());
+                }
+                depth -= 1;
+            }
+            Component::RootDir | Component::Prefix(_) => {
+                return Err(link.display().to_string());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// 将 tar 链接名规范化为相对提取根的安全路径（hard link 相对归档根）。
+fn normalized_root_path(link: &Path) -> Result<PathBuf, String> {
+    use std::path::Component;
+    let stripped = link.strip_prefix("/").unwrap_or(link);
+    let mut out = PathBuf::new();
+    for component in stripped.components() {
+        match component {
+            Component::Normal(part) => out.push(part),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !out.pop() {
+                    return Err(link.display().to_string());
+                }
+            }
+            Component::RootDir | Component::Prefix(_) => {
+                return Err(link.display().to_string());
+            }
+        }
+    }
+    Ok(out)
+}
+
 fn extract_tar_archive(src: &Path, dst: &Path, media_type: &str) -> Result<(), String> {
     let file = std::fs::File::open(src).map_err(|e| e.to_string())?;
 
@@ -482,7 +600,93 @@ fn extract_tar_archive(src: &Path, dst: &Path, media_type: &str) -> Result<(), S
     let mut archive = tar::Archive::new(reader);
     archive.set_preserve_permissions(true);
     archive.set_preserve_mtime(true);
-    archive.unpack(dst).map_err(|e| e.to_string())?;
+    let mut pending_hardlinks: Vec<(PathBuf, PathBuf)> = Vec::new();
+    for entry in archive.entries().map_err(|e| e.to_string())? {
+        let mut entry = entry.map_err(|e| e.to_string())?;
+        let path = entry.path().map_err(|e| e.to_string())?.into_owned();
+        use std::path::Component;
+        if path.is_absolute()
+            || path
+                .components()
+                .any(|component| matches!(component, Component::ParentDir | Component::Prefix(_)))
+        {
+            return Err(format!("OCI layer path escapes root: {}", path.display()));
+        }
+        if let Some(link) = entry
+            .header()
+            .entry_type()
+            .is_symlink()
+            .then(|| entry.link_name())
+            .transpose()
+            .map_err(|e| e.to_string())?
+            .flatten()
+        {
+            let parent = path.parent().unwrap_or_else(|| Path::new(""));
+            normalize_link_target(&link, parent)
+                .map_err(|message| format!("OCI symlink escapes root: {message}"))?;
+        }
+        if let Some(link) = entry
+            .header()
+            .entry_type()
+            .is_hard_link()
+            .then(|| entry.link_name())
+            .transpose()
+            .map_err(|e| e.to_string())?
+            .flatten()
+        {
+            // tar 的 hard link 目标可能在其后出现（busybox/python 镜像）：
+            // 先校验相对归档根的规范化路径，延迟到常规条目全部提取后创建。
+            let normalized = normalized_root_path(&link)
+                .map_err(|message| format!("OCI hard link escapes root: {message}"))?;
+            let target = dst.join(&path);
+            if let Some(parent) = target.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+            }
+            pending_hardlinks.push((normalized, target));
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        if name == ".wh..wh..opq" {
+            let target = dst.join(parent);
+            if target.is_dir() {
+                for child in std::fs::read_dir(&target).map_err(|e| e.to_string())? {
+                    let child = child.map_err(|e| e.to_string())?.path();
+                    if child.is_dir() {
+                        std::fs::remove_dir_all(child).map_err(|e| e.to_string())?;
+                    } else {
+                        std::fs::remove_file(child).map_err(|e| e.to_string())?;
+                    }
+                }
+            }
+            continue;
+        }
+        if let Some(removed) = name.strip_prefix(".wh.") {
+            let target = dst.join(parent).join(removed);
+            if target.is_dir() {
+                std::fs::remove_dir_all(target).map_err(|e| e.to_string())?;
+            } else if target.exists() {
+                std::fs::remove_file(target).map_err(|e| e.to_string())?;
+            }
+            continue;
+        }
+        let target = dst.join(&path);
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        entry.unpack(&target).map_err(|e| e.to_string())?;
+    }
+    for (link, target) in pending_hardlinks {
+        let link_display = link.display().to_string();
+        std::fs::hard_link(dst.join(&link), &target).map_err(|e| {
+            format!(
+                "create hard link {} -> {link_display}: {e}",
+                target.display()
+            )
+        })?;
+    }
     Ok(())
 }
 
@@ -670,5 +874,33 @@ mod tests {
 
         // The symlink itself is counted; its directory target is not recursed.
         assert_eq!(dir_size(root.path()).unwrap(), 4);
+    }
+
+    #[test]
+    fn absolute_symlink_within_root_is_allowed() {
+        // alpine: /bin/sh -> /bin/busybox
+        assert!(normalize_link_target(Path::new("/bin/busybox"), Path::new("bin")).is_ok());
+        // /usr/bin/python3 -> /usr/bin/python3.11
+        assert!(
+            normalize_link_target(Path::new("/usr/bin/python3.11"), Path::new("usr/bin")).is_ok()
+        );
+    }
+
+    #[test]
+    fn relative_symlink_within_root_is_allowed() {
+        // debian: /lib64 -> usr/lib64 (relative to /)
+        assert!(normalize_link_target(Path::new("usr/lib64"), Path::new("")).is_ok());
+        // lib/x -> ../y stays within root
+        assert!(normalize_link_target(Path::new("../y"), Path::new("lib")).is_ok());
+    }
+
+    #[test]
+    fn link_escaping_root_is_rejected() {
+        assert!(normalize_link_target(Path::new("../../etc/passwd"), Path::new("a")).is_err());
+        assert!(normalize_link_target(Path::new("/../../etc/passwd"), Path::new("")).is_err());
+        assert!(normalize_link_target(Path::new("../escape"), Path::new("")).is_err());
+        assert!(normalize_link_target(Path::new("/../escape"), Path::new("bin")).is_err());
+        // a/b/../../../etc/passwd pops three levels from depth two.
+        assert!(normalize_link_target(Path::new("../../../etc/passwd"), Path::new("a/b")).is_err());
     }
 }

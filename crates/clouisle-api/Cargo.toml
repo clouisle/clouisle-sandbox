@@ -19,6 +19,7 @@ clouisle-core = { path = "../clouisle-core" }
 clouisle-vmm = { path = "../clouisle-vmm" }
 clouisle-store = { path = "../clouisle-store" }
 clouisle-scheduler = { path = "../clouisle-scheduler" }
+clouisle-pool = { path = "../clouisle-pool" }
 clouisle-proto = { path = "../clouisle-proto" }
 clouisle-obs = { path = "../clouisle-obs" }
 clouisle-net = { path = "../clouisle-net" }
@@ -27,6 +28,8 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+libc.workspace = true
+parking_lot.workspace = true
 async-trait.workspace = true
 tracing.workspace = true
 uuid.workspace = true
@@ -38,6 +41,9 @@ metrics.workspace = true
 metrics-exporter-prometheus.workspace = true
 futures.workspace = true
 bytes.workspace = true
+base64.workspace = true
+sha2.workspace = true
+hex.workspace = true
 chrono.workspace = true
 clap.workspace = true
 tracing-subscriber.workspace = true

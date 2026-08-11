@@ -20,6 +20,9 @@ hyper-util = "0.1"
 http-body-util = "0.1"
 futures.workspace = true
 bytes.workspace = true
+bollard = { version = "0.18", default-features = false, features = ["http", "pipe"] }
+tokio-stream = "0.1"
+tar = "0.4"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 nix = { version = "0.29", features = ["fs", "process", "signal"] }

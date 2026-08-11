@@ -11,8 +11,9 @@ use tokio::sync::RwLock;
 
 use hickory_proto::op::{Message, MessageType, OpCode, ResponseCode};
 use hickory_proto::rr::{Name, RecordType};
-use hickory_resolver::TokioAsyncResolver;
-use hickory_resolver::config::{ResolverConfig, ResolverOpts};
+use hickory_resolver::TokioResolver;
+use hickory_resolver::config::{CLOUDFLARE, ResolverConfig, ResolverOpts};
+use hickory_resolver::net::runtime::TokioRuntimeProvider;
 
 /// 错误类型。
 #[derive(Debug)]
@@ -36,7 +37,7 @@ impl std::error::Error for DnsError {}
 #[derive(Clone)]
 pub struct DnsProxy {
     allowed: Arc<RwLock<HashSet<String>>>,
-    upstream: TokioAsyncResolver,
+    upstream: TokioResolver,
     sandbox_id: Option<String>,
 }
 impl std::fmt::Debug for DnsProxy {
@@ -52,8 +53,13 @@ impl DnsProxy {
 
     /// 创建绑定到指定 netns 的 DNS 代理。
     pub fn with_sandbox(domains: Vec<String>, sandbox_id: impl Into<Option<String>>) -> Self {
-        let upstream =
-            TokioAsyncResolver::tokio(ResolverConfig::cloudflare(), ResolverOpts::default());
+        let upstream = TokioResolver::builder_with_config(
+            ResolverConfig::udp_and_tcp(&CLOUDFLARE),
+            TokioRuntimeProvider::default(),
+        )
+        .with_options(ResolverOpts::default())
+        .build()
+        .expect("hickory resolver build");
         Self {
             allowed: Arc::new(RwLock::new(domains.into_iter().collect())),
             upstream,
@@ -62,11 +68,17 @@ impl DnsProxy {
     }
 
     pub async fn is_allowed(&self, domain: &str) -> bool {
-        let domain = domain.trim_end_matches('.');
+        let domain = domain.trim_end_matches('.').to_ascii_lowercase();
         let allowed = self.allowed.read().await;
-        allowed
-            .iter()
-            .any(|d| domain == d.as_str() || domain.ends_with(&format!(".{d}")))
+        allowed.iter().any(|entry| {
+            let entry = entry.trim_end_matches('.');
+            let entry = entry.strip_prefix("*.").unwrap_or(entry);
+            domain == entry || domain.ends_with(&format!(".{entry}"))
+        })
+    }
+
+    pub async fn replace_allowed(&self, domains: Vec<String>) {
+        *self.allowed.write().await = domains.into_iter().collect();
     }
 
     fn allow_ip(&self, ip: &str) {
@@ -109,11 +121,13 @@ impl DnsProxy {
         let request =
             Message::from_vec(query).map_err(|e| DnsError::Proto(format!("parse query: {e}")))?;
 
-        if request.op_code() != OpCode::Query || request.message_type() != MessageType::Query {
+        if request.metadata.op_code != OpCode::Query
+            || request.metadata.message_type != MessageType::Query
+        {
             return Ok(());
         }
 
-        let question = match request.queries().first() {
+        let question = match request.queries.first() {
             Some(q) => q,
             None => return Ok(()),
         };
@@ -156,7 +170,7 @@ impl DnsProxy {
                         }
                     }
                 } else {
-                    response.set_response_code(ResponseCode::NXDomain);
+                    response.metadata.response_code = ResponseCode::NXDomain;
                 }
             }
             RecordType::AAAA => {
@@ -174,7 +188,7 @@ impl DnsProxy {
                         }
                     }
                 } else {
-                    response.set_response_code(ResponseCode::NXDomain);
+                    response.metadata.response_code = ResponseCode::NXDomain;
                 }
             }
             _ => {}
@@ -184,14 +198,15 @@ impl DnsProxy {
 
     /// 构建 DNS 响应头。
     fn make_response(request: &Message, rcode: ResponseCode) -> Message {
-        let mut response = Message::new();
-        response.set_id(request.id());
-        response.set_message_type(MessageType::Response);
-        response.set_op_code(OpCode::Query);
-        response.set_response_code(rcode);
-        response.set_recursion_desired(true);
-        response.set_recursion_available(true);
-        response.add_queries(request.queries().to_vec());
+        let mut response = Message::new(
+            request.metadata.id,
+            MessageType::Response,
+            request.metadata.op_code,
+        );
+        response.metadata.response_code = rcode;
+        response.metadata.recursion_desired = true;
+        response.metadata.recursion_available = true;
+        response.add_queries(request.queries.clone());
         response
     }
 }
@@ -212,6 +227,14 @@ mod tests {
         let proxy = DnsProxy::new(vec!["python.org".into()]);
         assert!(proxy.is_allowed("files.python.org").await);
         assert!(!proxy.is_allowed("example.com").await);
+    }
+
+    #[tokio::test]
+    async fn wildcard_match() {
+        let proxy = DnsProxy::new(vec!["*.example.com".into()]);
+        assert!(proxy.is_allowed("api.example.com").await);
+        assert!(proxy.is_allowed("example.com").await);
+        assert!(!proxy.is_allowed("example.net").await);
     }
 
     #[tokio::test]

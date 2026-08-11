@@ -66,10 +66,12 @@ impl PoolSlot {
             vm_handle: VmHandle {
                 id: String::new(),
                 backend: String::new(),
+                owner_id: None,
                 pid: None,
                 api_socket: None,
                 vsock_socket: None,
                 vsock_cid: None,
+                subnet: None,
             },
             state: SlotState::Preparing,
             created_at: now,
@@ -126,9 +128,14 @@ impl Pool {
     /// 注册模板并立即预热一个就绪槽位。
     ///
     /// 将 `spec` 记入模板表（供后台补足），并同步创建 + 启动一个 VM，
-    /// 成功则返回 `Ready` 槽位，创建失败返回 `None`。
     pub async fn warm(&self, spec: &SandboxSpec) -> Option<PoolSlot> {
         self.ensure_background().await;
+        if !self.vmm.supports_detached_warm_pool() {
+            if let Err(error) = self.vmm.prefetch_image(spec).await {
+                tracing::warn!(%error, image = %spec.image.reference, "pool image warm-up failed");
+            }
+            return None;
+        }
         let key = spec.pool_key();
         {
             let mut g = self.inner.lock().await;
@@ -174,6 +181,25 @@ impl Pool {
                 _ => Err(PoolError::InvalidState),
             },
         }
+    }
+
+    /// Remove an acquired slot after a provisioning failure instead of
+    /// returning a poisoned VM to the ready pool.
+    pub async fn discard(&self, slot: PoolSlot) -> Result<(), PoolError> {
+        self.ensure_background().await;
+        let removed = {
+            let mut inner = self.inner.lock().await;
+            let Some(index) = inner
+                .slots
+                .iter()
+                .position(|candidate| candidate.id == slot.id)
+            else {
+                return Err(PoolError::SlotNotFound);
+            };
+            inner.slots.remove(index)
+        };
+        let _ = self.vmm.stop(&removed.vm_handle, StopMode::Force).await;
+        Ok(())
     }
 
     /// 当前就绪槽位数。
@@ -315,6 +341,9 @@ async fn health_check(inner: &Arc<Mutex<PoolInner>>, vmm: &Arc<dyn Vmm>) {
 
 /// 补足闲置：当就绪槽位数 < `min_idle` 时，为最缺的模板冷启动一个新 VM。
 async fn replenish(inner: &Arc<Mutex<PoolInner>>, vmm: &Arc<dyn Vmm>) {
+    if !vmm.supports_detached_warm_pool() {
+        return;
+    }
     // 选择要补足的模板：就绪槽不足且当前无冷启动在途。
     let template: Option<(String, SandboxSpec)> = {
         let g = inner.lock().await;
@@ -417,10 +446,12 @@ mod tests {
             Ok(VmHandle {
                 id: uuid::Uuid::now_v7().to_string(),
                 backend: "test".into(),
+                owner_id: None,
                 pid: None,
                 api_socket: None,
                 vsock_socket: None,
                 vsock_cid: None,
+                subnet: None,
             })
         }
         async fn start(&self, _: &VmHandle) -> clouisle_core::Result<()> {
@@ -449,10 +480,12 @@ mod tests {
             Ok(VmHandle {
                 id: uuid::Uuid::now_v7().to_string(),
                 backend: "test".into(),
+                owner_id: None,
                 pid: None,
                 api_socket: None,
                 vsock_socket: None,
                 vsock_cid: None,
+                subnet: None,
             })
         }
         async fn stop(&self, _: &VmHandle, _m: StopMode) -> clouisle_core::Result<()> {

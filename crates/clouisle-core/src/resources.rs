@@ -102,6 +102,15 @@ impl Resources {
             errors.push(ValidationError::new("iops", "iops must be >= 1 if set"));
         }
 
+        if let Some(pids) = self.pids_max
+            && pids == 0
+        {
+            errors.push(ValidationError::new(
+                "pids_max",
+                "pids_max must be >= 1 if set",
+            ));
+        }
+
         if errors.is_empty() {
             Ok(())
         } else {
@@ -166,6 +175,16 @@ mod tests {
         };
         let errs = r.validate().unwrap_err();
         assert!(errs.iter().any(|e| e.field == "vcpu"));
+    }
+
+    #[test]
+    fn resources_pids_max_zero_rejected() {
+        let r = Resources {
+            pids_max: Some(0),
+            ..Resources::default()
+        };
+        let errs = r.validate().unwrap_err();
+        assert!(errs.iter().any(|e| e.field == "pids_max"));
     }
 
     #[test]

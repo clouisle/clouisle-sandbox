@@ -28,6 +28,32 @@ pub enum Frame {
         cwd: Option<String>,
         timeout_ms: u64,
     },
+    /// host 发送：启动长生命周期进程（可选 stdin 与 PTY）。进程输出继续以
+    /// `Stdout`/`Stderr`/`Exited` 帧按 `id` 寻址；控制帧（`Stdin`、`Signal`、
+    /// `Resize`）可在任意连接上按同一 `id` 发送，由 guest 侧全局注册表路由。
+    ProcessStart {
+        id: String,
+        argv: Vec<String>,
+        env: HashMap<String, String>,
+        cwd: Option<String>,
+        timeout_ms: u64,
+        /// 保持 stdin 打开（0 为关闭）。PTY 模式下恒为真。
+        stdin: bool,
+        /// Some 时在 guest 分配 PTY，子进程以该 PTY 为 stdin/stdout/stderr。
+        pty: Option<PtyConfig>,
+    },
+    /// agent -> host: 进程已启动（`pid` 为 guest 侧进程号，供信号投递）。
+    ProcessStarted { id: String, pid: u32 },
+    /// host -> agent: 向进程 stdin 写入一块数据。
+    Stdin { id: String, chunk: Bytes },
+    /// host -> agent: 关闭进程 stdin（EOF）。
+    StdinEof { id: String },
+    /// host -> agent: 向进程进程组投递信号。
+    Signal { id: String, signal: ProcessSignal },
+    /// host -> agent: 调整 PTY 终端尺寸。
+    Resize { id: String, cols: u16, rows: u16 },
+    /// agent -> host: 控制帧（Stdin/StdinEof/Signal/Resize）成功执行。
+    ControlOk,
     /// agent -> host: 标准输出块。
     Stdout { id: String, chunk: Bytes },
     /// agent -> host: 标准错误块。
@@ -64,6 +90,12 @@ pub enum Frame {
     Error { message: String, code: u32 },
     /// 密钥注入（SR-06）。
     SetSecret { name: String, value: Bytes },
+    /// host -> guest: 施加资源限制（cgroup v2）。None 字段不修改。
+    ApplyLimits {
+        pids_max: Option<u32>,
+        /// 保留：guest 内网卡限速（当前由 host netns tc 施加）。
+        bandwidth_mbps: Option<u32>,
+    },
 }
 
 /// 目录条目。
@@ -74,6 +106,41 @@ pub struct DirEntry {
     pub mode: u32,
     pub mtime: i64,
     pub is_dir: bool,
+}
+
+/// PTY 分配配置（进程启动时）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PtyConfig {
+    pub cols: u16,
+    pub rows: u16,
+}
+
+/// 进程信号（与 POSIX 编号一致）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[repr(u8)]
+pub enum ProcessSignal {
+    Sigterm = 15,
+    Sigkill = 9,
+    Sigint = 2,
+}
+
+impl ProcessSignal {
+    pub fn as_i32(self) -> i32 {
+        self as i32
+    }
+}
+
+impl TryFrom<u8> for ProcessSignal {
+    type Error = ();
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            15 => Ok(ProcessSignal::Sigterm),
+            9 => Ok(ProcessSignal::Sigkill),
+            2 => Ok(ProcessSignal::Sigint),
+            _ => Err(()),
+        }
+    }
 }
 
 /// 帧编解码错误。
@@ -204,6 +271,34 @@ mod tests {
             cwd: Some("/tmp".into()),
             timeout_ms: 2000,
         });
+        roundtrip(&Frame::ProcessStart {
+            id: "p-1".into(),
+            argv: vec!["sh".into()],
+            env: Default::default(),
+            cwd: None,
+            timeout_ms: 0,
+            stdin: true,
+            pty: Some(PtyConfig { cols: 80, rows: 24 }),
+        });
+        roundtrip(&Frame::ProcessStarted {
+            id: "p-1".into(),
+            pid: 42,
+        });
+        roundtrip(&Frame::Stdin {
+            id: "p-1".into(),
+            chunk: Bytes::from("data"),
+        });
+        roundtrip(&Frame::StdinEof { id: "p-1".into() });
+        roundtrip(&Frame::Signal {
+            id: "p-1".into(),
+            signal: ProcessSignal::Sigterm,
+        });
+        roundtrip(&Frame::Resize {
+            id: "p-1".into(),
+            cols: 120,
+            rows: 40,
+        });
+        roundtrip(&Frame::ControlOk);
         roundtrip(&Frame::Stdout {
             id: "e-1".into(),
             chunk: Bytes::from("hello\n"),

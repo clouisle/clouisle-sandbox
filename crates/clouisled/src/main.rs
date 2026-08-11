@@ -6,7 +6,7 @@ mod linux {
     use std::sync::Arc;
 
     use clap::Parser;
-    use clouisle_store::SqliteStore;
+    use clouisle_store::{PostgresStore, SqliteStore, Store};
     use clouisle_vmm::{FirecrackerConfig, FirecrackerVmm};
     use clouisled::server::NodeServiceImpl;
     use clouisled::{NodeAgent, NodeAgentConfig};
@@ -86,7 +86,13 @@ mod linux {
             heartbeat_secs: 3,
         };
 
-        let store = Arc::new(SqliteStore::open(&cli.db)?);
+        let store: Arc<dyn Store> =
+            if cli.db.starts_with("postgres://") || cli.db.starts_with("postgresql://") {
+                tracing::info!(db = %cli.db, "connecting node to PostgreSQL metadata store");
+                Arc::new(PostgresStore::connect(&cli.db).await?)
+            } else {
+                Arc::new(SqliteStore::open(&cli.db)?)
+            };
         let firecracker = FirecrackerConfig {
             kernel_path: cli.kernel.into(),
             images_dir: cli.images_dir.into(),
@@ -98,6 +104,8 @@ mod linux {
         let agent = NodeAgent::new(config, vmm);
         let restored = agent.reconcile_from_store(store.as_ref()).await;
         tracing::info!(restored, "reconciled node sandboxes");
+        let reconcile_store = Arc::clone(&store);
+        tokio::spawn(reconcile_loop(agent.clone(), reconcile_store));
         if let Some(control_plane) = cli.control_plane {
             let api_key = cli
                 .control_plane_api_key
@@ -157,6 +165,17 @@ mod linux {
             .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
             .filter(|value| !value.is_empty())
             .unwrap_or_else(|| "unknown".to_string())
+    }
+
+    async fn reconcile_loop(agent: NodeAgent, store: Arc<dyn Store>) {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+        loop {
+            let restored = agent.reconcile_from_store(store.as_ref()).await;
+            if restored > 0 {
+                tracing::debug!(restored, "node reconciliation completed");
+            }
+            interval.tick().await;
+        }
     }
 
     async fn heartbeat_loop(

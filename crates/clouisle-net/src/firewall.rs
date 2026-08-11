@@ -49,7 +49,16 @@ impl FirewallManager {
         &self,
         sandbox_id: &str,
     ) -> Result<(String, String, String), ClouisleError> {
-        let info = netns::create_netns(sandbox_id)?;
+        self.create_network_in_subnet(sandbox_id, None).await
+    }
+
+    /// 用显式子网创建 netns 拓扑（快照预热继承路径）。
+    pub async fn create_network_in_subnet(
+        &self,
+        sandbox_id: &str,
+        subnet: Option<(u16, u16)>,
+    ) -> Result<(String, String, String), ClouisleError> {
+        let info = netns::create_netns_in_subnet(sandbox_id, subnet)?;
         Ok((
             info.ns_name.clone(),
             info.veth_ns.clone(),
@@ -57,24 +66,22 @@ impl FirewallManager {
         ))
     }
 
-    /// 为沙盒配置网络隔离（netns 内 nftables + DNS 代理）。
+    /// 为沙盒配置网络隔离（netns 内 nftables + DNS 代理 + 带宽限速）。
     pub async fn setup_sandbox_network(
         &self,
         sandbox_id: &str,
         veth_host_ip: &str,
         allow_egress: &[String],
+        deny_egress: &[String],
+        bandwidth_mbps: Option<u32>,
     ) -> Result<(), ClouisleError> {
         let ns = netns::ns_name(sandbox_id);
         let veth_ns = netns::short_name(sandbox_id, "vn");
 
-        // 0. 将 Firecracker 创建的 tap0 加入网桥
         netns::attach_tap(sandbox_id)?;
-
-        // 1. guest netns 内规则；宿主 veth 规则捕获桥接后真正的三层出站流量。
         nftables::setup_ruleset(sandbox_id, &ns, &veth_ns, veth_host_ip)?;
-        nftables::setup_host_egress(sandbox_id)?;
-        // 2. DNS 请求经 guest → bridge → host veth 发送；代理必须绑定 host veth 的网关地址，
-        // 而不是 netns bridge 的同地址，否则 ARP 会把请求转发到 host 而不会送达本地 socket。
+        nftables::setup_host_egress_with_policy(sandbox_id, allow_egress, deny_egress)?;
+        netns::apply_bandwidth_limit(sandbox_id, bandwidth_mbps)?;
         let proxy = DnsProxy::with_sandbox(allow_egress.to_vec(), Some(sandbox_id.to_string()));
         let proxy_srv = proxy.clone();
         let dns_addr = veth_host_ip
@@ -92,7 +99,6 @@ impl FirewallManager {
             }
         });
 
-        // 记录 DNS 代理句柄
         self.dns_proxies.lock().await.insert(
             sandbox_id.to_string(),
             DnsHandle {
@@ -100,15 +106,56 @@ impl FirewallManager {
                 cancel: cancel_tx,
             },
         );
-
-        // 记录状态
         self.nets.write().await.insert(sandbox_id.to_string(), ());
-
         Ok(())
     }
 
-    /// 删除沙盒的网络隔离环境。
-    pub async fn teardown_sandbox_network(&self, sandbox_id: &str) -> Result<(), ClouisleError> {
+    /// Replace the DNS and host firewall policy without restarting the sandbox network.
+    pub async fn update_sandbox_network(
+        &self,
+        sandbox_id: &str,
+        enabled: bool,
+        allow_egress: &[String],
+        deny_egress: &[String],
+    ) -> Result<(), ClouisleError> {
+        let proxy = {
+            let proxies = self.dns_proxies.lock().await;
+            proxies
+                .get(sandbox_id)
+                .map(|handle| handle.proxy.clone())
+                .ok_or_else(|| {
+                    ClouisleError::invalid_state(format!(
+                        "sandbox network {sandbox_id} is not active"
+                    ))
+                })?
+        };
+        proxy
+            .replace_allowed(if enabled {
+                allow_egress.to_vec()
+            } else {
+                Vec::new()
+            })
+            .await;
+        nftables::teardown_host_egress(sandbox_id)?;
+        let deny = if enabled {
+            deny_egress.to_vec()
+        } else {
+            vec!["0.0.0.0/0".to_string()]
+        };
+        nftables::setup_host_egress_with_policy(
+            sandbox_id,
+            if enabled { allow_egress } else { &[] },
+            &deny,
+        )
+    }
+
+    /// 删除沙盒的网络隔离环境。`subnet` 为快照继承子网（继承路径用显式子网，
+    /// 否则按 sandbox_id 派生）；None 表示按 sandbox_id 派生。
+    pub async fn teardown_sandbox_network(
+        &self,
+        sandbox_id: &str,
+        subnet: Option<(u16, u16)>,
+    ) -> Result<(), ClouisleError> {
         // 1. 停止 DNS 代理
         if let Some(handle) = self.dns_proxies.lock().await.remove(sandbox_id) {
             let _ = handle.cancel.send(());
@@ -118,7 +165,7 @@ impl FirewallManager {
         let ns = netns::ns_name(sandbox_id);
         let _ = nftables::teardown_ruleset(sandbox_id, &ns);
         let _ = nftables::teardown_host_egress(sandbox_id);
-        let _ = netns::delete_netns(sandbox_id);
+        let _ = netns::delete_netns(sandbox_id, subnet);
 
         // 4. 清理状态
         self.nets.write().await.remove(sandbox_id);
@@ -161,6 +208,8 @@ mod tests {
     async fn setup_teardown_noop() {
         // 在非 Linux 上只验证不 panic
         let mgr = FirewallManager::new();
-        mgr.teardown_sandbox_network("test-sbx").await.unwrap();
+        mgr.teardown_sandbox_network("test-sbx", None)
+            .await
+            .unwrap();
     }
 }

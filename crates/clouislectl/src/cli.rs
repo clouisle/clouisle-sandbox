@@ -15,6 +15,8 @@ pub enum Cli {
         memory_mb: u32,
         #[arg(long)]
         api: Option<String>,
+        #[arg(long, env = "CLOUISLE_API_KEY")]
+        key: Option<String>,
     },
     /// 列出沙盒
     List {
@@ -22,12 +24,16 @@ pub enum Cli {
         status: Option<String>,
         #[arg(long)]
         api: Option<String>,
+        #[arg(long, env = "CLOUISLE_API_KEY")]
+        key: Option<String>,
     },
     /// 删除沙盒
     Delete {
         id: String,
         #[arg(long)]
         api: Option<String>,
+        #[arg(long, env = "CLOUISLE_API_KEY")]
+        key: Option<String>,
     },
     /// 执行命令
     Exec {
@@ -35,11 +41,15 @@ pub enum Cli {
         command: Vec<String>,
         #[arg(long)]
         api: Option<String>,
+        #[arg(long, env = "CLOUISLE_API_KEY")]
+        key: Option<String>,
     },
     /// 健康检查
     Health {
         #[arg(long)]
         api: Option<String>,
+        #[arg(long, env = "CLOUISLE_API_KEY")]
+        key: Option<String>,
     },
 }
 
@@ -52,6 +62,17 @@ impl Cli {
             Cli::Delete { api, .. } => api.clone().unwrap_or_else(|| default.clone()),
             Cli::Exec { api, .. } => api.clone().unwrap_or_else(|| default.clone()),
             Cli::Health { api, .. } => api.clone().unwrap_or_else(|| default.clone()),
+        }
+    }
+
+    /// API key（`--key` 或 `CLOUISLE_API_KEY`），无则空。
+    pub fn api_key(&self) -> Option<String> {
+        match self {
+            Cli::Create { key, .. }
+            | Cli::List { key, .. }
+            | Cli::Delete { key, .. }
+            | Cli::Exec { key, .. }
+            | Cli::Health { key, .. } => key.clone(),
         }
     }
 }

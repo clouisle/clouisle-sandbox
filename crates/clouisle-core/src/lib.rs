@@ -14,6 +14,6 @@ pub use error::{ClouisleError, ErrorKind, Result};
 pub use execution::{ExecutionRecord, ExecutionResult, ExecutionSpec, truncate_output};
 pub use resources::{Resources, ValidationError};
 pub use sandbox::model::VmmMeta;
-pub use sandbox::{ImageRef, MountSpec, NetworkConfig, RestartPolicy, SecretSpec};
+pub use sandbox::{ImageRef, MountSpec, NetworkConfig, RestartPolicy, SecretSpec, VolumeMountSpec};
 pub use sandbox::{Sandbox, SandboxEvent, SandboxSpec, SandboxStatus};
 pub use types::{DirEntry, NodeInfo, NodeStatus, RegisteredNode, TenantId};
