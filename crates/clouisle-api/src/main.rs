@@ -181,6 +181,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             e2b_tokens: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             processes: Arc::new(clouisle_api::state::ProcessRegistry::default()),
             snapshots: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            #[cfg(target_os = "linux")]
             subnet_alloc: clouisle_net::netns::SubnetAllocator::new(),
             provisioning: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
             draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),

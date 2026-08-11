@@ -1133,12 +1133,19 @@ pub async fn fork_sandbox(
     // 必须继承源网段，否则 restore 后 agent 网络不可达。
     // subnet 格式 "10.{a}.{b}.0/30" → 取第 2/3 段。
     let source_subnet = {
-        let net = clouisle_net::netns::subnet(&source.id);
-        let mut parts = net.split('.');
-        parts.next();
-        let a = parts.next().and_then(|v| v.parse::<u16>().ok());
-        let b = parts.next().and_then(|v| v.parse::<u16>().ok());
-        a.zip(b)
+        #[cfg(target_os = "linux")]
+        {
+            let net = clouisle_net::netns::subnet(&source.id);
+            let mut parts = net.split('.');
+            parts.next();
+            let a = parts.next().and_then(|v| v.parse::<u16>().ok());
+            let b = parts.next().and_then(|v| v.parse::<u16>().ok());
+            a.zip(b)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            None
+        }
     };
     let count = body
         .get("count")

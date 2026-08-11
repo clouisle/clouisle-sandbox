@@ -104,6 +104,7 @@ pub async fn create_sandbox(
         ))));
     }
     // docker-dev 后端专属预检（allowlist/资源/restart 限制）。
+    #[cfg(target_os = "linux")]
     if !state.vmm.capabilities().vsock && !state.vmm.capabilities().snapshot {
         clouisle_vmm::docker_dev::validate_dev_spec(&req.spec).map_err(ApiError)?;
     }

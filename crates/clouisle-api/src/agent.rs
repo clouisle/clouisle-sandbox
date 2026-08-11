@@ -4,11 +4,8 @@ use async_trait::async_trait;
 #[cfg(any(test, feature = "test-utils"))]
 use std::sync::Arc;
 
-#[cfg(any(test, feature = "test-utils", target_os = "linux"))]
-use clouisle_core::ClouisleError;
-#[cfg(target_os = "linux")]
-use clouisle_core::ErrorKind;
 use clouisle_core::Result;
+use clouisle_core::{ClouisleError, ErrorKind};
 use clouisle_vmm::VmHandle;
 
 /// 连接器 trait：给定 VMM handle 和 sandbox_id，连接 vsock 并完成 Hello 握手。

@@ -78,6 +78,7 @@ pub struct AppState {
     /// 预热快照池（模板 → 快照 + 固定子网），create 快路径优先使用。
     pub snapshots: Arc<tokio::sync::Mutex<Vec<WarmSnapshot>>>,
     /// 快照预热子网分配器（顺序递增，跨沙盒身份复用）。
+    #[cfg(target_os = "linux")]
     pub subnet_alloc: clouisle_net::netns::SubnetAllocator,
     /// IDs currently being provisioned or recovered; prevents duplicate jobs.
     pub provisioning: Arc<tokio::sync::Mutex<HashSet<String>>>,
@@ -312,6 +313,7 @@ impl AppState {
         #[cfg(target_os = "linux")]
         if self.manage_network {
             // FC 启动后在 netns 内创建 tap0；此刻再桥接并拉起。
+            #[cfg(target_os = "linux")]
             clouisle_net::netns::attach_tap(&temp_id)?;
         }
         let hello = tokio::time::timeout(
