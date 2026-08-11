@@ -300,7 +300,10 @@ impl AppState {
                 return Ok(());
             }
         }
+        #[cfg(target_os = "linux")]
         let subnet = self.subnet_alloc.allocate();
+        #[cfg(not(target_os = "linux"))]
+        let subnet = (10u16, 10u16);
         let temp_id = uuid::Uuid::now_v7().to_string();
         #[cfg(target_os = "linux")]
         if self.manage_network {
