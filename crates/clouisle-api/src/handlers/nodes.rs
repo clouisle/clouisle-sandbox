@@ -3,6 +3,7 @@
 use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
+use std::collections::HashSet;
 
 use clouisle_core::RegisteredNode;
 
@@ -20,6 +21,33 @@ pub async fn upsert_node(
         )));
     }
     state.store.upsert_node(&node).await?;
+    let observed: HashSet<&str> = node.sandbox_ids.iter().map(String::as_str).collect();
+    for sandbox_id in &node.sandbox_ids {
+        if let Ok(sandbox) = state.store.get_sandbox(sandbox_id).await
+            && sandbox.node_id.as_deref() != Some(node.info.node_id.as_str())
+        {
+            state
+                .store
+                .update_sandbox_node(sandbox_id, Some(&node.info.node_id))
+                .await?;
+        }
+    }
+    for sandbox in state.store.list_sandboxes(None).await? {
+        if sandbox.node_id.as_deref() == Some(node.info.node_id.as_str())
+            && sandbox.status.is_active()
+            && !observed.contains(sandbox.id.as_str())
+        {
+            state
+                .store
+                .update_sandbox_status_message(
+                    &sandbox.id,
+                    &clouisle_core::SandboxStatus::Error,
+                    Some("node heartbeat no longer reports this sandbox"),
+                )
+                .await?;
+            state.reservations.lock().await.remove(&sandbox.id);
+        }
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 

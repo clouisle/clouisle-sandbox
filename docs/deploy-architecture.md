@@ -7,15 +7,15 @@
 ```
 ┌────────────────────── K8s 集群 ──────────────────────┐
 │                                                       │
-│  Deployment: apiserver (副本×2, 无状态)               │
-│    └─ HTTP API / 调度 / 存储 → PostgreSQL              │
+│  Deployment: apiserver (默认单体，可扩展副本)           │
+│    └─ HTTP API + 本机 Firecracker / 镜像缓存             │
 │                                                       │
-│  DaemonSet: clouisled (每节点一个 Pod)                 │
-│    └─ Pod 内: [clouisled] + [firecracker 进程们]       │
-│        沙盒 A  沙盒 B  沙盒 C  (Pod 内多进程)          │
+│  StatefulSet: postgres (共享持久状态)                   │
 │                                                       │
-│  StatefulSet: postgres (控制平面共享状态)               │
+│  可选 profile: clouisled DaemonSet（多节点）             │
+│    └─ 每节点直管 Firecracker，通过同一 PostgreSQL      │
 │                                                       │
+│  默认 docker compose / kubectl -k deploy 不启动节点    │
 │  NetworkPolicy: 默认拒绝跨命名空间                      │
 └───────────────────────────────────────────────────────┘
 ```
@@ -28,9 +28,9 @@
 | 部署形态 | **DaemonSet** | 每节点一个 Pod，天然亲和宿主机设备 |
 | KVM 透传 | **privileged + hostPath** | `/dev/kvm` 直通，firecracker 必要 |
 | 沙盒 K8s 权限 | **`automountServiceAccountToken: false`** | 沙盒无 K8s token，逃逸后无法操作集群 |
-| 控制平面存储 | **PostgreSQL**（StatefulSet） | 多实例 apiserver 共享状态源 |
-| 控制平面状态 | **无状态** | 通过 gRPC 转发到 clouisled，不持有 VMM 引用 |
-| 节点发现 | **clouisled 心跳上报** | 每 3s 上报资源/沙盒数，apiserver 维护节点列表 |
+| 控制平面存储 | **PostgreSQL**（StatefulSet 或云服务） | 默认单体和多副本共享状态 |
+| 默认部署 | **API + Firecracker + PostgreSQL** | 单节点无需维护独立 Node 服务 |
+| 多节点扩展 | **可选 clouisled DaemonSet** | 显式启用后通过同一 Store DSN |
 
 ## 节点代理架构
 
@@ -72,8 +72,8 @@ clouisled (DaemonSet Pod)
 
 | 组件 | 高可用方式 | 状态 |
 |------|-----------|------|
-| apiserver | Deployment 多副本，PostgreSQL 共享状态 | **待实现**（当前用 SQLite + 内存池） |
-| clouisled | DaemonSet 每节点一个，节点故障时该节点沙盒标记 error | **待实现**（心跳超时未接入） |
-| postgres | StatefulSet 或云服务（RDS） | **待实现**（`PostgresStore` 代码已有） |
-| 资源调度 | 乐观锁：`UPDATE nodes ... WHERE ... RETURNING` | **待实现**（当前进程内 Semaphore） |
-| 健康检查 | `/health/live` + `/health/ready` | **已实现**（未接入 K8s 探针） |
+| apiserver | 默认单体；可扩展 Deployment 多副本 | **已实现**（PostgreSQL 共享状态） |
+| clouisled | 可选 DaemonSet 每节点一个 | **已实现**（同一 Store + 周期 reconciler） |
+| postgres | StatefulSet 或云服务 | **已实现**（StatefulSet 清单与连接串） |
+| 资源调度 | 本地池或节点心跳调度 | **部分实现**（多节点调度路径保留） |
+| 健康检查 | `/health/live` + `/health/ready` | **已实现**（已接入默认探针） |

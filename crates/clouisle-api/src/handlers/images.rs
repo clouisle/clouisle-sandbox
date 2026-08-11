@@ -1,10 +1,11 @@
 use axum::Json;
-use axum::extract::{Path, State};
+use axum::extract::{Extension, Path, State};
 use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
 
 use clouisle_core::{ClouisleError, ImageRef, SandboxSpec};
 
+use crate::auth::Principal;
 use crate::error::ApiError;
 use crate::state::{AppState, ImagePrefetchJob};
 
@@ -24,6 +25,7 @@ pub struct ImagePrefetchResponse {
 
 pub async fn prefetch_images(
     State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
     Json(request): Json<ImagePrefetchRequest>,
 ) -> Result<(StatusCode, Json<ImagePrefetchResponse>), ApiError> {
     let mut images = request.images;
@@ -49,6 +51,7 @@ pub async fn prefetch_images(
             .insert(ImagePrefetchJob {
                 job_id: job_id.clone(),
                 image: image.clone(),
+                tenant_id: principal.tenant_id.clone(),
                 status: "queued".into(),
                 error: None,
             })
@@ -62,10 +65,18 @@ pub async fn prefetch_images(
                 image,
                 ..SandboxSpec::default()
             };
-            match vmm.prefetch_image(&spec).await {
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(300),
+                vmm.prefetch_image(&spec),
+            )
+            .await
+            .map_err(|_| ClouisleError::timeout("image prefetch timed out after 300s"))
+            .and_then(|result| result);
+            match result {
                 Ok(()) => jobs.update(&job_id_for_task, "succeeded", None).await,
                 Err(error) => {
-                    jobs.update(&job_id_for_task, "failed", Some(error.message)).await
+                    jobs.update(&job_id_for_task, "failed", Some(error.message))
+                        .await
                 }
             }
         });
@@ -83,12 +94,18 @@ pub async fn prefetch_images(
 
 pub async fn get_prefetch_job(
     State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
     Path(job_id): Path<String>,
 ) -> Result<Json<ImagePrefetchJob>, ApiError> {
-    state
-        .image_jobs
-        .get(&job_id)
-        .await
-        .map(Json)
-        .ok_or_else(|| ApiError(ClouisleError::not_found(format!("image job {job_id} not found"))))
+    let job = state.image_jobs.get(&job_id).await.ok_or_else(|| {
+        ApiError(ClouisleError::not_found(format!(
+            "image job {job_id} not found"
+        )))
+    })?;
+    if job.tenant_id != principal.tenant_id {
+        return Err(ApiError(ClouisleError::not_found(format!(
+            "image job {job_id} not found"
+        ))));
+    }
+    Ok(Json(job))
 }

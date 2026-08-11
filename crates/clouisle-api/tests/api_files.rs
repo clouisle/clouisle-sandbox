@@ -27,10 +27,12 @@ impl Vmm for TestVmm {
         Ok(VmHandle {
             id: uuid::Uuid::now_v7().to_string(),
             backend: "test".into(),
+            owner_id: None,
             pid: None,
             api_socket: None,
             vsock_socket: None,
             vsock_cid: None,
+            subnet: None,
         })
     }
     async fn start(&self, _: &VmHandle) -> Result<()> {
@@ -55,10 +57,12 @@ impl Vmm for TestVmm {
         Ok(VmHandle {
             id: uuid::Uuid::now_v7().to_string(),
             backend: "test".into(),
+            owner_id: None,
             pid: None,
             api_socket: None,
             vsock_socket: None,
             vsock_cid: None,
+            subnet: None,
         })
     }
     async fn stop(&self, _: &VmHandle, _m: StopMode) -> Result<()> {
@@ -83,11 +87,20 @@ fn app() -> Router {
     let vmm: Arc<dyn Vmm> = Arc::new(TestVmm(Arc::new(std::sync::atomic::AtomicUsize::new(0))));
     let agent_conn: Arc<dyn agent::AgentConnector> = Arc::new(agent::MockAgentConnector);
     build_router(AppState {
+        e2b: Arc::new(clouisle_api::E2bControlPlane::new()),
         store,
+        warm_pool: Arc::new(clouisle_pool::Pool::new(0, 60, vmm.clone())),
         vmm,
+        warm_slots: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         pool,
         reservations: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         image_jobs: Arc::new(clouisle_api::ImageJobRegistry::new()),
+        e2b_tokens: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+        processes: Arc::new(clouisle_api::state::ProcessRegistry::default()),
+        snapshots: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+        subnet_alloc: clouisle_net::netns::SubnetAllocator::new(),
+        draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        provisioning: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
         manage_resources: true,
         agent: agent_conn,
         auth: Arc::new(auth::Authenticator::new()),

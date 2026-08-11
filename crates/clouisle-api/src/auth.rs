@@ -41,6 +41,9 @@ impl Scope {
 pub struct Principal {
     pub tenant_id: String,
     pub scope: Scope,
+    /// Set only for a Volume content token; such principals may access that
+    /// volume's content endpoints and no general control-plane resources.
+    pub volume_id: Option<String>,
 }
 
 impl Principal {
@@ -49,6 +52,7 @@ impl Principal {
         Self {
             tenant_id: "dev".into(),
             scope: Scope::Full,
+            volume_id: None,
         }
     }
 }
@@ -57,6 +61,7 @@ impl Principal {
 #[derive(Debug, Clone)]
 pub struct Authenticator {
     keys: Arc<RwLock<HashMap<String, Principal>>>,
+    key_ids: Arc<RwLock<HashMap<String, String>>>,
     allow_anonymous_dev: bool,
 }
 
@@ -64,6 +69,7 @@ impl Default for Authenticator {
     fn default() -> Self {
         Self {
             keys: Arc::new(RwLock::new(HashMap::new())),
+            key_ids: Arc::new(RwLock::new(HashMap::new())),
             allow_anonymous_dev: true,
         }
     }
@@ -79,6 +85,7 @@ impl Authenticator {
     pub fn new_production() -> Self {
         Self {
             keys: Arc::new(RwLock::new(HashMap::new())),
+            key_ids: Arc::new(RwLock::new(HashMap::new())),
             allow_anonymous_dev: false,
         }
     }
@@ -94,14 +101,36 @@ impl Authenticator {
 
     /// 注册 API key。
     pub async fn register(&self, key: &str, tenant_id: &str, scope: Scope) {
-        let mut keys = self.keys.write().await;
-        keys.insert(
+        self.register_inner(None, key, tenant_id, scope).await;
+    }
+
+    /// Register a durable key and retain its ID for immediate revocation.
+    pub async fn register_with_id(&self, id: &str, key: &str, tenant_id: &str, scope: Scope) {
+        self.register_inner(Some(id), key, tenant_id, scope).await;
+    }
+
+    async fn register_inner(&self, id: Option<&str>, key: &str, tenant_id: &str, scope: Scope) {
+        self.keys.write().await.insert(
             key.to_string(),
             Principal {
                 tenant_id: tenant_id.to_string(),
                 scope,
+                volume_id: None,
             },
         );
+        if let Some(id) = id {
+            self.key_ids
+                .write()
+                .await
+                .insert(id.to_string(), key.to_string());
+        }
+    }
+
+    /// Revoke a durable key without waiting for a process restart.
+    pub async fn revoke_id(&self, id: &str) {
+        if let Some(key) = self.key_ids.write().await.remove(id) {
+            self.keys.write().await.remove(&key);
+        }
     }
 
     /// Verify that the authenticated principal owns the sandbox.
