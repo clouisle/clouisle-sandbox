@@ -226,7 +226,11 @@ class Client:
                 "iops": spec.resources.iops,
                 "pids_max": spec.resources.pids_max,
             },
-            "network": {"enabled": spec.network.enabled, "allow_egress": spec.network.allow_egress},
+            "network": {
+                "enabled": spec.network.enabled,
+                "allow_egress": spec.network.allow_egress,
+                "deny_egress": spec.network.deny_egress,
+            },
             "mounts": [{"source": mount.source, "target": mount.target, "readonly": mount.readonly} for mount in spec.mounts],
             "secrets": [{"name": secret.name, "value": secret.value} for secret in spec.secrets],
             "ttl_secs": spec.ttl_secs,
@@ -259,6 +263,7 @@ class Client:
             network=NetworkConfig(
                 enabled=_as_bool(network_raw.get("enabled", True)),
                 allow_egress=_as_str_list(network_raw.get("allow_egress", [])),
+                deny_egress=_as_str_list(network_raw.get("deny_egress", [])),
             ),
             mounts=[
                 MountSpec(

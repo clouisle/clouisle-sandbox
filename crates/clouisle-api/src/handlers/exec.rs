@@ -17,16 +17,23 @@ pub(crate) fn meta_to_handle(
     meta: &clouisle_core::VmmMeta,
     sandbox_id: &str,
 ) -> clouisle_vmm::VmHandle {
+    let subnet = meta
+        .extra
+        .get("subnet")
+        .and_then(|value| value.split_once('.'))
+        .and_then(|(a, b)| Some((a.parse::<u16>().ok()?, b.parse::<u16>().ok()?)));
     clouisle_vmm::VmHandle {
         id: meta
             .vmm_id
             .clone()
             .unwrap_or_else(|| sandbox_id.to_string()),
         backend: meta.backend.clone(),
+        owner_id: meta.owner_id.clone(),
         pid: meta.pid,
         api_socket: meta.api_socket.clone(),
         vsock_socket: meta.vsock_socket.clone(),
         vsock_cid: meta.vsock_cid,
+        subnet,
     }
 }
 

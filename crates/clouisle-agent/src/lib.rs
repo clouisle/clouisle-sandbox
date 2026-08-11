@@ -2,6 +2,7 @@
 
 pub mod errors;
 pub mod init;
+pub mod limits;
 pub mod serve;
 
 pub use errors::{AgentError, AgentResult};

@@ -1,0 +1,43 @@
+# Docker 开发后端拓扑（macOS/Windows/Linux Docker Desktop 或 WSL2）。
+#
+# 仅用于本地开发：API 容器挂载 Docker socket（host 等效权限），沙盒以
+# Docker 容器运行（注入静态 clouisle-agent，复用帧协议）。
+# 生产部署（docker-compose.yml / Kubernetes）绝不挂载 Docker socket。
+#
+#   docker compose -f docker-compose.dev.yml up --build
+
+services:
+  api:
+    build:
+      context: .
+    command:
+      - clouisle-api
+      - --backend
+      - docker-dev
+      - --addr
+      - 0.0.0.0:8080
+      - --db
+      - /data/clouisle.db
+      - --api-socket-dir
+      - /run/clouisle
+    ports:
+      - "18080:8080"
+    volumes:
+      # 开发专用：Docker Engine API（host 等效权限）。
+      - /var/run/docker.sock:/var/run/docker.sock
+      - clouisle-dev-data:/data
+    environment:
+      CLOUISLE_API_KEYS: "e2b_dev_00000000000000000000000000000000000000:dev:full"
+    networks:
+      - clouisle-dev-mgmt
+      - default
+    restart: unless-stopped
+
+networks:
+  clouisle-dev-mgmt:
+    name: clouisle-dev-mgmt
+    driver: bridge
+    internal: true
+
+volumes:
+  clouisle-dev-data:

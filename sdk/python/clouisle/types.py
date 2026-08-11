@@ -53,6 +53,7 @@ class NetworkConfig:
     """Network configuration."""
     enabled: bool = True
     allow_egress: list[str] = field(default_factory=list)
+    deny_egress: list[str] = field(default_factory=list)
 
 
 @dataclass

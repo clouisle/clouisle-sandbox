@@ -67,6 +67,8 @@ pub struct NetworkConfig {
     pub enabled: bool,
     #[serde(default)]
     pub allow_egress: Vec<String>,
+    #[serde(default)]
+    pub deny_egress: Vec<String>,
 }
 
 const fn default_true() -> bool {
@@ -78,6 +80,7 @@ impl Default for NetworkConfig {
         Self {
             enabled: true,
             allow_egress: Vec::new(),
+            deny_egress: Vec::new(),
         }
     }
 }

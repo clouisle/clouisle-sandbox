@@ -1,0 +1,6 @@
+# RUSTSEC-2024-0436: paste is unmaintained but has no drop-in replacement; it is
+# a proc-macro used by the actively-maintained netlink-packet-* family, our only
+# path into it. Not a memory-safety issue and no fixed version exists. Revisit
+# on rtnetlink major upgrades.
+[advisories]
+ignore = ["RUSTSEC-2024-0436"]

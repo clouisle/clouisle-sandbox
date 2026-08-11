@@ -4,6 +4,9 @@
 //! 真正的 vsock 绑定在 Linux（`#[cfg(target_os = "linux")]`）分支补充。
 
 use std::collections::HashMap;
+#[cfg(unix)]
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::sync::{Arc, OnceLock};
 
 use bytes::Bytes;
 use clouisle_proto::{Frame, FrameDecoder};
@@ -37,6 +40,9 @@ pub fn handle_frame(frame: Frame) -> AgentResult<Vec<Frame>> {
             cwd,
             timeout_ms,
         } => Ok(run_exec_sync(&id, argv, env, cwd, timeout_ms)),
+        Frame::ApplyLimits { pids_max, .. } => crate::limits::apply_pids_max(pids_max)
+            .map(|_| vec![Frame::ControlOk])
+            .map_err(AgentError::Command),
         other => Ok(vec![Frame::Error {
             message: format!("unrecognized host frame: {other:?}"),
             code: 2,
@@ -248,50 +254,514 @@ fn list_dir(path: String) -> Result<Frame, String> {
     Ok(Frame::ListDirResult { entries })
 }
 
-/// 服务主循环：每次请求都产生确定性的响应帧。
-pub async fn serve_loop<R, W>(reader: &mut R, writer: &mut W) -> AgentResult<()>
-where
-    R: tokio::io::AsyncRead + Unpin,
-    W: tokio::io::AsyncWrite + Unpin,
+/// 长生命周期进程的可寻址控制句柄（guest 全局注册表条目）。
+/// 控制帧（stdin/signal/resize）可按 `id` 从任意连接路由到这里。
+struct RunningProcess {
+    pid: u32,
+    /// 可关闭的 stdin 写端。`close_stdin` 置 None 即关闭管道 → 子进程收到 EOF。
+    stdin: Option<Arc<tokio::sync::Mutex<Option<tokio::process::ChildStdin>>>>,
+    pty_master: Option<Arc<OwnedFd>>,
+}
+
+type ProcessRegistry = HashMap<String, Arc<RunningProcess>>;
+
+fn processes() -> &'static Arc<std::sync::Mutex<ProcessRegistry>> {
+    static PROCESSES: OnceLock<Arc<std::sync::Mutex<ProcessRegistry>>> = OnceLock::new();
+    PROCESSES.get_or_init(|| Arc::new(std::sync::Mutex::new(HashMap::new())))
+}
+
+#[cfg(unix)]
+fn set_nonblocking(fd: i32) -> Result<(), String> {
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 {
+        return Err("fcntl F_GETFL failed".into());
+    }
+    if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return Err("fcntl F_SETFL O_NONBLOCK failed".into());
+    }
+    Ok(())
+}
+
+/// 分配 PTY，返回 (master, slave)。
+#[cfg(unix)]
+fn open_pty(cols: u16, rows: u16) -> Result<(OwnedFd, OwnedFd), String> {
+    let mut master: libc::c_int = -1;
+    let mut slave: libc::c_int = -1;
+    let winsize = libc::winsize {
+        ws_row: rows,
+        ws_col: cols,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    let ret = unsafe {
+        libc::openpty(
+            &mut master,
+            &mut slave,
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            &winsize,
+        )
+    };
+    if ret != 0 {
+        return Err(format!(
+            "openpty failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok((unsafe { OwnedFd::from_raw_fd(master) }, unsafe {
+        OwnedFd::from_raw_fd(slave)
+    }))
+}
+
+/// 启动交互式进程：可选 stdin 管道或 PTY。返回控制句柄与子进程。
+#[cfg(unix)]
+fn spawn_interactive(
+    argv: &[String],
+    env: &HashMap<String, String>,
+    cwd: Option<&str>,
+    stdin_open: bool,
+    pty: Option<clouisle_proto::PtyConfig>,
+) -> Result<(Arc<RunningProcess>, tokio::process::Child), String> {
+    if argv.is_empty() {
+        return Err("argv is required".into());
+    }
+    let mut cmd = tokio::process::Command::new(&argv[0]);
+    cmd.args(&argv[1..]).envs(env);
+    if let Some(cwd) = cwd {
+        cmd.current_dir(cwd);
+    }
+    let (stdin_handle, pty_master) = if let Some(pty_cfg) = pty {
+        let (master, slave) = open_pty(pty_cfg.cols, pty_cfg.rows)?;
+        set_nonblocking(master.as_raw_fd())?;
+        let slave_in = slave
+            .try_clone()
+            .map_err(|e| format!("clone pty slave: {e}"))?;
+        let slave_out = slave
+            .try_clone()
+            .map_err(|e| format!("clone pty slave: {e}"))?;
+        cmd.stdin(std::process::Stdio::from(slave_in))
+            .stdout(std::process::Stdio::from(slave_out))
+            .stderr(std::process::Stdio::from(slave));
+        // 子进程成为会话组长并把 pty 设为控制终端。
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::setsid();
+                let _ = libc::ioctl(0, libc::TIOCSCTTY as _, 0usize);
+                Ok(())
+            });
+        }
+        (None, Some(Arc::new(master)))
+    } else if stdin_open {
+        cmd.stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        #[cfg(unix)]
+        cmd.process_group(0);
+        (None, None)
+    } else {
+        cmd.stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        #[cfg(unix)]
+        cmd.process_group(0);
+        (None, None)
+    };
+    let mut child = cmd.spawn().map_err(|e| format!("spawn {}: {e}", argv[0]))?;
+    let pid = child.id().unwrap_or(0);
+    let stdin_handle = match stdin_handle {
+        Some(handle) => Some(handle),
+        None => {
+            if pty.is_none() && stdin_open {
+                child
+                    .stdin
+                    .take()
+                    .map(|stdin| Arc::new(tokio::sync::Mutex::new(Some(stdin))))
+            } else {
+                None
+            }
+        }
+    };
+    Ok((
+        Arc::new(RunningProcess {
+            pid,
+            stdin: stdin_handle,
+            pty_master,
+        }),
+        child,
+    ))
+}
+
+/// 把子进程输出泵成 `Stdout`/`Stderr`/`Exited` 帧，结束后注销注册表条目。
+async fn pump_process<W>(
+    id: String,
+    handle: Arc<RunningProcess>,
+    mut child: tokio::process::Child,
+    writer: Arc<tokio::sync::Mutex<W>>,
+) where
+    W: tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
+    if let Some(master) = handle.pty_master.clone() {
+        // PTY 模式：stdout/stderr 在从机上合并，读 master 泵成 Stdout 帧。
+        let master_clone = match master.try_clone() {
+            Ok(clone) => clone,
+            Err(_) => return,
+        };
+        let _ = set_nonblocking(master_clone.as_raw_fd());
+        if let Ok(async_fd) = tokio::io::unix::AsyncFd::new(master_clone) {
+            let mut buf = [0u8; 8192];
+            loop {
+                let mut guard = match async_fd.readable().await {
+                    Ok(guard) => guard,
+                    Err(_) => break,
+                };
+                let result = guard.try_io(|inner| {
+                    let n = unsafe {
+                        libc::read(
+                            inner.as_raw_fd(),
+                            buf.as_mut_ptr() as *mut libc::c_void,
+                            buf.len(),
+                        )
+                    };
+                    if n < 0 {
+                        Err(std::io::Error::last_os_error())
+                    } else {
+                        Ok(n as usize)
+                    }
+                });
+                match result {
+                    Ok(Ok(0)) => break, // EOF
+                    Ok(Ok(n)) => {
+                        let chunk = Bytes::copy_from_slice(&buf[..n]);
+                        if clouisle_proto::codec::write_frame(
+                            &mut *writer.lock().await,
+                            &Frame::Stdout {
+                                id: id.clone(),
+                                chunk,
+                            },
+                        )
+                        .await
+                        .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    Ok(Err(e)) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        guard.clear_ready();
+                        continue;
+                    }
+                    Ok(Err(_)) | Err(_) => break,
+                }
+            }
+        }
+    } else {
+        let mut stdout = child.stdout.take();
+        let mut stderr = child.stderr.take();
+        if let Some(mut stdout) = stdout.take() {
+            let id_out = id.clone();
+            let writer_out = writer.clone();
+            tokio::spawn(async move {
+                use tokio::io::AsyncReadExt;
+                let mut buf = [0u8; 8192];
+                loop {
+                    match stdout.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            let chunk = Bytes::copy_from_slice(&buf[..n]);
+                            if clouisle_proto::codec::write_frame(
+                                &mut *writer_out.lock().await,
+                                &Frame::Stdout {
+                                    id: id_out.clone(),
+                                    chunk,
+                                },
+                            )
+                            .await
+                            .is_err()
+                            {
+                                break;
+                            }
+                        }
+                    }
+                }
+            });
+        }
+        if let Some(mut stderr) = stderr.take() {
+            let id_err = id.clone();
+            let writer_err = writer.clone();
+            tokio::spawn(async move {
+                use tokio::io::AsyncReadExt;
+                let mut buf = [0u8; 8192];
+                loop {
+                    match stderr.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            let chunk = Bytes::copy_from_slice(&buf[..n]);
+                            if clouisle_proto::codec::write_frame(
+                                &mut *writer_err.lock().await,
+                                &Frame::Stderr {
+                                    id: id_err.clone(),
+                                    chunk,
+                                },
+                            )
+                            .await
+                            .is_err()
+                            {
+                                break;
+                            }
+                        }
+                    }
+                }
+            });
+        }
+    }
+    let code = child
+        .wait()
+        .await
+        .map(|status| status.code().unwrap_or(-1))
+        .unwrap_or(-1);
+    // 注销：stdin 被关闭，控制帧将得到 not-found。
+    if let Ok(mut registry) = processes().lock() {
+        registry.remove(&id);
+    }
+    let _ =
+        clouisle_proto::codec::write_frame(&mut *writer.lock().await, &Frame::Exited { id, code })
+            .await;
+}
+
+fn lookup_process(id: &str) -> Option<Arc<RunningProcess>> {
+    processes().lock().ok()?.get(id).cloned()
+}
+
+async fn send_stdin(id: &str, chunk: Bytes) -> Result<(), String> {
+    let handle = lookup_process(id).ok_or_else(|| format!("process {id} not found"))?;
+    let Some(stdin) = handle.stdin.as_ref() else {
+        return Err(format!("process {id} has no open stdin"));
+    };
+    use tokio::io::AsyncWriteExt;
+    let mut guard = stdin.lock().await;
+    let Some(writer) = guard.as_mut() else {
+        return Err(format!("process {id} stdin is closed"));
+    };
+    writer
+        .write_all(&chunk)
+        .await
+        .map_err(|e| format!("write stdin {id}: {e}"))
+}
+
+async fn close_stdin(id: &str) -> Result<(), String> {
+    let handle = lookup_process(id).ok_or_else(|| format!("process {id} not found"))?;
+    let Some(stdin) = handle.stdin.as_ref() else {
+        return Ok(());
+    };
+    // 置 None 丢弃写端 → 管道关闭 → 子进程读到 EOF。
+    *stdin.lock().await = None;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn send_signal(id: &str, signal: clouisle_proto::ProcessSignal) -> Result<(), String> {
+    let handle = lookup_process(id).ok_or_else(|| format!("process {id} not found"))?;
+    let ret = unsafe { libc::kill(-(handle.pid as i32), signal.as_i32()) };
+    if ret != 0 && std::io::Error::last_os_error().kind() != std::io::ErrorKind::NotFound {
+        return Err(format!(
+            "kill {}: {}",
+            handle.pid,
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn resize_pty(id: &str, cols: u16, rows: u16) -> Result<(), String> {
+    let handle = lookup_process(id).ok_or_else(|| format!("process {id} not found"))?;
+    let Some(master) = handle.pty_master.as_ref() else {
+        return Err(format!("process {id} has no pty"));
+    };
+    let winsize = libc::winsize {
+        ws_row: rows,
+        ws_col: cols,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    let ret = unsafe { libc::ioctl(master.as_raw_fd(), libc::TIOCSWINSZ, &winsize) };
+    if ret != 0 {
+        return Err(format!(
+            "TIOCSWINSZ failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(())
+}
+
+/// 服务主循环：处理帧，流式返回。
+pub async fn serve_loop<R, W>(reader: &mut R, writer: W) -> AgentResult<()>
+where
+    R: tokio::io::AsyncRead + Unpin + Send,
+    W: tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let writer = Arc::new(tokio::sync::Mutex::new(writer));
     loop {
         let frame = clouisle_proto::codec::read_frame(reader).await?;
-        let responses = match frame {
+        match frame {
+            Frame::ApplyLimits { pids_max, .. } => {
+                let response = match crate::limits::apply_pids_max(pids_max) {
+                    Ok(()) => Frame::ControlOk,
+                    Err(message) => Frame::Error { message, code: 3 },
+                };
+                clouisle_proto::codec::write_frame(&mut *writer.lock().await, &response).await?;
+            }
             Frame::ExecReq {
                 id,
                 argv,
                 env,
                 cwd,
                 timeout_ms,
-            } => run_exec(&id, argv, env, cwd, timeout_ms).await,
+            } => {
+                let responses = run_exec(&id, argv, env, cwd, timeout_ms).await;
+                for response in responses {
+                    clouisle_proto::codec::write_frame(&mut *writer.lock().await, &response)
+                        .await?;
+                }
+            }
+            Frame::ProcessStart {
+                id,
+                argv,
+                env,
+                cwd,
+                timeout_ms,
+                stdin,
+                pty,
+            } => match spawn_interactive(&argv, &env, cwd.as_deref(), stdin, pty) {
+                Ok((handle, child)) => {
+                    let pid = handle.pid;
+                    let registered = match processes().lock() {
+                        Ok(mut registry) => {
+                            registry.insert(id.clone(), handle.clone());
+                            true
+                        }
+                        Err(_) => false,
+                    };
+                    if !registered {
+                        clouisle_proto::codec::write_frame(
+                            &mut *writer.lock().await,
+                            &Frame::Error {
+                                message: "process registry poisoned".into(),
+                                code: 3,
+                            },
+                        )
+                        .await?;
+                        continue;
+                    }
+                    clouisle_proto::codec::write_frame(
+                        &mut *writer.lock().await,
+                        &Frame::ProcessStarted {
+                            id: id.clone(),
+                            pid,
+                        },
+                    )
+                    .await?;
+                    if timeout_ms > 0 {
+                        let timeout_pid = pid;
+                        tokio::spawn(async move {
+                            tokio::time::sleep(std::time::Duration::from_millis(timeout_ms)).await;
+                            unsafe {
+                                libc::kill(-(timeout_pid as i32), libc::SIGKILL);
+                            }
+                        });
+                    }
+                    let pump_writer = writer.clone();
+                    tokio::spawn(pump_process(id, handle, child, pump_writer));
+                }
+                Err(message) => {
+                    clouisle_proto::codec::write_frame(
+                        &mut *writer.lock().await,
+                        &Frame::Error { message, code: 3 },
+                    )
+                    .await?;
+                }
+            },
+            Frame::Stdin { id, chunk } => {
+                let response = match send_stdin(&id, chunk).await {
+                    Ok(()) => Frame::ControlOk,
+                    Err(message) => Frame::Error { message, code: 3 },
+                };
+                clouisle_proto::codec::write_frame(&mut *writer.lock().await, &response).await?;
+            }
+            Frame::StdinEof { id } => {
+                let response = match close_stdin(&id).await {
+                    Ok(()) => Frame::ControlOk,
+                    Err(message) => Frame::Error { message, code: 3 },
+                };
+                clouisle_proto::codec::write_frame(&mut *writer.lock().await, &response).await?;
+            }
+            Frame::Signal { id, signal } => {
+                let response = match send_signal(&id, signal) {
+                    Ok(()) => Frame::ControlOk,
+                    Err(message) => Frame::Error { message, code: 3 },
+                };
+                clouisle_proto::codec::write_frame(&mut *writer.lock().await, &response).await?;
+            }
+            Frame::Resize { id, cols, rows } => {
+                let response = match resize_pty(&id, cols, rows) {
+                    Ok(()) => Frame::ControlOk,
+                    Err(message) => Frame::Error { message, code: 3 },
+                };
+                clouisle_proto::codec::write_frame(&mut *writer.lock().await, &response).await?;
+            }
             Frame::WriteFile {
                 path,
                 mode,
                 content,
-            } => write_file(path, mode, content)
-                .map(|frame| vec![frame])
-                .unwrap_or_else(|message| vec![Frame::Error { message, code: 3 }]),
+            } => {
+                let response = write_file(path, mode, content)
+                    .map(|frame| vec![frame])
+                    .unwrap_or_else(|message| vec![Frame::Error { message, code: 3 }]);
+                for response in response {
+                    clouisle_proto::codec::write_frame(&mut *writer.lock().await, &response)
+                        .await?;
+                }
+            }
             Frame::ReadFile {
                 path,
                 offset,
                 length,
-            } => read_file(path, offset, length)
-                .map(|frame| vec![frame])
-                .unwrap_or_else(|message| vec![Frame::Error { message, code: 3 }]),
-            Frame::ListDir { path } => list_dir(path)
-                .map(|frame| vec![frame])
-                .unwrap_or_else(|message| vec![Frame::Error { message, code: 3 }]),
-            Frame::Ping => vec![Frame::Pong],
-            Frame::Hello { .. } => vec![Frame::Hello {
-                agent_version: env!("CARGO_PKG_VERSION").to_string(),
-            }],
-            other => vec![Frame::Error {
-                message: format!("unsupported frame: {other:?}"),
-                code: 4,
-            }],
-        };
-        for response in responses {
-            clouisle_proto::codec::write_frame(writer, &response).await?;
+            } => {
+                let response = read_file(path, offset, length)
+                    .map(|frame| vec![frame])
+                    .unwrap_or_else(|message| vec![Frame::Error { message, code: 3 }]);
+                for response in response {
+                    clouisle_proto::codec::write_frame(&mut *writer.lock().await, &response)
+                        .await?;
+                }
+            }
+            Frame::ListDir { path } => {
+                let response = list_dir(path)
+                    .map(|frame| vec![frame])
+                    .unwrap_or_else(|message| vec![Frame::Error { message, code: 3 }]);
+                for response in response {
+                    clouisle_proto::codec::write_frame(&mut *writer.lock().await, &response)
+                        .await?;
+                }
+            }
+            Frame::Ping => {
+                clouisle_proto::codec::write_frame(&mut *writer.lock().await, &Frame::Pong).await?;
+            }
+            Frame::Hello { .. } => {
+                clouisle_proto::codec::write_frame(
+                    &mut *writer.lock().await,
+                    &Frame::Hello {
+                        agent_version: env!("CARGO_PKG_VERSION").to_string(),
+                    },
+                )
+                .await?;
+            }
+            other => {
+                let response = Frame::Error {
+                    message: format!("unsupported frame: {other:?}"),
+                    code: 4,
+                };
+                clouisle_proto::codec::write_frame(&mut *writer.lock().await, &response).await?;
+            }
         }
     }
 }
@@ -304,9 +774,23 @@ pub const AGENT_PORT: u16 = 5201;
 /// - 其他平台（macOS 测试）：占位返回。
 #[cfg(target_os = "linux")]
 pub async fn run_serve() -> AgentResult<()> {
-    crate::init::configure_network()
-        .await
-        .map_err(AgentError::Command)?;
+    run_serve_with(ServeConfig::default()).await
+}
+
+/// serve 配置：`skip_network_config` 仅用于 Docker 开发容器（DockerDevVmm
+/// 注入的 agent 作为容器 PID 1，无需 Firecracker 静态网络配置）。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ServeConfig {
+    pub skip_network_config: bool,
+}
+
+#[cfg(target_os = "linux")]
+pub async fn run_serve_with(config: ServeConfig) -> AgentResult<()> {
+    if !config.skip_network_config {
+        crate::init::configure_network()
+            .await
+            .map_err(AgentError::Command)?;
+    }
 
     let addr = format!("0.0.0.0:{AGENT_PORT}");
     let listener = tokio::net::TcpListener::bind(&addr)
@@ -320,9 +804,9 @@ pub async fn run_serve() -> AgentResult<()> {
             .await
             .map_err(|e| AgentError::Io(std::io::Error::other(e)))?;
         tracing::info!("connection from {peer}");
-        let (mut reader, mut writer) = tokio::io::split(stream);
+        let (mut reader, writer) = tokio::io::split(stream);
         tokio::spawn(async move {
-            if let Err(e) = serve_loop(&mut reader, &mut writer).await {
+            if let Err(e) = serve_loop(&mut reader, writer).await {
                 tracing::warn!(error = %e, "serve_loop ended");
             }
         });
@@ -331,7 +815,7 @@ pub async fn run_serve() -> AgentResult<()> {
 
 /// serve 模式入口（macOS/测试：无 AF_VSOCK，占位）。
 #[cfg(not(target_os = "linux"))]
-pub async fn run_serve() -> AgentResult<()> {
+pub async fn run_serve_with(_config: ServeConfig) -> AgentResult<()> {
     // macOS/测试环境：serve 由外部 vsock 触发；此函数仅为 lib 导出占位。
     Ok(())
 }
@@ -382,8 +866,8 @@ mod tests {
     async fn serve_loop_exec() {
         let (mut a, b) = duplex(128);
         // 拆出独立读写半部
-        let (mut br, mut bw) = tokio::io::split(b);
-        let server = tokio::spawn(async move { serve_loop(&mut br, &mut bw).await });
+        let (mut br, bw) = tokio::io::split(b);
+        let server = tokio::spawn(async move { serve_loop(&mut br, bw).await });
         // a 是 client 端：发 exec
         write_frame(
             &mut a,
@@ -411,8 +895,8 @@ mod tests {
     async fn serve_loop_file_roundtrip_and_traversal_rejection() {
         let path = format!("/tmp/clouisle-agent-test-{}.txt", std::process::id());
         let (mut client, server_side) = duplex(4096);
-        let (mut reader, mut writer) = tokio::io::split(server_side);
-        let server = tokio::spawn(async move { serve_loop(&mut reader, &mut writer).await });
+        let (mut reader, writer) = tokio::io::split(server_side);
+        let server = tokio::spawn(async move { serve_loop(&mut reader, writer).await });
 
         write_frame(
             &mut client,
@@ -467,8 +951,8 @@ mod tests {
     #[tokio::test]
     async fn serve_loop_timeout_kills_process_group() {
         let (mut client, server_side) = duplex(4096);
-        let (mut reader, mut writer) = tokio::io::split(server_side);
-        let server = tokio::spawn(async move { serve_loop(&mut reader, &mut writer).await });
+        let (mut reader, writer) = tokio::io::split(server_side);
+        let server = tokio::spawn(async move { serve_loop(&mut reader, writer).await });
         write_frame(
             &mut client,
             &Frame::ExecReq {
@@ -483,6 +967,226 @@ mod tests {
         .unwrap();
         let frame = read_frame(&mut client).await.unwrap();
         assert!(matches!(frame, Frame::Exited { code: -1, .. }));
+        server.abort();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn serve_loop_stdin_echo_and_eof() {
+        let (mut client, server_side) = duplex(8192);
+        let (mut reader, writer) = tokio::io::split(server_side);
+        let server = tokio::spawn(async move { serve_loop(&mut reader, writer).await });
+        write_frame(
+            &mut client,
+            &Frame::ProcessStart {
+                id: "interactive-cat".into(),
+                argv: vec!["cat".into()],
+                env: HashMap::new(),
+                cwd: None,
+                timeout_ms: 0,
+                stdin: true,
+                pty: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            read_frame(&mut client).await.unwrap(),
+            Frame::ProcessStarted {
+                id,
+                pid
+            } if id == "interactive-cat" && pid > 0
+        ));
+
+        write_frame(
+            &mut client,
+            &Frame::Stdin {
+                id: "interactive-cat".into(),
+                chunk: Bytes::from_static(b"hello-stdin\n"),
+            },
+        )
+        .await
+        .unwrap();
+        write_frame(
+            &mut client,
+            &Frame::StdinEof {
+                id: "interactive-cat".into(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let mut echoed = Vec::new();
+        let mut code = None;
+        for _ in 0..6 {
+            match read_frame(&mut client).await.unwrap() {
+                Frame::Stdout { id, chunk } if id == "interactive-cat" => {
+                    echoed.extend_from_slice(&chunk);
+                }
+                Frame::Exited { code: c, .. } => {
+                    code = Some(c);
+                    break;
+                }
+                Frame::ControlOk => {}
+                other => panic!("unexpected frame: {other:?}"),
+            }
+        }
+        assert_eq!(echoed, b"hello-stdin\n");
+        assert_eq!(code, Some(0));
+        server.abort();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn serve_loop_signal_kills_process() {
+        let (mut client, server_side) = duplex(8192);
+        let (mut reader, writer) = tokio::io::split(server_side);
+        let server = tokio::spawn(async move { serve_loop(&mut reader, writer).await });
+        write_frame(
+            &mut client,
+            &Frame::ProcessStart {
+                id: "interactive-sleep".into(),
+                argv: vec!["sleep".into(), "60".into()],
+                env: HashMap::new(),
+                cwd: None,
+                timeout_ms: 0,
+                stdin: false,
+                pty: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            read_frame(&mut client).await.unwrap(),
+            Frame::ProcessStarted { .. }
+        ));
+
+        write_frame(
+            &mut client,
+            &Frame::Signal {
+                id: "interactive-sleep".into(),
+                signal: clouisle_proto::ProcessSignal::Sigkill,
+            },
+        )
+        .await
+        .unwrap();
+
+        loop {
+            match read_frame(&mut client).await.unwrap() {
+                Frame::ControlOk => {}
+                Frame::Exited { id, code } => {
+                    assert_eq!(id, "interactive-sleep");
+                    assert_eq!(code, -1);
+                    break;
+                }
+                other => panic!("expected Exited, got {other:?}"),
+            }
+        }
+        server.abort();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn serve_loop_pty_merges_output() {
+        let (mut client, server_side) = duplex(8192);
+        let (mut reader, writer) = tokio::io::split(server_side);
+        let server = tokio::spawn(async move { serve_loop(&mut reader, writer).await });
+        write_frame(
+            &mut client,
+            &Frame::ProcessStart {
+                id: "interactive-pty".into(),
+                argv: vec![
+                    "sh".into(),
+                    "-c".into(),
+                    "echo pty-out; echo pty-err >&2".into(),
+                ],
+                env: HashMap::new(),
+                cwd: None,
+                timeout_ms: 0,
+                stdin: true,
+                pty: Some(clouisle_proto::PtyConfig { cols: 80, rows: 24 }),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            read_frame(&mut client).await.unwrap(),
+            Frame::ProcessStarted { .. }
+        ));
+
+        let mut output = Vec::new();
+        let mut code = None;
+        for _ in 0..8 {
+            match read_frame(&mut client).await.unwrap() {
+                Frame::Stdout { id, chunk } if id == "interactive-pty" => {
+                    output.extend_from_slice(&chunk);
+                }
+                Frame::Exited { code: c, .. } => {
+                    code = Some(c);
+                    break;
+                }
+                other => panic!("unexpected frame: {other:?}"),
+            }
+        }
+        let text = String::from_utf8_lossy(&output);
+        assert!(text.contains("pty-out"), "pty stdout missing: {text:?}");
+        assert!(text.contains("pty-err"), "pty stderr missing: {text:?}");
+        assert_eq!(code, Some(0));
+        server.abort();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn serve_loop_resize_pty_ok() {
+        let (mut client, server_side) = duplex(8192);
+        let (mut reader, writer) = tokio::io::split(server_side);
+        let server = tokio::spawn(async move { serve_loop(&mut reader, writer).await });
+        write_frame(
+            &mut client,
+            &Frame::ProcessStart {
+                id: "interactive-resize".into(),
+                argv: vec!["sleep".into(), "5".into()],
+                env: HashMap::new(),
+                cwd: None,
+                timeout_ms: 0,
+                stdin: true,
+                pty: Some(clouisle_proto::PtyConfig { cols: 80, rows: 24 }),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            read_frame(&mut client).await.unwrap(),
+            Frame::ProcessStarted { .. }
+        ));
+
+        write_frame(
+            &mut client,
+            &Frame::Resize {
+                id: "interactive-resize".into(),
+                cols: 132,
+                rows: 43,
+            },
+        )
+        .await
+        .unwrap();
+        // 无错误帧返回；随后终止进程收尾。
+        write_frame(
+            &mut client,
+            &Frame::Signal {
+                id: "interactive-resize".into(),
+                signal: clouisle_proto::ProcessSignal::Sigkill,
+            },
+        )
+        .await
+        .unwrap();
+        loop {
+            match read_frame(&mut client).await.unwrap() {
+                Frame::ControlOk => {}
+                Frame::Exited { .. } => break,
+                other => panic!("unexpected frame: {other:?}"),
+            }
+        }
         server.abort();
     }
 }

@@ -50,7 +50,9 @@ pub fn read_cmdline() -> String {
 pub async fn configure_network() -> Result<(), String> {
     use std::net::{IpAddr, Ipv4Addr};
 
+    ensure_dev_mounted()?;
     ensure_proc_mounted()?;
+    ensure_sys_mounted()?;
     let params = parse_cmdline(&read_cmdline());
     let guest_ip = params
         .get("guest_ip")
@@ -128,6 +130,55 @@ fn ensure_proc_mounted() -> Result<(), String> {
         Ok(()) | Err(Errno::EBUSY) => Ok(()),
         Err(error) => Err(format!("mount /proc: {error}")),
     }
+}
+
+/// 挂载 sysfs，供 cgroup v2（/sys/fs/cgroup）等子系统使用。
+#[cfg(target_os = "linux")]
+fn ensure_sys_mounted() -> Result<(), String> {
+    use nix::errno::Errno;
+    use nix::mount::{MsFlags, mount};
+
+    std::fs::create_dir_all("/sys").map_err(|error| format!("create /sys: {error}"))?;
+    match mount(
+        Some("sysfs"),
+        "/sys",
+        Some("sysfs"),
+        MsFlags::empty(),
+        None::<&str>,
+    ) {
+        Ok(()) | Err(Errno::EBUSY) => Ok(()),
+        Err(error) => Err(format!("mount sysfs: {error}")),
+    }
+}
+
+/// 挂载 devtmpfs 与 devpts，保证 `/dev/ptmx` 可用（PTY 分配依赖它）。
+#[cfg(target_os = "linux")]
+fn ensure_dev_mounted() -> Result<(), String> {
+    use nix::errno::Errno;
+    use nix::mount::{MsFlags, mount};
+
+    std::fs::create_dir_all("/dev/pts").map_err(|error| format!("create /dev/pts: {error}"))?;
+    match mount(
+        Some("devtmpfs"),
+        "/dev",
+        Some("devtmpfs"),
+        MsFlags::empty(),
+        None::<&str>,
+    ) {
+        Ok(()) | Err(Errno::EBUSY) => {}
+        Err(error) => return Err(format!("mount devtmpfs: {error}")),
+    }
+    match mount(
+        Some("devpts"),
+        "/dev/pts",
+        Some("devpts"),
+        MsFlags::empty(),
+        None::<&str>,
+    ) {
+        Ok(()) | Err(Errno::EBUSY) => {}
+        Err(error) => return Err(format!("mount devpts: {error}")),
+    }
+    Ok(())
 }
 
 #[cfg(not(target_os = "linux"))]

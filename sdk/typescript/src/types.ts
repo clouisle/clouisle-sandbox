@@ -32,6 +32,8 @@ export interface NetworkConfig {
   enabled: boolean;
   /** Egress domain allowlist. Empty = deny all egress. */
   allow_egress: string[];
+  /** Egress IP/CIDR deny rules. */
+  deny_egress?: string[];
 }
 
 /** Host mount requested for a sandbox. */
