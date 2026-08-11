@@ -4,8 +4,10 @@ use async_trait::async_trait;
 #[cfg(any(test, feature = "test-utils"))]
 use std::sync::Arc;
 
+use clouisle_core::ClouisleError;
+#[cfg(target_os = "linux")]
+use clouisle_core::ErrorKind;
 use clouisle_core::Result;
-use clouisle_core::{ClouisleError, ErrorKind};
 use clouisle_vmm::VmHandle;
 
 /// 连接器 trait：给定 VMM handle 和 sandbox_id，连接 vsock 并完成 Hello 握手。
@@ -113,6 +115,7 @@ pub trait AgentConnection: Send + Sync {
 }
 
 /// guest 文件系统错误的 API 侧映射：ENOENT 类错误映射 404，其余映射 VMM 错误。
+#[cfg(target_os = "linux")]
 fn guest_fs_error(op: &str, path: &str, message: &str) -> ClouisleError {
     let lower = message.to_ascii_lowercase();
     if lower.contains("no such file")
