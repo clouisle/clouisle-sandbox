@@ -929,11 +929,14 @@ impl NodeAgent {
                         .lock()
                         .await
                         .insert(sandbox.id.clone(), reservation);
+                    #[cfg(target_os = "linux")]
                     let mut adopted = sandbox.clone();
                     #[cfg(target_os = "linux")]
                     if sandbox.status == SandboxStatus::Starting {
                         adopted.status = SandboxStatus::Running;
                     }
+                    #[cfg(not(target_os = "linux"))]
+                    let adopted = sandbox.clone();
                     self.sandboxes
                         .write()
                         .await

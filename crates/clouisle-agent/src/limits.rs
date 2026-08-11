@@ -6,26 +6,35 @@ use std::fs;
 /// controller 已通过 `cgroup.subtree_control` 启用，创建 `clouisle`
 /// 子 cgroup，写入 `pids.max`，并把 PID 1（agent，guest 内所有进程的祖先）
 /// 移入——guest 内进程总数受限于该上限。`None` 不修改。
+/// 非 Linux 平台为 no-op（agent 仅部署于 Linux guest/容器）。
 pub fn apply_pids_max(pids_max: Option<u32>) -> Result<(), String> {
-    let Some(max) = pids_max else {
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pids_max;
         return Ok(());
-    };
-    ensure_cgroup2()?;
-    // 在 root cgroup 启用 pids controller（agent 是 PID 1 root，可写）。
-    fs::write("/sys/fs/cgroup/cgroup.subtree_control", "+pids")
-        .map_err(|error| format!("enable pids controller: {error}"))?;
-    fs::create_dir_all("/sys/fs/cgroup/clouisle")
-        .map_err(|error| format!("create /sys/fs/cgroup/clouisle: {error}"))?;
-    fs::write("/sys/fs/cgroup/clouisle/pids.max", max.to_string())
-        .map_err(|error| format!("write pids.max: {error}"))?;
-    // 移入自身；后续所有 fork/exec 继承该 cgroup。
-    fs::write(
-        "/sys/fs/cgroup/clouisle/cgroup.procs",
-        std::process::id().to_string(),
-    )
-    .map_err(|error| format!("move agent into cgroup: {error}"))?;
-    tracing::info!(pids_max = max, "applied guest pids.max");
-    Ok(())
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let Some(max) = pids_max else {
+            return Ok(());
+        };
+        ensure_cgroup2()?;
+        // 在 root cgroup 启用 pids controller（agent 是 PID 1 root，可写）。
+        fs::write("/sys/fs/cgroup/cgroup.subtree_control", "+pids")
+            .map_err(|error| format!("enable pids controller: {error}"))?;
+        fs::create_dir_all("/sys/fs/cgroup/clouisle")
+            .map_err(|error| format!("create /sys/fs/cgroup/clouisle: {error}"))?;
+        fs::write("/sys/fs/cgroup/clouisle/pids.max", max.to_string())
+            .map_err(|error| format!("write pids.max: {error}"))?;
+        // 移入自身；后续所有 fork/exec 继承该 cgroup。
+        fs::write(
+            "/sys/fs/cgroup/clouisle/cgroup.procs",
+            std::process::id().to_string(),
+        )
+        .map_err(|error| format!("move agent into cgroup: {error}"))?;
+        tracing::info!(pids_max = max, "applied guest pids.max");
+        Ok(())
+    }
 }
 
 #[cfg(target_os = "linux")]

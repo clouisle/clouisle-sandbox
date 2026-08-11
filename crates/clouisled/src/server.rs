@@ -37,6 +37,7 @@ fn to_status(e: ClouisleError) -> Status {
 
 /// 交互式控制结果 → gRPC ack 帧（成功）或 Status（失败）。
 #[allow(clippy::result_large_err)]
+#[cfg(target_os = "linux")]
 fn control_response(
     frame_id: &str,
     result: std::result::Result<(), ClouisleError>,
@@ -181,10 +182,12 @@ impl NodeService for NodeServiceImpl {
         &self,
         request: Request<Streaming<ExecStream>>,
     ) -> Result<Response<Self::ExecStream>, Status> {
+        #[cfg(target_os = "linux")]
         let mut stream = request.into_inner();
 
         #[cfg(not(target_os = "linux"))]
         {
+            let _ = request;
             return Err(Status::unimplemented("guest execution requires Linux"));
         }
 

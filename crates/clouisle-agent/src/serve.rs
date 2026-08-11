@@ -42,7 +42,7 @@ pub fn handle_frame(frame: Frame) -> AgentResult<Vec<Frame>> {
         } => Ok(run_exec_sync(&id, argv, env, cwd, timeout_ms)),
         Frame::ApplyLimits { pids_max, .. } => crate::limits::apply_pids_max(pids_max)
             .map(|_| vec![Frame::ControlOk])
-            .map_err(AgentError::Command),
+            .map_err(crate::errors::AgentError::Command),
         other => Ok(vec![Frame::Error {
             message: format!("unrecognized host frame: {other:?}"),
             code: 2,
@@ -282,8 +282,8 @@ fn set_nonblocking(fd: i32) -> Result<(), String> {
     Ok(())
 }
 
-/// 分配 PTY，返回 (master, slave)。
-#[cfg(unix)]
+/// 分配 PTY，返回 (master, slave)。仅 Linux guest 使用（docker-dev/FC 均为 Linux）。
+#[cfg(target_os = "linux")]
 fn open_pty(cols: u16, rows: u16) -> Result<(OwnedFd, OwnedFd), String> {
     let mut master: libc::c_int = -1;
     let mut slave: libc::c_int = -1;
@@ -311,6 +311,11 @@ fn open_pty(cols: u16, rows: u16) -> Result<(OwnedFd, OwnedFd), String> {
     Ok((unsafe { OwnedFd::from_raw_fd(master) }, unsafe {
         OwnedFd::from_raw_fd(slave)
     }))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn open_pty(_cols: u16, _rows: u16) -> Result<(OwnedFd, OwnedFd), String> {
+    Err("PTY requires Linux guest".into())
 }
 
 /// 启动交互式进程：可选 stdin 管道或 PTY。返回控制句柄与子进程。
@@ -814,6 +819,11 @@ pub async fn run_serve_with(config: ServeConfig) -> AgentResult<()> {
 }
 
 /// serve 模式入口（macOS/测试：无 AF_VSOCK，占位）。
+#[cfg(not(target_os = "linux"))]
+pub async fn run_serve() -> AgentResult<()> {
+    run_serve_with(ServeConfig::default()).await
+}
+
 #[cfg(not(target_os = "linux"))]
 pub async fn run_serve_with(_config: ServeConfig) -> AgentResult<()> {
     // macOS/测试环境：serve 由外部 vsock 触发；此函数仅为 lib 导出占位。

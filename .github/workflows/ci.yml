@@ -147,6 +147,9 @@ jobs:
   audit:
     name: Audit (cargo audit)
     runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      checks: write
     steps:
       - uses: actions/checkout@v5
       - uses: actions-rust-lang/setup-rust-toolchain@v1

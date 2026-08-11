@@ -1488,6 +1488,27 @@ async fn e2b_filesystem_rpc_contract() {
     .await;
     let id = created["sandboxID"].as_str().unwrap().to_owned();
 
+    // E2B create 走异步 provision（CI 高负载下可能仍在 Starting）；等待 running。
+    for _ in 0..100 {
+        let status = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(format!("/sandboxes/{id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = to_bytes(status.into_body(), 1024 * 1024).await.unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        if value["status"] == "running" || value["lifecycle"]["status"] == "running" {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
     let make_dir = app
         .clone()
         .oneshot(
