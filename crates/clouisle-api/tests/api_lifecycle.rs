@@ -1517,7 +1517,7 @@ async fn e2b_filesystem_rpc_contract() {
                 .uri("/filesystem.Filesystem/MakeDir")
                 .header("e2b-sandbox-id", &id)
                 .header("content-type", "application/json")
-                .body(Body::from(r#"{"path":"/work/rpc-dir"}"#))
+                .body(Body::from(r#"{"path":"/tmp/clouisle-rpc-dir"}"#))
                 .unwrap(),
         )
         .await
@@ -1535,7 +1535,7 @@ async fn e2b_filesystem_rpc_contract() {
                 .uri("/filesystem.Filesystem/Stat")
                 .header("e2b-sandbox-id", &id)
                 .header("content-type", "application/json")
-                .body(Body::from(r#"{"path":"/work/rpc-dir"}"#))
+                .body(Body::from(r#"{"path":"/tmp/clouisle-rpc-dir"}"#))
                 .unwrap(),
         )
         .await
@@ -1544,7 +1544,7 @@ async fn e2b_filesystem_rpc_contract() {
     let stat_body = to_bytes(stat.into_body(), 1024 * 1024).await.unwrap();
     let stat: serde_json::Value = serde_json::from_slice(&stat_body).unwrap();
     assert_eq!(stat["entry"]["type"], "FILE_TYPE_DIRECTORY");
-    assert_eq!(stat["entry"]["path"], "/work/rpc-dir");
+    assert_eq!(stat["entry"]["path"], "/tmp/clouisle-rpc-dir");
 
     let move_file = app
         .clone()
@@ -1555,7 +1555,7 @@ async fn e2b_filesystem_rpc_contract() {
                 .header("e2b-sandbox-id", &id)
                 .header("content-type", "application/json")
                 .body(Body::from(
-                    r#"{"source":"/work/rpc-dir","destination":"/work/rpc-moved"}"#,
+                    r#"{"source":"/tmp/clouisle-rpc-dir","destination":"/tmp/clouisle-rpc-moved"}"#,
                 ))
                 .unwrap(),
         )
@@ -1571,7 +1571,7 @@ async fn e2b_filesystem_rpc_contract() {
                 .uri("/filesystem.Filesystem/Remove")
                 .header("e2b-sandbox-id", &id)
                 .header("content-type", "application/json")
-                .body(Body::from(r#"{"path":"/work/rpc-moved"}"#))
+                .body(Body::from(r#"{"path":"/tmp/clouisle-rpc-moved"}"#))
                 .unwrap(),
         )
         .await
@@ -1586,7 +1586,7 @@ async fn e2b_filesystem_rpc_contract() {
                 .uri("/filesystem.Filesystem/Stat")
                 .header("e2b-sandbox-id", &id)
                 .header("content-type", "application/json")
-                .body(Body::from(r#"{"path":"/work/does-not-exist"}"#))
+                .body(Body::from(r#"{"path":"/tmp/clouisle-rpc-missing"}"#))
                 .unwrap(),
         )
         .await

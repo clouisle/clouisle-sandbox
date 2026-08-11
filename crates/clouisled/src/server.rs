@@ -18,8 +18,8 @@ pub mod proto {
 
 use proto::node_service_server::{NodeService, NodeServiceServer};
 use proto::{
-    CreateSandboxRequest, DeleteResult, ExecRequest, ExecStream, FileRequest, FileResponse,
-    HeartbeatCommand, HeartbeatReport, NodeId, NodeInfo, SandboxHandle, SandboxId,
+    CreateSandboxRequest, DeleteResult, ExecStream, FileRequest, FileResponse, HeartbeatCommand,
+    HeartbeatReport, NodeId, NodeInfo, SandboxHandle, SandboxId,
 };
 
 /// 将 ClouisleError 转为 tonic Status。
@@ -197,7 +197,7 @@ impl NodeService for NodeServiceImpl {
 
             let (tx, rx) = tokio::sync::mpsc::channel(32);
             let mut sandbox_id = String::new();
-            let mut legacy_exec: Option<ExecRequest> = None;
+            let mut legacy_exec: Option<crate::server::proto::ExecRequest> = None;
 
             // 交互式进程：一个 gRPC 双向流服务一个进程会话。ProcessStart 建立
             // 会话并启动输出泵；控制消息（stdin/EOF/信号/resize）同步执行并回 ack。
