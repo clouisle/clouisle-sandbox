@@ -4,6 +4,7 @@ use async_trait::async_trait;
 #[cfg(any(test, feature = "test-utils"))]
 use std::sync::Arc;
 
+#[cfg(any(test, feature = "test-utils", target_os = "linux"))]
 use clouisle_core::ClouisleError;
 #[cfg(target_os = "linux")]
 use clouisle_core::ErrorKind;
