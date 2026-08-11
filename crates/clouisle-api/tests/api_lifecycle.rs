@@ -1503,7 +1503,7 @@ async fn e2b_filesystem_rpc_contract() {
             .unwrap();
         let body = to_bytes(status.into_body(), 1024 * 1024).await.unwrap();
         let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        if value["status"] == "running" || value["lifecycle"]["status"] == "running" {
+        if value["state"] == "running" {
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;

@@ -1,5 +1,6 @@
 //! guest 内资源限制（cgroup v2）。
 
+#[cfg(target_os = "linux")]
 use std::fs;
 
 /// 施加 pids.max：确保 cgroup v2 挂载于 `/sys/fs/cgroup` 且 `pids`

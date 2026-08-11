@@ -4,8 +4,10 @@
 //! 真正的 vsock 绑定在 Linux（`#[cfg(target_os = "linux")]`）分支补充。
 
 use std::collections::HashMap;
+#[cfg(target_os = "linux")]
+use std::os::fd::FromRawFd;
 #[cfg(unix)]
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::sync::{Arc, OnceLock};
 
 use bytes::Bytes;
